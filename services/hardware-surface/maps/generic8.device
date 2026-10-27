@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Squizzy Studio control-surface device description (format 1).
+     A generic 8-channel controller: matches any MIDI port whose name contains "Squizzy Generic 8". -->
+<Device format="1" id="squizzy.generic8" name="Generic 8-Channel Controller" vendor="Squizzy" model="Generic 8">
+  <Ports input="Squizzy Generic 8" output="Squizzy Generic 8"/>
+  <Surface file="generic8.surface.xml"/>
+</Device>

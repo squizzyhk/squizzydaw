@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Squizzy Studio base theme: metrics, neutral colors and shared assets. The dark and light
+     themes inherit from it and override colors and icons. Colors are #RRGGBB or #RRGGBBAA;
+     "@Name" refers to another color of the same theme chain. Metrics are DIPs. -->
+<Theme name="base" format="1" title="Squizzy Base">
+  <Colors>
+    <Color name="Accent" value="#4FB3A9"/>
+    <Color name="Accent.Hot" value="#E0604A"/>
+    <Color name="Accent.Warm" value="#D9A441"/>
+    <Color name="Meter.Low" value="#3CC06A"/>
+    <Color name="Meter.Mid" value="#E0C03A"/>
+    <Color name="Meter.High" value="#E0604A"/>
+    <Color name="Track.Audio" value="@Accent"/>
+    <Color name="Track.Instrument" value="#8E7CC3"/>
+    <Color name="Transport.Record" value="@Accent.Hot"/>
+    <Color name="Cursor" value="@Accent.Warm"/>
+  </Colors>
+  <Metrics>
+    <Metric name="Track.Height" value="46"/>
+    <Metric name="Track.HeaderWidth" value="150"/>
+    <Metric name="Ruler.Height" value="20"/>
+    <Metric name="Strip.Width" value="84"/>
+    <Metric name="Transport.Height" value="40"/>
+    <Metric name="Font.Size" value="12"/>
+    <Metric name="Font.SizeSmall" value="11"/>
+    <Metric name="Corner.Radius" value="3"/>
+    <Metric name="Knob.Size" value="32"/>
+  </Metrics>
+</Theme>

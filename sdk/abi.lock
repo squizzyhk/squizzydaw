@@ -1,0 +1,4 @@
+# Managed by ci/stamp-abi.cmake - do not edit by hand.
+# SHA-256 of the core ABI headers at this platform ABI version.
+abi=1.0
+sha256=b97996967494a3ee1c9293a0e05dc0ce2671ddab0e4a6ccc2894201b8f23ac51

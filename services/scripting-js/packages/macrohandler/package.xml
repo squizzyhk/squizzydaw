@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Macros: run several commands (or actions) as one undo step (Squizzy Studio bundled package). -->
+<ScriptPackage id="squizzy.macrohandler" name="Macro Handler" version="1.0.0" abi="1.0">
+  <ClassFactory>
+    <ScriptClass classID="{539A96B2-05A2-43A0-83AE-340DA6EB2E6F}" category="Command" name="Macro Handler: Commands"
+                 sourceFile="macro.js" functionName="createMacroCommands">
+      <Command category="Macro" name="Run" title="Run Macro"/>
+      <Command category="Macro" name="Run Saved" title="Run Saved Macro..."/>
+    </ScriptClass>
+    <ScriptClass classID="{5F785F64-52F8-4381-AFF1-036C1C60E9F5}" category="Action" name="Macro Handler: Action Sequence"
+                 sourceFile="macro.js" functionName="createActionSequence"/>
+  </ClassFactory>
+</ScriptPackage>

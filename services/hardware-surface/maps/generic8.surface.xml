@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Squizzy Studio control-surface map (format 1). Faders: pitch bend per channel (14-bit, motorized),
+     knobs: relative encoders with LED rings, mute buttons with LEDs, page buttons, a 16-character display.
+     Bindings are the defaults; a remote page (setRemotePages) overrides them per control. -->
+<ControlSurface format="1" name="Generic 8">
+  <Controls>
+    <Control id="fader1" type="fader" label="Fader 1" feedback="true"><MidiMessage status="0xE0"/></Control>
+    <Control id="fader2" type="fader" label="Fader 2" feedback="true"><MidiMessage status="0xE1"/></Control>
+    <Control id="fader3" type="fader" label="Fader 3" feedback="true"><MidiMessage status="0xE2"/></Control>
+    <Control id="fader4" type="fader" label="Fader 4" feedback="true"><MidiMessage status="0xE3"/></Control>
+    <Control id="fader5" type="fader" label="Fader 5" feedback="true"><MidiMessage status="0xE4"/></Control>
+    <Control id="fader6" type="fader" label="Fader 6" feedback="true"><MidiMessage status="0xE5"/></Control>
+    <Control id="fader7" type="fader" label="Fader 7" feedback="true"><MidiMessage status="0xE6"/></Control>
+    <Control id="fader8" type="fader" label="Fader 8" feedback="true"><MidiMessage status="0xE7"/></Control>
+    <Control id="knob1" type="encoder" label="Knob 1" mode="twos-complement" feedback="true"><MidiMessage status="0xB0" address="16"/></Control>
+    <Control id="knob2" type="encoder" label="Knob 2" mode="twos-complement" feedback="true"><MidiMessage status="0xB0" address="17"/></Control>
+    <Control id="knob3" type="encoder" label="Knob 3" mode="twos-complement" feedback="true"><MidiMessage status="0xB0" address="18"/></Control>
+    <Control id="knob4" type="encoder" label="Knob 4" mode="twos-complement" feedback="true"><MidiMessage status="0xB0" address="19"/></Control>
+    <Control id="knob5" type="encoder" label="Knob 5" mode="twos-complement" feedback="true"><MidiMessage status="0xB0" address="20"/></Control>
+    <Control id="knob6" type="encoder" label="Knob 6" mode="twos-complement" feedback="true"><MidiMessage status="0xB0" address="21"/></Control>
+    <Control id="knob7" type="encoder" label="Knob 7" mode="twos-complement" feedback="true"><MidiMessage status="0xB0" address="22"/></Control>
+    <Control id="knob8" type="encoder" label="Knob 8" mode="twos-complement" feedback="true"><MidiMessage status="0xB0" address="23"/></Control>
+    <Control id="mute1" type="button" label="Mute 1" toggle="true" feedback="true"><MidiMessage status="0x90" address="16"/></Control>
+    <Control id="mute2" type="button" label="Mute 2" toggle="true" feedback="true"><MidiMessage status="0x90" address="17"/></Control>
+    <Control id="mute3" type="button" label="Mute 3" toggle="true" feedback="true"><MidiMessage status="0x90" address="18"/></Control>
+    <Control id="mute4" type="button" label="Mute 4" toggle="true" feedback="true"><MidiMessage status="0x90" address="19"/></Control>
+    <Control id="mute5" type="button" label="Mute 5" toggle="true" feedback="true"><MidiMessage status="0x90" address="20"/></Control>
+    <Control id="mute6" type="button" label="Mute 6" toggle="true" feedback="true"><MidiMessage status="0x90" address="21"/></Control>
+    <Control id="mute7" type="button" label="Mute 7" toggle="true" feedback="true"><MidiMessage status="0x90" address="22"/></Control>
+    <Control id="mute8" type="button" label="Mute 8" toggle="true" feedback="true"><MidiMessage status="0x90" address="23"/></Control>
+    <Control id="pagePrev" type="button" label="Page &lt;" action="page.prev"><MidiMessage status="0x90" address="46"/></Control>
+    <Control id="pageNext" type="button" label="Page &gt;" action="page.next"><MidiMessage status="0x90" address="47"/></Control>
+    <Control id="display" type="display" label="Display" length="16"><Sysex header="F0 7D 53 51 01"/></Control>
+  </Controls>
+  <Bindings>
+    <Bind control="fader1" target="object://doc/tracks/0" property="volumeDb" min="-60" max="6"/>
+    <Bind control="mute1" target="object://doc/tracks/0" property="mute"/>
+    <Bind control="fader2" target="object://doc/tracks/1" property="volumeDb" min="-60" max="6"/>
+    <Bind control="mute2" target="object://doc/tracks/1" property="mute"/>
+    <Bind control="fader3" target="object://doc/tracks/2" property="volumeDb" min="-60" max="6"/>
+    <Bind control="mute3" target="object://doc/tracks/2" property="mute"/>
+    <Bind control="fader4" target="object://doc/tracks/3" property="volumeDb" min="-60" max="6"/>
+    <Bind control="mute4" target="object://doc/tracks/3" property="mute"/>
+    <Bind control="fader5" target="object://doc/tracks/4" property="volumeDb" min="-60" max="6"/>
+    <Bind control="mute5" target="object://doc/tracks/4" property="mute"/>
+    <Bind control="fader6" target="object://doc/tracks/5" property="volumeDb" min="-60" max="6"/>
+    <Bind control="mute6" target="object://doc/tracks/5" property="mute"/>
+    <Bind control="fader7" target="object://doc/tracks/6" property="volumeDb" min="-60" max="6"/>
+    <Bind control="mute7" target="object://doc/tracks/6" property="mute"/>
+    <Bind control="fader8" target="object://doc/tracks/7" property="volumeDb" min="-60" max="6"/>
+    <Bind control="mute8" target="object://doc/tracks/7" property="mute"/>
+  </Bindings>
+</ControlSurface>

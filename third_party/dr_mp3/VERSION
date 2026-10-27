@@ -1,0 +1,4 @@
+dr_mp3 v0.7.4 (dr_libs commit a466dbe88fe2576d46c43877d602f3d66b8561a7)
+source: https://raw.githubusercontent.com/mackron/dr_libs/a466dbe88fe2576d46c43877d602f3d66b8561a7/dr_mp3.h
+sha256(dr_mp3.h): 390e4e0ef0cff80fb86ebf1b461d6947cfa4ed699a4fe107e5a5e69a47db2950
+license: public domain (Unlicense) or MIT-0, see LICENSE

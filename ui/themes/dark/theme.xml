@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Squizzy Dark: the default theme. -->
+<Theme name="dark" format="1" inherits="base" title="Squizzy Dark">
+  <Colors>
+    <Color name="Window.Background" value="#1C1D21"/>
+    <Color name="Panel.Background" value="#23252B"/>
+    <Color name="Panel.Border" value="#2C2F36"/>
+    <Color name="Track.Background" value="#2F323A"/>
+    <Color name="Track.Selected" value="#3A3F4A"/>
+    <Color name="Text" value="#E4E6EB"/>
+    <Color name="Text.Dim" value="#8A9099"/>
+    <Color name="Control.Track" value="#3A3D44"/>
+    <Color name="Control.Thumb" value="#D8DADF"/>
+    <Color name="Playhead" value="#FFFFFF"/>
+  </Colors>
+</Theme>

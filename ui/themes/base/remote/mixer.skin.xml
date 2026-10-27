@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Default hardware remote layout: an 8-channel mixer bank and a transport page. The same skin
+     language as the on-screen UI; widgets with remote="..." become surface controls. Relative
+     targets ("track/1") bind against the context URL handed to IRemotePageProvider. -->
+<Skin name="remote-mixer" format="1">
+  <Defines>
+    <define name="bank" value="0"/>
+  </Defines>
+  <Forms>
+    <Form name="Channel" direction="column" width="$(theme.metric.Strip.Width)">
+      <Label name="name$(ch)" remote="display$(ch)" text="Track $(ch)" target="track/$(ch)" property="name"/>
+      <Knob name="pan$(ch)" remote="knob$(ch)" text="Pan $(ch)" target="track/$(ch)" property="pan" min="-1" max="1" bipolar="1"/>
+      <Fader name="vol$(ch)" remote="fader$(ch)" text="Volume $(ch)" target="track/$(ch)" property="volume" min="-60" max="6" feedback="1"/>
+      <Button name="mute$(ch)" remote="mute$(ch)" text="Mute $(ch)" toggles="1" target="track/$(ch)" property="mute"/>
+      <if equals="$(withSolo)" value="1">
+        <Button name="solo$(ch)" remote="solo$(ch)" text="Solo $(ch)" toggles="1" target="track/$(ch)" property="solo"/>
+      </if>
+    </Form>
+    <Form name="Mixer" direction="row">
+      <Include form="Channel" ch="1"/>
+      <Include form="Channel" ch="2"/>
+      <Include form="Channel" ch="3"/>
+      <Include form="Channel" ch="4"/>
+      <Include form="Channel" ch="5"/>
+      <Include form="Channel" ch="6"/>
+      <Include form="Channel" ch="7"/>
+      <Include form="Channel" ch="8"/>
+    </Form>
+    <Form name="Transport" direction="row">
+      <Button name="play" remote="play" text="Play" command="Transport.Play" image="theme://current/icons/play.png" target="object://engine/transport" property="playing" toggles="1"/>
+      <Button name="stop" remote="stop" text="Stop" command="Transport.Stop" image="theme://current/icons/stop.png"/>
+      <Button name="rec" remote="record" text="Record" command="Transport.Record" image="theme://current/icons/record.png" target="object://engine/transport" property="recording" toggles="1"/>
+      <Knob name="jog" remote="jog" remoteType="encoder" text="Jog" target="object://engine/transport" property="position"/>
+      <Meter name="level" remote="level" remoteType="led" text="Master level" target="object://engine/master" property="peak"/>
+    </Form>
+  </Forms>
+  <RemotePages>
+    <Page name="Mixer" form="Mixer" withSolo="1"/>
+    <Page name="Mixer (no solo)" form="Mixer"/>
+    <Page name="Transport" form="Transport"/>
+  </RemotePages>
+</Skin>

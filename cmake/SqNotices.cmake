@@ -1,0 +1,52 @@
+# Squizzy Studio - THIRD_PARTY_NOTICES.txt next to the binaries.
+#
+# Every vendored library (third_party/<name>/ with a LICENSE* file) is listed with its VERSION
+# and full license text. MIT/BSD-style licenses require the notice to ship with every copy of the
+# binaries: the file lands in bin/ (so the CI artifact `build/*/bin/` and any installer carry it),
+# is installed by `cmake --install`, and `SquizzyStudio --licenses` prints it.
+#
+# Generated at configure time (build.ps1 always reconfigures); the license files are configure
+# dependencies, so editing one regenerates the notices on the next build.
+function(sq_write_third_party_notices out_file)
+  file(GLOB _dirs LIST_DIRECTORIES true RELATIVE "${SQ_ROOT}/third_party" "${SQ_ROOT}/third_party/*")
+  list(SORT _dirs)
+  set(_text "Squizzy Studio - third-party software notices\n")
+  string(APPEND _text "==============================================\n\n")
+  string(APPEND _text "This product includes the following third-party components. Each is used under the\n")
+  string(APPEND _text "license reproduced below.\n")
+  set(_count 0)
+  foreach(_d IN LISTS _dirs)
+    if(NOT IS_DIRECTORY "${SQ_ROOT}/third_party/${_d}")
+      continue()
+    endif()
+    file(GLOB _lic LIST_DIRECTORIES false "${SQ_ROOT}/third_party/${_d}/LICENSE*" "${SQ_ROOT}/third_party/${_d}/COPYING*")
+    if(NOT _lic)
+      continue()
+    endif()
+    list(SORT _lic)
+    set(_ver "")
+    if(EXISTS "${SQ_ROOT}/third_party/${_d}/VERSION")
+      file(STRINGS "${SQ_ROOT}/third_party/${_d}/VERSION" _ver LIMIT_COUNT 1)
+    endif()
+    string(APPEND _text "\n------------------------------------------------------------------------------\n")
+    string(APPEND _text "${_d}")
+    if(_ver)
+      string(APPEND _text " (${_ver})")
+    endif()
+    string(APPEND _text "\n------------------------------------------------------------------------------\n\n")
+    foreach(_f IN LISTS _lic)
+      file(READ "${_f}" _body)
+      string(APPEND _text "${_body}")
+      if(NOT _body MATCHES "\n$")
+        string(APPEND _text "\n")
+      endif()
+      set_property(DIRECTORY "${SQ_ROOT}" APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_f}")
+    endforeach()
+    math(EXPR _count "${_count} + 1")
+  endforeach()
+  file(WRITE "${out_file}.tmp" "${_text}")
+  file(COPY_FILE "${out_file}.tmp" "${out_file}" ONLY_IF_DIFFERENT)
+  file(REMOVE "${out_file}.tmp")
+  install(FILES "${out_file}" DESTINATION .)
+  message(STATUS "sq: THIRD_PARTY_NOTICES.txt (${_count} component(s))")
+endfunction()

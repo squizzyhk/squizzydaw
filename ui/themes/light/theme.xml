@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Squizzy Light: high-key variant for bright rooms. -->
+<Theme name="light" format="1" inherits="base" title="Squizzy Light">
+  <Colors>
+    <Color name="Accent" value="#2E8C83"/>
+    <Color name="Window.Background" value="#F2F3F5"/>
+    <Color name="Panel.Background" value="#E6E8EC"/>
+    <Color name="Panel.Border" value="#C9CDD4"/>
+    <Color name="Track.Background" value="#FFFFFF"/>
+    <Color name="Track.Selected" value="#D7ECEA"/>
+    <Color name="Text" value="#1E2026"/>
+    <Color name="Text.Dim" value="#5E646E"/>
+    <Color name="Control.Track" value="#C3C7CE"/>
+    <Color name="Control.Thumb" value="#40444D"/>
+    <Color name="Playhead" value="#1E2026"/>
+  </Colors>
+  <Metrics>
+    <Metric name="Corner.Radius" value="4"/>
+  </Metrics>
+</Theme>

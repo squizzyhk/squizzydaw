@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- MIDI note editing commands (Squizzy Studio bundled package). -->
+<ScriptPackage id="squizzy.musicedit" name="Music Edit" version="1.0.0" abi="1.0">
+  <ClassFactory>
+    <ScriptClass classID="{7E6B3552-2209-4738-A38B-C65708F6A1EC}" category="Command" name="Music Edit: Transpose"
+                 sourceFile="transpose.js" functionName="createTransposeCommands">
+      <Command category="Music" name="Transpose" title="Transpose Notes..."/>
+      <Command category="Music" name="Octave Up" title="Octave Up"/>
+      <Command category="Music" name="Octave Down" title="Octave Down"/>
+    </ScriptClass>
+    <ScriptClass classID="{D9796949-9165-41FA-AF83-7AAF75E84113}" category="Command" name="Music Edit: Quantize"
+                 sourceFile="quantize.js" functionName="createQuantizeCommand">
+      <Command category="Music" name="Quantize" title="Quantize Note Starts"/>
+    </ScriptClass>
+    <ScriptClass classID="{A16AE34E-63E6-4FF9-8A02-7D66242F4BD8}" category="Command" name="Music Edit: Legato"
+                 sourceFile="legato.js" functionName="createLegatoCommand">
+      <Command category="Music" name="Legato" title="Legato (Stretch Notes to Next)"/>
+    </ScriptClass>
+  </ClassFactory>
+</ScriptPackage>

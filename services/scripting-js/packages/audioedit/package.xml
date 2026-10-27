@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Audio clip editing commands (Squizzy Studio bundled package). -->
+<ScriptPackage id="squizzy.audioedit" name="Audio Edit" version="1.0.0" abi="1.0">
+  <ClassFactory>
+    <ScriptClass classID="{1B61330A-2A08-47AA-9F03-D498374A92A1}" category="Command" name="Audio Edit: Normalize Clips"
+                 sourceFile="normalize.js" functionName="createNormalizeCommand">
+      <Command category="Audio" name="Normalize" title="Normalize Clips"/>
+    </ScriptClass>
+    <ScriptClass classID="{2B3FCCFB-0CB7-4BB3-BF16-3ABA16855514}" category="Command" name="Audio Edit: Clip Gain"
+                 sourceFile="gain.js" functionName="createGainCommands">
+      <Command category="Audio" name="Gain Up" title="Raise Clip Gain"/>
+      <Command category="Audio" name="Gain Down" title="Lower Clip Gain"/>
+      <Command category="Audio" name="Reset Gain" title="Reset Clip Gain"/>
+    </ScriptClass>
+    <ScriptClass classID="{6FEFA626-095C-49E5-9C37-2E06D1C5F6EF}" category="Command" name="Audio Edit: Edge Fades"
+                 sourceFile="fades.js" functionName="createFadeCommands">
+      <Command category="Audio" name="Apply Fades" title="Apply Edge Fades"/>
+      <Command category="Audio" name="Remove Fades" title="Remove Fades"/>
+    </ScriptClass>
+  </ClassFactory>
+</ScriptPackage>

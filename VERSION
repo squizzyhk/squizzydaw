@@ -1,0 +1,4 @@
+# Squizzy Studio version + platform ABI. Edited by ci/stamp-abi.cmake (bump-*) - do not hand-edit the ABI lines.
+SQ_VERSION=0.1.0
+SQ_ABI_MAJOR=1
+SQ_ABI_MINOR=0

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Track management commands (Squizzy Studio bundled package). -->
+<ScriptPackage id="squizzy.trackedit" name="Track Edit" version="1.0.0" abi="1.0">
+  <ClassFactory>
+    <ScriptClass classID="{EC9A20CA-9363-4679-9E78-8D3F6CB0F845}" category="Command" name="Track Edit: Rename"
+                 sourceFile="rename.js" functionName="createRenameCommand">
+      <Command category="Track" name="Rename With Pattern" title="Rename Tracks..."/>
+    </ScriptClass>
+    <ScriptClass classID="{FFBBB397-96AE-4E35-8848-ED2D41DCDC79}" category="Command" name="Track Edit: Duplicate"
+                 sourceFile="duplicate.js" functionName="createDuplicateCommand">
+      <Command category="Track" name="Duplicate" title="Duplicate Tracks"/>
+    </ScriptClass>
+    <ScriptClass classID="{95589D8D-EBF2-4A29-BE05-93D934C64246}" category="Command" name="Track Edit: Cleanup"
+                 sourceFile="cleanup.js" functionName="createCleanupCommand">
+      <Command category="Track" name="Remove Empty" title="Remove Empty Tracks"/>
+    </ScriptClass>
+  </ClassFactory>
+</ScriptPackage>

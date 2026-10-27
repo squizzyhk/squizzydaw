@@ -1,0 +1,30 @@
+// GENERATED per module by sq_add_service/sq_add_tool. ABI + version stamp.
+#include <winver.h>
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @SQRC_V1@,@SQRC_V2@,@SQRC_V3@,0
+ PRODUCTVERSION @SQ_VERSION_MAJOR@,@SQ_VERSION_MINOR@,@SQ_VERSION_PATCH@,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE @SQRC_FILETYPE@
+ FILESUBTYPE 0x0L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName", "Squizzy Studio project"
+      VALUE "FileDescription", "@SQRC_DESC@"
+      VALUE "FileVersion", "@SQRC_VERSION@"
+      VALUE "InternalName", "@SQRC_NAME@"
+      VALUE "ProductName", "Squizzy Studio"
+      VALUE "ProductVersion", "@SQ_VERSION@"
+      VALUE "SquizzyPlatformABI", "@SQ_ABI_MAJOR@.@SQ_ABI_MINOR@"
+      VALUE "SquizzyBuildStamp", "@SQ_BUILD_STAMP@"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

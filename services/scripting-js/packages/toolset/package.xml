@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Arrangement tool commands: nudge, split, mute (Squizzy Studio bundled package). -->
+<ScriptPackage id="squizzy.toolset" name="Toolset" version="1.0.0" abi="1.0">
+  <ClassFactory>
+    <ScriptClass classID="{C55A3136-0FC6-4B5B-B4A4-BA7B3C6965D0}" category="Command" name="Toolset: Nudge"
+                 sourceFile="nudge.js" functionName="createNudgeCommands">
+      <Command category="Edit" name="Nudge Left" title="Nudge Left"/>
+      <Command category="Edit" name="Nudge Right" title="Nudge Right"/>
+    </ScriptClass>
+    <ScriptClass classID="{351263FD-74A7-451A-B54E-AFB876D28B1A}" category="Command" name="Toolset: Split"
+                 sourceFile="split.js" functionName="createSplitCommand">
+      <Command category="Edit" name="Split At Position" title="Split Clips at Position"/>
+    </ScriptClass>
+    <ScriptClass classID="{D3F4F0ED-BAFB-48EA-A649-AD7315C3161F}" category="Command" name="Toolset: Mute"
+                 sourceFile="mute.js" functionName="createMuteCommand">
+      <Command category="Edit" name="Toggle Clip Mute" title="Mute/Unmute Clips"/>
+    </ScriptClass>
+  </ClassFactory>
+</ScriptPackage>

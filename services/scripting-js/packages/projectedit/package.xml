@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Song-level commands: markers and tempo (Squizzy Studio bundled package). -->
+<ScriptPackage id="squizzy.projectedit" name="Project Edit" version="1.0.0" abi="1.0">
+  <ClassFactory>
+    <ScriptClass classID="{676D725B-2420-484E-B250-EDD32EA04F95}" category="Command" name="Project Edit: Markers"
+                 sourceFile="markers.js" functionName="createMarkerCommands">
+      <Command category="Project" name="Insert Marker" title="Insert Marker"/>
+      <Command category="Project" name="Markers From Clips" title="Add Markers at Clip Starts"/>
+    </ScriptClass>
+    <ScriptClass classID="{5B0F1627-9CD7-4500-9F1B-4251D0670D73}" category="Command" name="Project Edit: Tempo"
+                 sourceFile="tempo.js" functionName="createTempoCommands">
+      <Command category="Project" name="Set Tempo" title="Set Tempo..."/>
+      <Command category="Project" name="Scale Tempo" title="Scale Tempo Map..."/>
+    </ScriptClass>
+  </ClassFactory>
+</ScriptPackage>

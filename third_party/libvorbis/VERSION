@@ -1,0 +1,9 @@
+libvorbis 1.3.7
+Source: https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.gz
+SHA-256: 0e982409a9c3fc82ee06e08205b1355e5c6aa4c36bca58146ef399621b0ce5ab
+License: BSD-3-Clause (LICENSE = upstream COPYING)
+Subset (unmodified except lib/block.c, see PATCHES.md): include/vorbis/{codec.h,vorbisenc.h,vorbisfile.h}; lib/*.h, lib/modes/*.h, lib/books/**/*.h;
+lib/{mdct,smallft,block,envelope,window,lsp,lpc,analysis,synthesis,psy,info,floor1,floor0,res0,
+mapping0,registry,codebook,sharedbook,lookup,bitrate,vorbisenc,vorbisfile}.c
+(libvorbis + libvorbisenc + libvorbisfile).
+Not vendored: examples, tests, tools, docs, build files, win32/macosx/symbian/vq dirs.
