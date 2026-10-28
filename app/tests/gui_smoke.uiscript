@@ -1,0 +1,56 @@
+# GUI smoke test (headless, software renderer): every panel, menus, dialogs, piano roll, device rack.
+# Run by CTest app_gui_smoke at --size 1600x1000. A crash or an unknown op fails the test.
+shot gui_smoke_arrange.png
+# main menus (open, hover, close)
+click 148 14
+move 180 60
+key escape
+click 190 14
+move 220 290
+key escape
+click 238 14
+key escape
+click 304 14
+key escape
+click 367 14
+key escape
+click 424 14
+move 470 72
+key escape
+click 481 14
+key escape
+# select the instrument track lane and open the clip in the editor
+click 330 250
+key f4
+idle 50
+shot gui_smoke_editor.png
+# draw a note with the draw tool via double-click in the grid, then undo
+dclick 900 780
+char z ctrl
+# devices + mixer panels
+key f6
+idle 50
+shot gui_smoke_devices.png
+key f3
+idle 50
+shot gui_smoke_mixer.png
+# prompt dialog (rename track), type, cancel
+key f2
+type Lead
+key escape
+# file chooser opens and closes
+char o ctrl
+key escape
+# browser tabs
+click 122 97
+click 200 97
+click 45 97
+# theme switch rebuilds the whole tree
+run UI.SetTheme name=light
+shot gui_smoke_light.png
+run UI.SetTheme name=dark
+# zoom / scroll the arrange view
+wheel 900 300 2 ctrl
+wheel 900 300 -1 shift
+wheel 900 300 -1
+print

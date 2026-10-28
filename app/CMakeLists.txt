@@ -157,6 +157,25 @@ if(SQ_BUILD_TESTS)
       "Midi.Inject bytes=0x80,60,0" "ok")
     # Live MIDI through the null device: sound while stopped, then a MIDI recording creates one
     # clip (one undo step).
+    # Whole GUI headless (software renderer, no display needed): build a song, open every panel,
+    # menu and dialog, draw in the piano roll, switch themes, write screenshots. Runs on every OS,
+    # so CI exercises the MSVC-built GUI code too.
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/test-output/gui")
+    add_test(NAME app_gui_smoke
+      COMMAND SquizzyStudio --audio-driver none --run File.New --run "Track.AddDrums name=Drums"
+              --run "Clip.CreateMidi start=0 length=8" --run "Clip.SetNotes notes=0,0.5,36,110/1,0.5,38,100/2,0.5,36,110/3,0.5,38,100"
+              --run "Track.AddInstrument name=Keys" --run "Clip.CreateMidi start=0 length=8"
+              --run "Clip.SetNotes notes=0,1,60,100/1,1,64,90/2,1,67,80" --run "Track.AddInsert spec=builtin|reverb|"
+              --run "Track.AddInsert spec=builtin|eq|" --run "Track.AddBus name=FX"
+              --ui-script "${CMAKE_CURRENT_SOURCE_DIR}/tests/gui_smoke.uiscript" --size 1600x1000
+      WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/test-output/gui")
+    set_tests_properties(app_gui_smoke PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "screenshot: gui_smoke_light\\.png.*ui-script: status="
+      FAIL_REGULAR_EXPRESSION "unknown op|skin:")
+    add_test(NAME app_gui_smoke_hidpi
+      COMMAND SquizzyStudio --audio-driver none --run File.New --run "Track.AddInstrument name=Keys"
+              --screenshot gui_smoke_hidpi.png --size 2400x1500 --scale 2
+      WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/test-output/gui")
+    set_tests_properties(app_gui_smoke_hidpi PROPERTIES TIMEOUT 60 PASS_REGULAR_EXPRESSION "screenshot: gui_smoke_hidpi\\.png \\(2400x1500\\)")
     sq_app_cli_test(app_run_live_midi null
       File.New "ok"
       "Track.AddInstrument name=Keys" "ok"
