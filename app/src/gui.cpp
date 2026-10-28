@@ -701,6 +701,8 @@ int runGuiOffscreen(Shell& shell, const GuiRunOptions& o) {
     } else if (op == "shot") {
       frame();
       if (!renderTo(gui, w, h, scale, wds.size() > 1 ? wds[1] : o.screenshot)) rc = 4;
+    } else if (op == "drop" && wds.size() > 3) {  // drop X Y PATH: a browser file dropped on the arrange view
+      if (Widget* a = gui.tree.findByName("arrange")) gui::arrangeDropFile(a, num(1), num(2), wds[3]);
     } else if (op == "print") {
       std::printf("ui-script: status=\"%s\"\n", gui.status.c_str());
     } else {
