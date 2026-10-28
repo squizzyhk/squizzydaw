@@ -57,6 +57,20 @@ class OverlayStack {
 };
 
 std::unique_ptr<Overlay> makeMenuOverlay(std::vector<MenuItem> items, Point at);
+// A menu opened from the menu bar: knows the bar's title rects so clicking / hovering another title
+// or pressing Left / Right at the top level switches menus (openTitle(index) runs after it closed).
+struct MenuBarLink {
+  std::vector<Rect> titles;
+  int current = -1;
+  // how: kMenuByClick / kMenuByHover / kMenuByKey (keyboard: the first item starts highlighted).
+  std::function<void(int index, int how)> openTitle;
+  int how = 0;
+};
+std::unique_ptr<Overlay> makeMenuBarOverlay(std::vector<MenuItem> items, Point at, MenuBarLink link);
+// Message with several buttons (left to right); Enter picks the first, Escape the last.
+std::unique_ptr<Overlay> makeChoiceOverlay(const std::string& message, std::vector<std::string> buttons, std::function<void(int)> onPick);
+// Folder chooser: returns the current folder, the selected subfolder or the typed (possibly new) folder.
+std::unique_ptr<Overlay> makeFolderOverlay(const std::string& title, const std::string& initial, std::function<void(const std::string&)> onOk);
 std::unique_ptr<Overlay> makePromptOverlay(const std::string& title, const std::string& initial, std::function<void(const std::string&)> onOk);
 std::unique_ptr<Overlay> makeConfirmOverlay(const std::string& message, std::function<void()> onYes);
 std::unique_ptr<Overlay> makeFileOverlay(bool save, const std::string& title, const std::vector<std::string>& exts, const std::string& initial,

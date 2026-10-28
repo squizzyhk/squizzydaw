@@ -60,36 +60,40 @@ class TransportBar final : public Widget {
     const bool recording = (ts.flags & SQ_TRANSPORT_RECORDING) != 0;
     hits_.clear();
     const float bh = f.h - 16, by = f.y + 8;
-    float x = f.x + 10;
+    // Narrow windows: compact controls, then the CPU readout and finally the meter give way so
+    // nothing overlaps (the left block is ~830 DIPs wide normally, ~690 compact).
+    const bool compact = f.w < 1060;
+    const float gap = compact ? 3.0f : 4.0f;
+    float x = f.x + (compact ? 6.0f : 10.0f);
     auto iconButton = [&](Icon icon, int id, bool on, Color onCol, const char* tip) {
-      Rect r{x, by, bh + 6, bh};
+      Rect r{x, by, compact ? bh : bh + 6, bh};
       const bool hot = hot_ == id;
       c.fillRoundRect(r, 5, on ? onCol.withAlpha(0.9f) : hot ? p.panel3 : p.panel2);
       if (!on) c.strokeRoundRect(r, 5, p.border, 1);
       drawIcon(c, icon, r.inset(6), on ? (p.dark ? Color::rgb(0x111214) : Color::rgb(0xFFFFFF)) : (icon == Icon::Record ? p.rec : p.text));
       hits_.push_back(Hit{r, id, tip});
-      x += r.w + 4;
+      x += r.w + gap;
     };
     iconButton(Icon::ToStart, kToStart, false, p.accent, "Go to start (Home)");
     iconButton(Icon::Stop, kStop, false, p.accent, "Stop (Space)");
     iconButton(Icon::Play, kPlay, playing && !recording, p.accent, "Play (Space)");
     iconButton(Icon::Record, kRecord, recording, p.rec, "Record (R)");
-    x += 8;
+    x += compact ? 4.0f : 8.0f;
     iconButton(Icon::Loop, kLoop, (ts.flags & SQ_TRANSPORT_LOOPING) != 0, p.accent, "Loop (L)");
     iconButton(Icon::Metronome, kMetronome, (ts.flags & SQ_TRANSPORT_METRONOME) != 0, p.accent, "Metronome (C)");
-    x += 12;
+    x += compact ? 6.0f : 12.0f;
 
     // position display
-    Rect pos{x, by - 2, 190, bh + 4};
+    Rect pos{x, by - 2, compact ? 150.0f : 190.0f, bh + 4};
     c.fillRoundRect(pos, 6, p.bg);
     c.strokeRoundRect(pos, 6, p.border, 1);
     c.drawTextBold(ctx_.formatBars(ts.position), Rect{pos.x + 12, pos.y + 2, pos.w - 24, pos.h * 0.62f}, recording ? p.rec : p.accent, 19);
     c.drawText(GuiContext::formatTime(ts.seconds), Rect{pos.x + 12, pos.y + pos.h * 0.58f, pos.w - 24, pos.h * 0.38f}, p.dim, 11);
     hits_.push_back(Hit{pos, kPosition, "Song position (click to type a bar)"});
-    x = pos.right() + 10;
+    x = pos.right() + (compact ? 6.0f : 10.0f);
 
     // tempo
-    Rect tempo{x, by - 2, 104, bh + 4};
+    Rect tempo{x, by - 2, compact ? 92.0f : 104.0f, bh + 4};
     c.fillRoundRect(tempo, 6, hot_ == kTempo || dragTempo_ ? p.panel3 : p.bg);
     c.strokeRoundRect(tempo, 6, p.border, 1);
     char buf[64];
@@ -97,25 +101,34 @@ class TransportBar final : public Widget {
     c.drawTextBold(buf, Rect{tempo.x + 10, tempo.y + 2, tempo.w - 20, tempo.h * 0.62f}, p.text, 17);
     c.drawText("BPM", Rect{tempo.x + 10, tempo.y + tempo.h * 0.58f, tempo.w - 20, tempo.h * 0.38f}, p.dim, 10.5f);
     hits_.push_back(Hit{tempo, kTempo, "Tempo: drag up/down (Shift = fine), double-click to type"});
-    x = tempo.right() + 4;
+    x = tempo.right() + gap;
     iconButton(Icon::Tap, kTap, false, p.accent, "Tap tempo");
-    x += 4;
+    x += gap;
 
     // signature
-    Rect sig{x, by - 2, 64, bh + 4};
+    Rect sig{x, by - 2, compact ? 56.0f : 64.0f, bh + 4};
     c.fillRoundRect(sig, 6, hot_ == kSignature ? p.panel3 : p.bg);
     c.strokeRoundRect(sig, 6, p.border, 1);
     std::snprintf(buf, sizeof buf, "%u/%u", ts.numerator ? ts.numerator : 4, ts.denominator ? ts.denominator : 4);
     c.drawTextBold(buf, Rect{sig.x, sig.y + 2, sig.w, sig.h * 0.62f}, p.text, 16, TextAlign::Center);
     c.drawText("TIME", Rect{sig.x, sig.y + sig.h * 0.58f, sig.w, sig.h * 0.38f}, p.dim, 10.5f, TextAlign::Center);
     hits_.push_back(Hit{sig, kSignature, "Time signature (click to change)"});
-    x = sig.right() + 16;
+    x = sig.right() + (compact ? 8.0f : 16.0f);
 
     iconButton(Icon::Undo, kUndo, false, p.accent, "Undo (Ctrl+Z)");
     iconButton(Icon::Redo, kRedo, false, p.accent, "Redo (Ctrl+Y)");
 
-    // right side: master meter + CPU
-    const float mw = std::min(260.0f, f.w * 0.18f);
+    // right side: master meter + CPU, only in the space left of the controls
+    const float room = f.right() - 12 - (x + 8);
+    const float cpuW = 84;
+    float mw = std::min(260.0f, f.w * 0.18f);
+    bool showCpu = room >= mw + cpuW;
+    if (!showCpu) mw = std::min(mw, room);
+    const bool showMeter = mw >= 70;
+    if (!showMeter) {
+      paintTooltip(c, p, x, by, bh, f.right() - 12);
+      return;
+    }
     Rect meterR{f.right() - mw - 12, by + 4, mw, bh - 8};
     float pk[2] = {0, 0};
     const uint32_t n = ctx_.meter(sq_guid{}, pk, nullptr, 2);
@@ -137,7 +150,7 @@ class TransportBar final : public Widget {
     c.fillRoundRect(clipR, 2, clip_ ? p.meterHigh : p.panel2);
     hits_.push_back(Hit{clipR, kClip, "Clip indicator (click to reset)"});
     c.drawText("MASTER", Rect{meterR.x, f.y, meterR.w, 10}, p.faint, 8.5f);
-    if (IAudioEngine* e = ctx_.shell().engine()) {
+    if (IAudioEngine* e = showCpu ? ctx_.shell().engine() : nullptr) {
       sq_engine_status st{};
       st.struct_size = sizeof st;
       if (e->getStatus(&st) == SQ_OK) {
@@ -145,12 +158,14 @@ class TransportBar final : public Widget {
         c.drawText(buf, Rect{meterR.x - 84, by, 76, bh}, st.cpu_load > 0.8 ? p.rec : p.dim, 11, TextAlign::Right);
       }
     }
-    // tooltip line for the hovered control
-    if (hot_ > 0)
-      for (const auto& h : hits_)
-        if (h.id == hot_ && h.tip) c.drawText(h.tip, Rect{x + 16, by, std::max(0.0f, meterR.x - x - 110), bh}, p.faint, 11);
+    paintTooltip(c, p, x, by, bh, meterR.x - (showCpu ? cpuW + 26 : 10));
+  }
 
-    // finish pending tap-tempo / hover bookkeeping
+  // Tooltip line for the hovered control, between the controls and the meter (if it fits).
+  void paintTooltip(Canvas& c, const Palette& p, float x, float by, float bh, float right) {
+    if (hot_ <= 0 || right - x < 80) return;
+    for (const auto& h : hits_)
+      if (h.id == hot_ && h.tip) c.drawText(h.tip, Rect{x + 16, by, right - x - 16, bh}, p.faint, 11);
   }
 
   bool onMouse(const WidgetMouse& e) override {
@@ -179,7 +194,7 @@ class TransportBar final : public Widget {
       case MouseAction::Move:
         if (dragTempo_) {
           const double per = (e.modifiers & kModShift) ? 0.01 : 0.25;
-          dragBpm_ = std::clamp(startBpm_ + static_cast<double>(dragStartY_ - e.y) * per, 20.0, 400.0);
+          dragBpm_ = std::clamp(startBpm_ + static_cast<double>(dragStartY_ - e.y) * per, kMinBpm, kMaxBpm);
           dragBpm_ = std::round(dragBpm_ * 100.0) / 100.0;
           ctx_.invalidate();
         }
@@ -201,15 +216,17 @@ class TransportBar final : public Widget {
           std::snprintf(buf, sizeof buf, "%.2f", ctx_.transport().bpm);
           ctx_.prompt("Tempo (BPM)", buf, [this](const std::string& v) {
             const double bpm = std::atof(v.c_str());
-            if (bpm >= 10 && bpm <= 999) setTempo(bpm);
-            else ctx_.setStatus("tempo must be between 10 and 999 BPM");
+            if (bpm >= kMinBpm && bpm <= kMaxBpm) setTempo(bpm);
+            else ctx_.setStatus("tempo must be between " + formatBpm(kMinBpm) + " and " + formatBpm(kMaxBpm) + " BPM");
           });
           return true;
         }
         return h != 0;
       case MouseAction::Wheel:
         if (h == kTempo) {
-          setTempo(std::clamp(std::round(ctx_.transport().bpm) + (e.wheel > 0 ? 1.0 : -1.0), 20.0, 400.0));
+          // One BPM per notch, landing on whole numbers (95.5 -> 96 up, 95 down).
+          const double cur = ctx_.transport().bpm;
+          setTempo(std::clamp(e.wheel > 0 ? std::floor(cur + 1e-9) + 1.0 : std::ceil(cur - 1e-9) - 1.0, kMinBpm, kMaxBpm));
           return true;
         }
         return false;
@@ -247,14 +264,14 @@ class TransportBar final : public Widget {
     auto a = sq::makeAttributes();
     a->setDouble("bpm", bpm);
     if (SQ_SUCCEEDED(ctx_.shell().execute("Song.SetTempo", a.get()))) {
-      ctx_.setStatus("Tempo: " + std::to_string(static_cast<int>(std::lround(bpm))) + " BPM");
+      ctx_.setStatus("Tempo: " + formatBpm(bpm) + " BPM");
       ctx_.invalidate();
       return;
     }
     auto p = sq::makeAttributes();
     p->setDouble("position", 0.0);
     p->setDouble("bpm", bpm);
-    if (SQ_SUCCEEDED(ctx_.exec(sq::doc::kSetTempo, p.get()))) ctx_.setStatus("Tempo: " + std::to_string(static_cast<int>(std::lround(bpm))) + " BPM");
+    if (SQ_SUCCEEDED(ctx_.exec(sq::doc::kSetTempo, p.get()))) ctx_.setStatus("Tempo: " + formatBpm(bpm) + " BPM");
   }
 
   void setSignature(uint32_t num, uint32_t den) {
@@ -276,7 +293,7 @@ class TransportBar final : public Widget {
     if (taps_.size() > 8) taps_.erase(taps_.begin());
     if (taps_.size() >= 3) {
       const double secs = std::chrono::duration<double>(taps_.back() - taps_.front()).count() / static_cast<double>(taps_.size() - 1);
-      if (secs > 0.1) setTempo(std::clamp(std::round(60.0 / secs * 10.0) / 10.0, 20.0, 400.0));
+      if (secs > 0.05) setTempo(std::clamp(std::round(60.0 / secs * 10.0) / 10.0, kMinBpm, kMaxBpm));
     } else {
       ctx_.setStatus("Tap tempo: keep tapping...");
     }
@@ -291,7 +308,7 @@ class TransportBar final : public Widget {
         else ctx_.run("Transport.Stop");
         break;
       case kPlay: ctx_.run((ts.flags & SQ_TRANSPORT_PLAYING) ? "Transport.Stop" : "Transport.Play"); break;
-      case kRecord: ctx_.run("Transport.Record"); break;
+      case kRecord: toggleRecord(ctx_); break;
       case kLoop: ctx_.run("Transport.ToggleLoop"); break;
       case kMetronome: ctx_.run("Transport.ToggleMetronome"); break;
       case kUndo: ctx_.run("Edit.Undo"); break;
@@ -348,5 +365,27 @@ class TransportBar final : public Widget {
 }  // namespace
 
 std::unique_ptr<Widget> makeTransportBar(GuiContext& ctx) { return std::make_unique<TransportBar>(ctx); }
+
+std::string formatBpm(double bpm) {
+  char buf[32];
+  const double r = std::round(bpm * 100.0) / 100.0;
+  if (std::fabs(r - std::round(r)) < 1e-9) std::snprintf(buf, sizeof buf, "%.0f", r);
+  else std::snprintf(buf, sizeof buf, "%.2f", r);
+  return buf;
+}
+
+void toggleRecord(GuiContext& ctx) {
+  const auto ts = ctx.transport();
+  if (!(ts.flags & SQ_TRANSPORT_RECORDING)) {
+    bool armed = false;
+    for (const TrackView& t : ctx.tracks())
+      if (t.info.flags & SQ_TRACK_ARMED) armed = true;
+    if (!armed) {
+      ctx.setStatus("Nothing to record: arm a track first (its R button, or Track > Arm for Recording)");
+      return;
+    }
+  }
+  ctx.run("Transport.Record");
+}
 
 }  // namespace sq::app::gui

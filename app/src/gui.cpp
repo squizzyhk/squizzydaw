@@ -53,6 +53,10 @@ class Splitter final : public Widget {
  public:
   Splitter(GuiContext& ctx, bool vertical) : Widget("Splitter"), ctx_(ctx), vertical_(vertical) {}
   std::string targetName;
+  // The flexible sibling that gives up the space (never below giveMin), so a drag can never push
+  // other panels (status bar) out of the window.
+  std::string giveName;
+  float giveMin = 120;
   float sign = 1, minSize = 80, maxSize = 2000;
   void paint(Canvas& c) override {
     const Rect& f = frame();
@@ -70,11 +74,14 @@ class Splitter final : public Widget {
         drag_ = true;
         start_ = vertical_ ? e.x : e.y;
         startSize_ = vertical_ ? t->frame().w : t->frame().h;
+        room_ = maxSize;
+        if (Widget* g = find(giveName)) room_ = std::max(0.0f, (vertical_ ? g->frame().w : g->frame().h) - giveMin);
         return true;
       case MouseAction::Move:
         if (drag_ && t) {
           const float d = ((vertical_ ? e.x : e.y) - start_) * sign;
-          const float sz = std::clamp(startSize_ + d, minSize, maxSize);
+          const float hi = std::max(std::min(maxSize, startSize_ + room_), std::min(minSize, startSize_));
+          const float sz = std::clamp(startSize_ + d, std::min(minSize, hi), hi);
           if (vertical_) t->style.width = Dim::pt(sz);
           else t->style.height = Dim::pt(sz);
           ctx_.invalidate();
@@ -90,15 +97,17 @@ class Splitter final : public Widget {
   }
 
  private:
-  Widget* target() {
+  Widget* target() { return find(targetName); }
+  Widget* find(const std::string& n) {
+    if (n.empty()) return nullptr;
     for (Widget* p = parent(); p; p = p->parent())
-      if (Widget* w = p->findByName(targetName)) return w;
+      if (Widget* w = p->findByName(n)) return w;
     return nullptr;
   }
   GuiContext& ctx_;
   bool vertical_;
   bool hot_ = false, drag_ = false;
-  float start_ = 0, startSize_ = 0;
+  float start_ = 0, startSize_ = 0, room_ = 0;
 };
 
 // Tab strip of the bottom panel (Mixer | Editor | Devices).
@@ -205,6 +214,8 @@ class Gui final : public GuiContext {
   sq::Ptr<ISubject> observedMgr_, observedDoc_;
   sq_guid lastDoc_{};
   bool quitConfirmed = false;
+  std::string lastDir_;            // folder of the last file chosen in a file / folder chooser
+  bool swallowSpaceChar_ = false;  // a text field already typed the space of the last Space key
 
   // ---- GuiContext ----
   Shell& shell() override { return sh_; }
@@ -214,6 +225,13 @@ class Gui final : public GuiContext {
     sq_result r = sh_.execute(dotted, args);
     status = !sh_.lastMessage().empty() ? sh_.lastMessage()
                                         : std::string(dotted) + (SQ_SUCCEEDED(r) ? std::string() : std::string(": ") + sq_result_string(r));
+    if (r == SQ_COMMAND_DISABLED && sh_.lastMessage().empty()) {
+      const size_t dot = dotted.find('.');
+      if (dot != std::string_view::npos && sh_.isEnabled(dotted.substr(0, dot), dotted.substr(dot + 1)) == SQ_COMMAND_DISABLED)
+        status = std::string(dotted) + ": not available right now" + (sh_.activeDocument() ? "" : " (no song is open)");
+    }
+    if (dotted == "File.Close" && SQ_SUCCEEDED(r)) status = "song closed";
+    if (ensureDocument()) status += " - started a new empty song";
     ++serial_;  // commands may change journals (selection) without a document.changed
     invalidate();
     return r;
@@ -239,8 +257,22 @@ class Gui final : public GuiContext {
   }
   void chooseFile(bool save, const std::string& title, const std::vector<std::string>& exts, const std::string& initial,
                   std::function<void(const std::string&)> onOk) override {
-    overlays.push(gui::makeFileOverlay(save, title, exts, initial, std::move(onOk)));
+    overlays.push(gui::makeFileOverlay(save, title, exts, startPath(initial), rememberDir(std::move(onOk))));
     invalidate();
+  }
+  // A bare file name (or nothing) starts in the song's folder, else the folder used last.
+  std::string startPath(const std::string& initial);
+  std::function<void(const std::string&)> rememberDir(std::function<void(const std::string&)> onOk) {
+    return [this, cb = std::move(onOk)](const std::string& path) {
+      const size_t k = path.find_last_of("/\\");
+      if (k != std::string::npos) lastDir_ = k == 0 ? std::string("/") : path.substr(0, k);
+      if (cb) cb(path);
+    };
+  }
+  // The GUI always has a song: after Close Song (or a script closing it) a new empty one starts.
+  bool ensureDocument() {
+    if (!sh_.hasEngine() || !sh_.documents() || sh_.activeDocument()) return false;
+    return SQ_SUCCEEDED(sh_.execute("File.New"));
   }
   void showBottomPanel(BottomPanel p) override {
     bottom_ = p;
@@ -338,7 +370,9 @@ class Gui final : public GuiContext {
         s->targetName = "bottom";
         s->sign = -1;
         s->minSize = 120;
-        s->maxSize = 900;
+        s->maxSize = 2000;
+        s->giveName = "middle";
+        s->giveMin = 180;  // toolbar + ruler + one track row stay visible
         return s;
       });
       skin->registerWidget("VSplitter", [this] {
@@ -346,6 +380,8 @@ class Gui final : public GuiContext {
         s->targetName = "browser";
         s->minSize = 160;
         s->maxSize = 600;
+        s->giveName = "arrange";
+        s->giveMin = 300;
         return s;
       });
       skin->registerWidget("StatusBar", [this] {
@@ -371,6 +407,12 @@ class Gui final : public GuiContext {
     };
     tree.onInvalidate = [this] { invalidate(); };
     tree.textMeasurer = [](std::string_view t, float size) { return measureDip(t, size); };
+    // The bottom panel gives way (down to its tab strip) when the window is too short, so the
+    // status bar always stays inside the window.
+    if (Widget* b = tree.findByName("bottom")) {
+      b->style.shrink = 1;
+      b->style.minHeight = Dim::pt(28);
+    }
     applyPanels();
     return true;
   }
@@ -487,13 +529,34 @@ class Gui final : public GuiContext {
       invalidate();
     }
   }
+  // A focused text field (CharInput) that takes this character. Text fields swallow Tab (9)
+  // without effect, so probing with it is harmless; any other character is really typed.
+  bool focusedTextTakes(uint32_t ch, unsigned mods) {
+    for (Widget* w = tree.focus(); w; w = w->parent())
+      if (auto* ci = dynamic_cast<gui::CharInput*>(w); ci && ci->onChar(ch, mods)) return true;
+    return false;
+  }
   void key(Key k, unsigned mods) {
+    swallowSpaceChar_ = false;
     if (overlays.key(k, mods)) {
       invalidate();
       return;
     }
     if (k == Key::Escape && !dragged_.empty()) {
       dragged_.clear();
+      return;
+    }
+    // Space types a space in a focused text field (search box) instead of starting playback; the
+    // character event that follows the key is then dropped.
+    if (k == Key::Space && !(mods & (kModCtrl | kModAlt)) && focusedTextTakes(' ', mods)) {
+      swallowSpaceChar_ = true;
+      invalidate();
+      return;
+    }
+    // Tab / Shift+Tab select the next / previous clip unless a text field has focus (focus
+    // cycling through the widget tree would otherwise always eat it).
+    if (k == Key::Tab && !(mods & (kModCtrl | kModAlt)) && !focusedTextTakes(9, mods)) {
+      if (gui::handleShortcutKey(*this, k, mods)) invalidate();
       return;
     }
     if (tree.dispatchKey(k, mods)) {
@@ -503,6 +566,10 @@ class Gui final : public GuiContext {
     if (gui::handleShortcutKey(*this, k, mods)) invalidate();
   }
   void chr(uint32_t ch, unsigned mods) {
+    if (ch == ' ' && swallowSpaceChar_) {
+      swallowSpaceChar_ = false;
+      return;
+    }
     if (overlays.chr(ch, mods)) {
       invalidate();
       return;
@@ -517,10 +584,59 @@ class Gui final : public GuiContext {
 
   void idle() {
     sh_.idle();
+    ensureDocument();
     watchDocuments();
     followTheme();
   }
 };
+
+namespace gui {
+void askChoice(GuiContext& ctx, const std::string& message, std::vector<std::string> buttons, std::function<void(int)> onPick) {
+  auto& g = static_cast<Gui&>(ctx);
+  g.overlays.push(makeChoiceOverlay(message, std::move(buttons), std::move(onPick)));
+  g.invalidate();
+}
+void chooseFolder(GuiContext& ctx, const std::string& title, const std::string& initial, std::function<void(const std::string&)> onOk) {
+  auto& g = static_cast<Gui&>(ctx);
+  std::string start = initial.empty() ? songFolder(ctx) : initial;
+  if (start.empty()) start = g.lastDir_;
+  g.overlays.push(makeFolderOverlay(title, start, [&g, cb = std::move(onOk)](const std::string& dir) {
+    g.lastDir_ = dir;
+    if (cb) cb(dir);
+  }));
+  g.invalidate();
+}
+void showMenuBarMenu(GuiContext& ctx, std::vector<MenuItem> items, Point at, std::vector<Rect> titles, int current,
+                     std::function<void(int, int)> openTitle, int how) {
+  auto& g = static_cast<Gui&>(ctx);
+  MenuBarLink link;
+  link.titles = std::move(titles);
+  link.current = current;
+  link.openTitle = std::move(openTitle);
+  link.how = how;
+  g.overlays.push(makeMenuBarOverlay(std::move(items), at, std::move(link)));
+  g.invalidate();
+}
+std::string songFolder(GuiContext& ctx) {
+  auto d = ctx.doc();
+  if (!d) return {};
+  char buf[2048] = {};
+  uint32_t need = 0;
+  if (d->getPath(buf, sizeof buf, &need) != SQ_OK || !buf[0]) return {};
+  std::string p = buf;
+  const size_t k = p.find_last_of("/\\");
+  if (k == std::string::npos) return {};
+  return k == 0 ? std::string("/") : p.substr(0, k);
+}
+}  // namespace gui
+
+std::string Gui::startPath(const std::string& initial) {
+  if (initial.find_first_of("/\\") != std::string::npos) return initial;
+  std::string dir = gui::songFolder(*this);
+  if (dir.empty()) dir = lastDir_;
+  if (dir.empty()) return initial;
+  return initial.empty() ? dir : dir + "/" + initial;
+}
 
 // The software renderer's font metrics (every window backend paints with it). Font size is in
 // DIPs and so is the result (metrics scale linearly).
@@ -768,10 +884,12 @@ int runGui(Shell& shell, int quitAfterMs) {
     sq_document_info di{};
     di.struct_size = sizeof di;
     if (d && d->getDocumentInfo(&di) == SQ_OK && di.modified && !gui.quitConfirmed) {
-      gui.confirm("The song has unsaved changes. Quit without saving?", [&] {
+      gui.overlays.clear();  // Save / Don't Save / Cancel, as for New, Open and Close Song
+      gui::guardUnsavedChanges(gui, [&] {
         gui.quitConfirmed = true;
         window->close();
       });
+      window->invalidate();
       return false;
     }
     return true;
