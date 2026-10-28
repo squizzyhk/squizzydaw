@@ -189,6 +189,8 @@ class Browser final : public Widget, public CharInput {
         if (pressRow_ >= 0 && !dragging_ && (std::fabs(e.x - pressPos_.x) + std::fabs(e.y - pressPos_.y)) > 6) startDrag(pressRow_);
         if (dragging_) {
           dragPos_ = Point{e.x, e.y};
+          if (!dragPath_.empty())
+            if (Widget* arr = findArrange(); arr && arr->frame().contains(e.x, e.y)) arrangeDragOver(arr, e.x, e.y);
           ctx_.invalidate();
         }
         return true;

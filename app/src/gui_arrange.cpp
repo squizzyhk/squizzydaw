@@ -765,10 +765,19 @@ bool ArrangeView::dropFile(float x, float y, const std::string& path) {
   refresh();
   const std::string ext = fileExtension(path);
   const Rect L = lanesRect();
-  const double at = snap(ppqAt(std::max(x, L.x)), 0);
-  const Hit h = hitTest(x, y);
-  int li = h.lane;
-  if (y > L.bottom() || y < L.y) li = -1;
+  double at = 0;
+  int li = -1;
+  if (x < 0) {  // not a mouse drop (browser double-click, Import): edit cursor on the selected track
+    at = ctx_.editState().cursor;
+    const sq_guid sel = ctx_.selectedTrack();
+    for (size_t i = 0; i < lanes_.size(); ++i)
+      if (lanes_[i].t.id == sel) li = static_cast<int>(i);
+  } else {
+    at = snap(ppqAt(std::max(x, L.x)), 0);
+    const Hit h = hitTest(x, y);
+    li = h.lane;
+    if (y > L.bottom() || y < L.y) li = -1;
+  }
   if (isMidiFileExtension(ext)) return importMidiFile(path, li, at);
   if (!isAudioFileExtension(ext)) {
     ctx_.setStatus("cannot import " + path + " (not an audio or MIDI file)");

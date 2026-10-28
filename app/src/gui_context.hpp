@@ -151,6 +151,8 @@ class GuiContext {
   // A file dragged out of the browser: the arrange view asks for it on mouse up.
   virtual std::string draggedFile() const = 0;
   virtual void setDraggedFile(const std::string& path) = 0;
+  // A named widget of the main window ("arrange", "mixer", ...), nullptr if absent.
+  virtual Widget* findWidget(std::string_view name) = 0;
 
   // ---- document helpers (gui_context.cpp) ----
   sq::Ptr<IDocument> doc();

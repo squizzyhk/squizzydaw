@@ -57,28 +57,12 @@ void exportAudio(GuiContext& ctx) {
 }
 
 void importAudio(GuiContext& ctx) {
-  ctx.chooseFile(false, "Import Audio File", {"wav", "flac", "ogg", "mp3", "aif", "aiff", "m4a"}, {}, [&ctx](const std::string& path) {
-    // New audio track at the edit cursor with the file as one clip.
-    const double at = ctx.editState().cursor;
-    ctx.setDraggedFile(path);
-    auto a = sq::makeAttributes();
-    std::string name = path.substr(path.find_last_of("/\\") + 1);
-    a->setString("name", name.c_str());
-    if (SQ_FAILED(ctx.run("Track.AddAudio", a.get()))) return;
-    sq_guid track = ctx.editState().track;
-    auto ts = ctx.tracks();
-    if (!ts.empty()) track = ts.back().id;
-    double lenPpq = 4.0;
-    auto p = sq::makeAttributes();
-    p->setGuid("track", &track);
-    p->setInt("kind", SQ_CLIP_AUDIO);
-    p->setDouble("start", at);
-    p->setDouble("length", lenPpq);
-    p->setString("source", path.c_str());
-    auto res = sq::makeAttributes();
-    ctx.exec(sq::doc::kAddClip, p.get(), res.get());
-    ctx.setDraggedFile({});
-  });
+  ctx.chooseFile(false, "Import Audio or MIDI File", {"wav", "flac", "ogg", "mp3", "aif", "aiff", "m4a", "mid", "midi"}, {},
+                 [&ctx](const std::string& path) {
+                   // The arrange view imports at the edit cursor on the selected track (real file length).
+                   Widget* arr = ctx.findWidget("arrange");
+                   if (!arr || !arrangeDropFile(arr, -1.0f, -1.0f, path)) ctx.setStatus("could not import " + path);
+                 });
 }
 
 }  // namespace

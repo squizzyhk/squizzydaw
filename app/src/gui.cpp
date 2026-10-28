@@ -265,6 +265,7 @@ class Gui final : public GuiContext {
   sq_guid editorClip() const override { return editorClip_; }
   std::string draggedFile() const override { return dragged_; }
   void setDraggedFile(const std::string& path) override { dragged_ = path; }
+  Widget* findWidget(std::string_view name) override { return tree.findByName(name); }
 
   // ---- setup ----
   void loadPalette() {
