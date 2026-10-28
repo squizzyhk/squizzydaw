@@ -7,6 +7,10 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#ifndef _WIN32
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 #include "fakes.hpp"
 #include "sq/app/class_registry.hpp"
@@ -81,9 +85,16 @@ SQ_TEST("record: 2 tracks, 64-frame blocks, 60 s simulated, no ring overflow, sa
   const double wall = static_cast<double>(sq_time_monotonic_ns() - t0) / 1e9;
   REQUIRE_OK(eng->stop());
   const uint64_t deviceXruns = dev->getXrunCount();
-  CHECK(dev->renderThread().priorityApplied());
 #ifdef _WIN32
+  CHECK(dev->renderThread().priorityApplied());
   CHECK(dev->renderThread().mmcssApplied());
+#else
+  // POSIX real-time scheduling needs privileges (root or an RLIMIT_RTPRIO grant); unprivileged
+  // CI runners and desktops without rtprio limits fall back to normal priority, which is allowed.
+  struct rlimit rl {};
+  const bool rtAllowed = geteuid() == 0 || (getrlimit(RLIMIT_RTPRIO, &rl) == 0 && rl.rlim_cur > 0);
+  if (rtAllowed) CHECK(dev->renderThread().priorityApplied());
+  else std::printf("record: real-time priority not permitted for this user; not checked\n");
 #endif
   eng->closeDevice();
 
