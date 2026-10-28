@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include <windows.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -144,8 +145,20 @@ class Win32Window final : public IWindow {
       RegisterClassExW(&wc);
       registered = true;
     }
-    hwnd_ = CreateWindowExW(0, kClassName, widen(d.title).c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, d.width, d.height,
-                            nullptr, nullptr, inst, this);
+    enableDpiAwareness();
+    // WindowDesc sizes are DIPs: scale by the system DPI, and fit the work area.
+    UINT sysDpi = 96;
+    if (HDC sdc = GetDC(nullptr)) {
+      sysDpi = static_cast<UINT>(GetDeviceCaps(sdc, LOGPIXELSX));
+      ReleaseDC(nullptr, sdc);
+    }
+    RECT work{0, 0, 1920, 1080};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int w = MulDiv(d.width, static_cast<int>(sysDpi), 96), h = MulDiv(d.height, static_cast<int>(sysDpi), 96);
+    w = std::min<int>(w, work.right - work.left);
+    h = std::min<int>(h, work.bottom - work.top);
+    hwnd_ = CreateWindowExW(0, kClassName, widen(d.title).c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, w, h, nullptr, nullptr,
+                            inst, this);
     if (hwnd_ && d.visible) show();
   }
   ~Win32Window() override {
@@ -220,6 +233,13 @@ class Win32Window final : public IWindow {
     if (!self) return DefWindowProcW(h, msg, wp, lp);
     switch (msg) {
       case WM_ERASEBKGND: return 1;
+      case WM_DPICHANGED: {
+        const RECT* r = reinterpret_cast<const RECT*>(lp);
+        SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (self->cb_.onDpiChanged) self->cb_.onDpiChanged(static_cast<float>(HIWORD(wp)) / 96.0f);
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+      }
       case WM_GETOBJECT:
         if (self->uia_) {
           bool handled = false;
@@ -339,6 +359,22 @@ class Win32Window final : public IWindow {
     DeleteObject(bmp);
     DeleteDC(mem);
     EndPaint(hwnd_, &ps);
+  }
+
+  // Per-monitor v2 DPI awareness (crisp rendering at 125-200% scaling, follows monitor changes).
+  // Resolved dynamically: older Windows builds simply stay system-aware/unaware.
+  static void enableDpiAwareness() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    if (HMODULE u = GetModuleHandleW(L"user32.dll")) {
+      using SetCtx = BOOL(WINAPI*)(HANDLE);
+      if (auto fn = reinterpret_cast<SetCtx>(reinterpret_cast<void*>(GetProcAddress(u, "SetProcessDpiAwarenessContext")))) {
+        if (fn(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-4)))) return;  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+      }
+      using SetAware = BOOL(WINAPI*)();
+      if (auto fn = reinterpret_cast<SetAware>(reinterpret_cast<void*>(GetProcAddress(u, "SetProcessDPIAware")))) fn();
+    }
   }
 
   static unsigned currentModifiers() {
