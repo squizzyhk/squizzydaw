@@ -1,0 +1,1952 @@
+diff --git a/app/CMakeLists.txt b/app/CMakeLists.txt
+index d72811d..2bc1df9 100644
+--- a/app/CMakeLists.txt
++++ b/app/CMakeLists.txt
+@@ -241,6 +241,52 @@ if(SQ_BUILD_TESTS)
+       Track.Info "ok - 'Keys' .* clips=1 events=1 "
+       Edit.Undo "ok"
+       Track.Info "ok - 'Keys' .* clips=0 events=0 ")
++    # Song persistence: export renders the release / reverb tail by default (tail=0 = hard cut),
++    # the loop range is saved in the song and restored on open, missing media is reported on
++    # open and on export.
++    set(_persist "${CMAKE_BINARY_DIR}/test-output/persist")
++    file(MAKE_DIRECTORY "${_persist}/proj/Media")
++    sq_app_cli_test(app_run_song_persistence none
++      File.New "ok"
++      "Track.AddInstrument name=Keys" "ok"
++      "Clip.CreateMidi length=4" "ok"
++      "Clip.SetNotes notes=3,1,48,110" "ok - 1 note"
++      "Track.AddInsert spec=builtin|reverb|" "ok"
++      "File.ExportAudio path=${_persist}/proj/Media/tail.wav" "ok - exported .*\\(tail [0-9]*\\.?[0-9]*[1-9][0-9]* s, auto\\)"
++      "File.ExportAudio path=${_persist}/cut.wav tail=0" "ok - exported .*\\(tail 0 s\\)"
++      "Transport.SetLoop start=4 end=12" "ok"
++      "Transport.Info" "ok - loop 4\\.\\.12 on \\(song\\)"
++      "Track.AddAudio name=Vox" "ok"
++      "Clip.AddAudio path=${_persist}/proj/Media/tail.wav" "ok - audio clip"
++      "Clip.AddAudio path=${_persist}/proj/Media/never_recorded.wav start=8" "ok - audio clip .*\\(file missing\\)"
++      "File.Save path=${_persist}/proj/song.song" "ok - saved"
++      File.Close "ok"
++      File.New "ok"
++      "Transport.Info" "ok - loop 0\\.\\.0 off"
++      "File.Open path=${_persist}/proj/song.song" "ok - opened .* WARNING: 1 missing media file\\(s\\): never_recorded\\.wav"
++      "Transport.Info" "ok - loop 4\\.\\.12 on \\(song\\)"
++      Transport.ToggleLoop "ok"
++      "Transport.Info" "ok - loop 4\\.\\.12 off \\(song\\)"
++      "File.ExportAudio path=${_persist}/missing.wav" "ok - exported .* WARNING: 1 missing media file\\(s\\) rendered as silence: never_recorded\\.wav")
++    # Takes recorded / bounced into an untitled song live in the temp media folder: the first save
++    # copies them into "<song name> Media" next to the song (TMPDIR / TMP / TEMP point at a test
++    # folder so the temp media folder is known).
++    file(MAKE_DIRECTORY "${_persist}/tmp/SquizzyStudio/Media")
++    sq_app_cli_test(app_run_save_consolidates_media none
++      File.New "ok"
++      "Track.AddInstrument name=Keys" "ok"
++      "Clip.CreateMidi length=4" "ok"
++      "Clip.SetNotes notes=0,1,60,100" "ok"
++      "File.ExportAudio path=${_persist}/tmp/SquizzyStudio/Media/Audio_take_1.wav tail=0" "ok"
++      "Track.AddAudio name=Vox" "ok"
++      "Clip.AddAudio path=${_persist}/tmp/SquizzyStudio/Media/Audio_take_1.wav" "ok - audio clip"
++      "File.Save path=${_persist}/consolidate/Takes.song" "ok - saved \\(1 media file\\(s\\) copied to '.*/consolidate/Takes Media'\\)"
++      File.Save "ok - saved"
++      File.Close "ok"
++      "File.Open path=${_persist}/consolidate/Takes.song" "ok - opened")
++    set_tests_properties(app_run_save_consolidates_media PROPERTIES
++      ENVIRONMENT "TMPDIR=${_persist}/tmp;TMP=${_persist}/tmp;TEMP=${_persist}/tmp"
++      FAIL_REGULAR_EXPRESSION "missing media|could not copy|copied to .*copied to")
+   endif()
+   if(_sq_app_themes)
+     # The real EXE: embedded stock themes, theme switch, device listing, surfaces (no hardware).
+diff --git a/app/src/shell.cpp b/app/src/shell.cpp
+index 9eaf726..d8fa755 100644
+--- a/app/src/shell.cpp
++++ b/app/src/shell.cpp
+@@ -208,6 +208,7 @@ struct Shell::Impl {
+   void bindEngine() {
+ #if SQ_SHELL_ENGINE
+     if (audio) audio->setDocument(active().get());
++    applyLoopFromDocument();
+ #endif
+   }
+ 
+@@ -232,7 +233,7 @@ struct Shell::Impl {
+       }
+       return setMessage(SQ_OK, "new song");
+     });
+-    add("File", "Open", "Open...", [this](IAttributes* a, IAttributes*) {
++    add("File", "Open", "Open...", [this](IAttributes* a, IAttributes* res) {
+       std::string path = str(a, "path");
+       if (path.empty() || !docs) return SQ_E_INVALIDARG;
+       sq::Ptr<IDocument> d;
+@@ -240,14 +241,28 @@ struct Shell::Impl {
+       if (SQ_FAILED(r)) return setMessage(r, "cannot open " + path + ": " + sq_result_string(r));
+       docs->setActiveDocument(d.get());
+       bindEngine();
+-      return setMessage(SQ_OK, "opened " + path);
++      const std::vector<std::string> missing = missingMedia();
++      if (res) res->setInt("missing", static_cast<int64_t>(missing.size()));
++      if (!missing.empty()) sq_log_printf(SQ_LOG_WARN, kTag, "%s: %zu media file(s) missing", path.c_str(), missing.size());
++      return setMessage(SQ_OK, "opened " + path + missingNote(missing, ""));
+     });
+-    add("File", "Save", "Save", [this](IAttributes* a, IAttributes*) {
++    add("File", "Save", "Save", [this](IAttributes* a, IAttributes* res) {
+       auto d = active();
+       if (!d || !docs) return SQ_E_NOTFOUND;
+       std::string path = str(a, "path");
+-      sq_result r = docs->saveDocument(d.get(), path.empty() ? nullptr : path.c_str());
+-      return setMessage(r, SQ_SUCCEEDED(r) ? "saved" : std::string("save failed: ") + sq_result_string(r));
++      if (path.empty()) {
++        char buf[4096];
++        uint32_t need = 0;
++        if (d->getPath(buf, sizeof buf, &need) == SQ_OK) path = buf;
++      }
++      if (path.empty()) return setMessage(SQ_E_INVALIDARG, "save failed: no path (path=<file>)");
++      std::string note;
++      const size_t moved = consolidateMedia(path, &note);
++      if (res) res->setInt("media_copied", static_cast<int64_t>(moved));
++      sq_result r = docs->saveDocument(d.get(), path.c_str());
++      std::string msg = SQ_SUCCEEDED(r) ? std::string("saved") : std::string("save failed: ") + sq_result_string(r);
++      if (moved) msg += " (" + std::to_string(moved) + " media file(s) copied to '" + mediaFolderFor(path) + "')";
++      return setMessage(r, msg + note);
+     }, haveDoc);
+     add("File", "Close", "Close", [this](IAttributes*, IAttributes*) {
+       auto d = active();
+@@ -268,7 +283,7 @@ struct Shell::Impl {
+       formats::dawproject::ExportReport rep;
+       std::string err;
+       sq_result r = formats::dawproject::exportProject(d.get(), path, &rep, &err);
+-      return setMessage(r, SQ_SUCCEEDED(r) ? "exported " + std::to_string(rep.tracks) + " track(s) to " + path : err);
++      return setMessage(r, SQ_SUCCEEDED(r) ? "exported " + dawSummary(rep) + " to " + path : err);
+     }, haveDoc);
+     add("File", "ImportDawProject", "Import DAWproject...", [this](IAttributes* a, IAttributes* res) {
+       std::string path = str(a, "path");
+@@ -287,7 +302,7 @@ struct Shell::Impl {
+       docs->setActiveDocument(d.get());
+       bindEngine();
+       if (res) res->setInt("tracks", rep.tracks);
+-      return setMessage(SQ_OK, "imported " + path);
++      return setMessage(SQ_OK, "imported " + dawSummary(rep) + " from " + path);
+     });
+ #endif
+     add("Transport", "Play", "Play", [this](IAttributes*, IAttributes*) { return audio ? audio->play() : SQ_E_UNSUPPORTED; });
+@@ -317,8 +332,12 @@ struct Shell::Impl {
+       sq_transport_state ts{};
+       ts.struct_size = sizeof ts;
+       audio->getTransportState(&ts);
+-      double s = num(a, "start", ts.loop_start), e = num(a, "end", ts.loop_end > ts.loop_start ? ts.loop_end : s + 16);
+-      return audio->setLoop(s, e, (ts.flags & SQ_TRANSPORT_LOOPING) ? SQ_FALSE : SQ_TRUE);
++      // The song's loop is the main-thread truth (the transport snapshot lags one audio block).
++      double ls = ts.loop_start, le = ts.loop_end;
++      bool on = (ts.flags & SQ_TRANSPORT_LOOPING) != 0;
++      readLoop(activeImpl(), &ls, &le, &on);
++      double s = num(a, "start", ls), e = num(a, "end", le > ls ? le : s + 16);
++      return audio->setLoop(s, e, on ? SQ_FALSE : SQ_TRUE);
+     });
+     add("Transport", "ToggleMetronome", "Metronome", [this](IAttributes*, IAttributes*) {
+       if (!audio) return SQ_E_UNSUPPORTED;
+@@ -710,6 +729,144 @@ struct Shell::Impl {
+   }
+ 
+ #if SQ_SHELL_ENGINE
++#if SQ_SHELL_DAWPROJECT
++  static std::string dawSummary(const formats::dawproject::ExportReport& rep) {
++    size_t warnings = 0;
++    for (char ch : rep.warnings) warnings += ch == '\n' ? 1u : 0u;
++    if (!rep.warnings.empty()) sq_log_printf(SQ_LOG_WARN, kTag, "DAWproject:\n%s", rep.warnings.c_str());
++    return std::to_string(rep.tracks) + " track(s)" + (rep.master ? " + master" : "") + ", " + std::to_string(rep.buses) + " bus(es), " +
++           std::to_string(rep.devices) + " device(s), " + std::to_string(rep.sends) + " send(s), " + std::to_string(rep.automation) +
++           " automation lane(s), " + std::to_string(rep.clips) + " clip(s)" + (warnings ? " (" + std::to_string(warnings) + " warning(s), see log)" : "");
++  }
++#endif
++  // ---- song persistence: loop, media ------------------------------------------------------------
++  // The transport loop is saved in the song as document user properties (not undo steps).
++  static constexpr const char* kLoopStartKey = "user.loop.start";
++  static constexpr const char* kLoopEndKey = "user.loop.end";
++  static constexpr const char* kLoopEnabledKey = "user.loop.enabled";
++  bool applyingLoop = false;  // document -> transport in progress: do not write it back
++  sq::Ptr<IObserver> engineObserver;
++
++  static bool readLoop(const edoc::DocumentImpl* impl, double* start, double* end, bool* enabled) {
++    if (!impl) return false;
++    const edoc::PropertyBag& u = impl->store().props.user;
++    auto s = u.find(kLoopStartKey), e = u.find(kLoopEndKey), on = u.find(kLoopEnabledKey);
++    if (s == u.end() || e == u.end() || s->second.type != SQ_VALUE_DOUBLE || e->second.type != SQ_VALUE_DOUBLE) return false;
++    if (!std::isfinite(s->second.d) || !std::isfinite(e->second.d) || s->second.d < 0) return false;
++    *start = s->second.d;
++    *end = e->second.d;
++    *enabled = on != u.end() && on->second.type == SQ_VALUE_BOOL && on->second.i != 0 && e->second.d > s->second.d;
++    return true;
++  }
++  // Document -> transport (open, new, activation). A song without a saved loop has looping off.
++  void applyLoopFromDocument() {
++    if (!audio) return;
++    edoc::DocumentImpl* impl = activeImpl();
++    if (!impl) return;
++    double s = 0, e = 0;
++    bool on = false;
++    applyingLoop = true;
++    if (readLoop(impl, &s, &e, &on)) audio->setLoop(s, e, on ? SQ_TRUE : SQ_FALSE);
++    else audio->setLoop(0.0, 0.0, SQ_FALSE);
++    applyingLoop = false;
++  }
++  // Transport -> document: every loop change (commands, ruler drags, scripts) ends up in the song.
++  void onLoopChanged(IAttributes* args) {
++    if (applyingLoop || !args) return;
++    edoc::DocumentImpl* impl = activeImpl();
++    if (!impl) return;
++    const double s = args->getDouble("start", 0.0), e = args->getDouble("end", 0.0);
++    if (!std::isfinite(s) || !std::isfinite(e)) return;
++    edoc::Value v;
++    v.type = SQ_VALUE_DOUBLE;
++    v.d = s;
++    impl->setUntrackedDocProperty(kLoopStartKey, v);
++    v.d = e;
++    impl->setUntrackedDocProperty(kLoopEndKey, v);
++    edoc::Value b;
++    b.type = SQ_VALUE_BOOL;
++    b.i = args->getBool("enabled", SQ_FALSE) ? 1 : 0;
++    impl->setUntrackedDocProperty(kLoopEnabledKey, b);
++  }
++
++  // Audio clip sources of the active song whose file does not exist (sorted, unique).
++  std::vector<std::string> missingMedia() const {
++    std::vector<std::string> out;
++    const edoc::DocumentImpl* impl = activeImpl();
++    if (!impl) return out;
++    std::set<std::string> seen;
++    for (const auto& [id, c] : impl->store().clips)
++      if (c.kind == SQ_CLIP_AUDIO && !c.source.empty() && seen.insert(c.source).second && !sq_fs_is_file(c.source.c_str()))
++        out.push_back(c.source);
++    std::sort(out.begin(), out.end());
++    return out;
++  }
++  static std::string fileNameOf(const std::string& p) {
++    const size_t sl = p.find_last_of("/\\");
++    return sl == std::string::npos ? p : p.substr(sl + 1);
++  }
++  static std::string missingNote(const std::vector<std::string>& missing, const char* consequence) {
++    if (missing.empty()) return {};
++    std::string out = " - WARNING: " + std::to_string(missing.size()) + " missing media file(s)" + consequence + ": ";
++    for (size_t i = 0; i < missing.size() && i < 8; ++i) out += (i ? ", " : "") + fileNameOf(missing[i]);
++    if (missing.size() > 8) out += ", ...";
++    return out;
++  }
++
++  static std::string absolutePath(const std::string& p) {
++    sq::Buffer b;
++    std::string out = sq_fs_absolute(p.c_str(), b.out()) == SQ_OK ? b.str() : p;
++    for (char& ch : out)
++      if (ch == '\\') ch = '/';
++    return out;
++  }
++  // "<song folder>/<song name> Media": where takes of an untitled song move to on the first save.
++  static std::string mediaFolderFor(const std::string& songPath) {
++    std::string name = fileNameOf(songPath);
++    const size_t dot = name.find_last_of('.');
++    if (dot != std::string::npos && dot > 0) name = name.substr(0, dot);
++    if (name.empty()) name = "Song";
++    return sq::joinPath(dirOf(absolutePath(songPath)), name + " Media");
++  }
++  // Media recorded or bounced while the song had no file lives in the temp media folder: copy it
++  // into "<song name> Media" next to the song and point the clips at the copies (one untracked
++  // step, not an undo step; the temp files stay for other songs that may still use them).
++  // Returns the number of files copied; `note` gets a warning for files that could not be copied.
++  size_t consolidateMedia(const std::string& songPath, std::string* note) {
++    edoc::DocumentImpl* impl = activeImpl();
++    if (!impl) return 0;
++    std::string temp = absolutePath(sq::joinPath(sq::joinPath(sq::specialDir(SQ_DIR_TEMP), "SquizzyStudio"), "Media"));
++    if (temp.empty()) return 0;
++    if (temp.back() != '/') temp += '/';
++    const std::string dest = mediaFolderFor(songPath);
++    std::map<std::string, std::string> relink;
++    std::vector<std::string> failed;
++    std::set<std::string> used;
++    for (const auto& [id, c] : impl->store().clips) {
++      if (c.kind != SQ_CLIP_AUDIO || c.source.empty() || relink.count(c.source)) continue;
++      const std::string abs = absolutePath(c.source);
++      if (abs.compare(0, temp.size(), temp) != 0 || !sq_fs_is_file(abs.c_str())) continue;
++      sq_fs_create_dirs(dest.c_str());
++      const std::string name = fileNameOf(abs);
++      const size_t dot = name.find_last_of('.');
++      const std::string stem = dot == std::string::npos ? name : name.substr(0, dot), ext = dot == std::string::npos ? "" : name.substr(dot);
++      std::string target = sq::joinPath(dest, name);
++      for (int k = 2; sq_fs_exists(target.c_str()) || used.count(target); ++k) target = sq::joinPath(dest, stem + "-" + std::to_string(k) + ext);
++      if (SQ_FAILED(sq_fs_copy_file(abs.c_str(), target.c_str(), SQ_FALSE))) {
++        failed.push_back(name);
++        continue;
++      }
++      used.insert(target);
++      relink[c.source] = target;
++    }
++    if (!failed.empty() && note) {
++      *note = " - WARNING: could not copy " + std::to_string(failed.size()) + " media file(s) next to the song:";
++      for (const std::string& f : failed) *note += " " + f;
++    }
++    if (!relink.empty()) impl->relinkClipSources(relink);
++    return relink.size();
++  }
++
+   template <class F>
+   sq_result setTrackProp(ITrack* t, const char* key, F&& setter, bool merge = false) {
+     auto p = sq::makeAttributes();
+@@ -721,6 +878,89 @@ struct Shell::Impl {
+     return exec(sq::doc::kSetProperty, p.get());
+   }
+ 
++  // Mixdown / stems. tail=<seconds> renders that much past the end (tail=0: hard cut at the end);
++  // without tail= the export renders until the output has decayed below -90 dBFS (at most
++  // kAutoTailMaxSeconds): a probe render with the maximum tail into a temp WAV measures it.
++  static constexpr double kAutoTailMaxSeconds = 10.0;
++  static constexpr double kTailSilence = 3.1622776601683795e-5;  // -90 dBFS
++
++  sq_result runRender(const sq_render_request& rq, std::vector<std::string>* outputs) {
++    sq::Ptr<IRenderTask> task;
++    sq_result r = audio->startRender(&rq, nullptr, task.put());
++    if (SQ_FAILED(r)) return r;
++    r = task->wait(600000);
++    audio->idle();  // main thread: release the finished render's graph (plugin instances) now
++    if (SQ_SUCCEEDED(r)) r = task->getResult();
++    if (SQ_SUCCEEDED(r) && outputs) {
++      for (uint32_t i = 0; i < task->getOutputCount(); ++i) {
++        char buf[4096];
++        uint32_t need = 0;
++        if (task->getOutputPath(i, buf, sizeof buf, &need) == SQ_OK) outputs->push_back(buf);
++      }
++    }
++    return r;
++  }
++  // Frames at the end of the WAV `path` (whose last `tailSeconds` are the rendered tail) that are
++  // still above -90 dBFS after the end of the range; -1 if the file cannot be read.
++  int64_t audibleTailFrames(const std::string& path, double tailSeconds, double* rate) {
++    auto codecSvc = sq::Ptr<ICodecService>::adopt(codec::findCodec(&sh.registry, "wav", nullptr, SQ_CODEC_READ));
++    if (!codecSvc) return -1;
++    sq::Ptr<IAudioFileReader> reader;
++    if (SQ_FAILED(codecSvc->createReader(reader.put())) || !reader || SQ_FAILED(reader->open(path.c_str()))) return -1;
++    sq_audio_file_format fmt{};
++    fmt.struct_size = sizeof fmt;
++    if (SQ_FAILED(reader->getFormat(&fmt)) || fmt.channels == 0 || fmt.channels > 64 || !(fmt.sample_rate > 0)) return -1;
++    constexpr uint32_t kChunk = 8192;
++    std::vector<float> buf(static_cast<size_t>(kChunk) * fmt.channels);
++    std::vector<float*> ptrs(fmt.channels);
++    for (uint32_t c = 0; c < fmt.channels; ++c) ptrs[c] = &buf[static_cast<size_t>(c) * kChunk];
++    int64_t pos = 0, lastLoud = -1;
++    for (;;) {
++      sq_audio_block blk{ptrs.data(), fmt.channels, kChunk, pos};
++      uint32_t got = 0;
++      if (SQ_FAILED(reader->read(&blk, &got)) || got == 0) break;
++      for (uint32_t c = 0; c < fmt.channels; ++c)
++        for (uint32_t f = 0; f < got; ++f)
++          if (std::fabs(static_cast<double>(ptrs[c][f])) > kTailSilence) lastLoud = std::max<int64_t>(lastLoud, pos + f);
++      pos += got;
++      if (got < kChunk) break;
++    }
++    *rate = fmt.sample_rate;
++    const int64_t body = pos - static_cast<int64_t>(std::llround(tailSeconds * fmt.sample_rate));
++    return std::max<int64_t>(0, lastLoud + 1 - body);
++  }
++  // Tail (seconds) the request needs until its output(s) decayed below -90 dBFS.
++  sq_result measureAutoTail(const sq_render_request& base, double* tail) {
++    *tail = 0;
++    const std::string probe = sq::joinPath(sq::joinPath(sq::specialDir(SQ_DIR_TEMP), "SquizzyStudio"),
++                                           "export-probe-" + std::to_string(sq_process_id()));
++    const bool stems = base.kind == SQ_RENDER_STEMS;
++    const std::string probeOut = stems ? probe : probe + ".wav";
++    sq_render_request rq = base;
++    rq.flags |= SQ_RENDER_TAIL;
++    rq.tail_seconds = kAutoTailMaxSeconds;
++    rq.output = probeOut.c_str();
++    rq.file_extension = "wav";
++    rq.codec_options = nullptr;
++    std::vector<std::string> outputs;
++    sq_result r = runRender(rq, &outputs);
++    if (SQ_SUCCEEDED(r)) {
++      for (const std::string& f : outputs) {
++        double rate = 0;
++        const int64_t frames = audibleTailFrames(f, kAutoTailMaxSeconds, &rate);
++        if (frames < 0) {
++          r = SQ_E_IO;
++          break;
++        }
++        *tail = std::max(*tail, std::ceil(static_cast<double>(frames) / rate * 1000.0) / 1000.0);  // whole ms
++      }
++    }
++    for (const std::string& f : outputs) sq_fs_remove(f.c_str());
++    if (stems) sq_fs_remove_all(probe.c_str());
++    *tail = std::min(*tail, kAutoTailMaxSeconds);
++    return r;
++  }
++
+   sq_result render(IAttributes* a, IAttributes* res, int32_t kind) {
+     auto d = active();
+     if (!d || !audio) return SQ_E_UNSUPPORTED;
+@@ -736,18 +976,28 @@ struct Shell::Impl {
+     rq.start = num(a, "start", 0.0);
+     rq.end = num(a, "end", di.length);
+     if (!(rq.end > rq.start)) return setMessage(SQ_E_INVALIDARG, "nothing to export (empty range)");
+-    rq.tail_seconds = num(a, "tail", 0.0);
++    const bool autoTail = !a || a->getType("tail") == SQ_VALUE_NONE;
++    if (autoTail) {
++      const sq_result pr = measureAutoTail(rq, &rq.tail_seconds);
++      if (SQ_FAILED(pr)) return setMessage(pr, std::string("export failed (tail probe): ") + sq_result_string(pr));
++    } else {
++      rq.tail_seconds = num(a, "tail", 0.0);
++      if (!(rq.tail_seconds >= 0.0 && rq.tail_seconds <= 3600.0)) return setMessage(SQ_E_INVALIDARG, "tail=<0..3600 seconds>");
++    }
+     if (rq.tail_seconds > 0) rq.flags |= SQ_RENDER_TAIL;
+     rq.output = out.c_str();
+     rq.file_extension = ext.c_str();
+-    sq::Ptr<IRenderTask> task;
+-    sq_result r = audio->startRender(&rq, nullptr, task.put());
+-    if (SQ_FAILED(r)) return setMessage(r, std::string("render failed to start: ") + sq_result_string(r));
+-    r = task->wait(600000);
+-    audio->idle();  // main thread: release the finished render's graph (plugin instances) now
+-    if (SQ_SUCCEEDED(r)) r = task->getResult();
+-    if (res && SQ_SUCCEEDED(r)) res->setInt("outputs", task->getOutputCount());
+-    return setMessage(r, SQ_SUCCEEDED(r) ? "exported " + out : std::string("export failed: ") + sq_result_string(r));
++    std::vector<std::string> outputs;
++    const sq_result r = runRender(rq, &outputs);
++    if (SQ_FAILED(r)) return setMessage(r, std::string("export failed: ") + sq_result_string(r));
++    const std::vector<std::string> missing = missingMedia();
++    if (res) {
++      res->setInt("outputs", static_cast<int64_t>(outputs.size()));
++      res->setDouble("tail", rq.tail_seconds);
++      res->setInt("missing", static_cast<int64_t>(missing.size()));
++    }
++    return setMessage(r, "exported " + out + " (tail " + fmtNum(rq.tail_seconds) + " s" + (autoTail ? ", auto" : "") + ")" +
++                             missingNote(missing, " rendered as silence"));
+   }
+ 
+   sq_result exportMidi(IAttributes* a, IAttributes* res) {
+@@ -2006,6 +2256,49 @@ struct Shell::Impl {
+       const sq_result r = audio->setLoop(s, e, on ? SQ_TRUE : SQ_FALSE);
+       return setMessage(r, SQ_SUCCEEDED(r) ? "loop " + fmtNum(s) + ".." + fmtNum(e) + (on ? " on" : " off") : std::string("set loop failed: ") + sq_result_string(r));
+     });
++    add("Transport", "Info", "Transport Info", [this](IAttributes*, IAttributes* res) {
++      if (!audio) return SQ_E_UNSUPPORTED;
++      sq_transport_state ts{};
++      ts.struct_size = sizeof ts;
++      audio->getTransportState(&ts);
++      double s = ts.loop_start, e = ts.loop_end;
++      bool on = (ts.flags & SQ_TRANSPORT_LOOPING) != 0;
++      const bool saved = readLoop(activeImpl(), &s, &e, &on);  // main-thread truth (the snapshot lags a block)
++      if (res) {
++        res->setDouble("loop_start", s);
++        res->setDouble("loop_end", e);
++        res->setBool("looping", on ? SQ_TRUE : SQ_FALSE);
++      }
++      return setMessage(SQ_OK, "loop " + fmtNum(s) + ".." + fmtNum(e) + (on ? " on" : " off") + (saved ? " (song)" : ""));
++    });
++    add("Clip", "AddAudio", "Add Audio Clip", [this](IAttributes* a, IAttributes* res) {
++      auto t = track(a);
++      if (SQ_FAILED(needTrack(t))) return SQ_E_NOTFOUND;
++      if (trackInfo(t.get()).kind != SQ_TRACK_AUDIO) return setMessage(SQ_E_INVALIDARG, trackLabel(t.get()) + " is not an audio track");
++      const std::string path = str(a, "path");
++      if (path.empty()) return setMessage(SQ_E_INVALIDARG, "path=<audio file> required");
++      double start = 0, length = 4;
++      if (a && a->getType("start") != SQ_VALUE_NONE && (!argNum(a, "start", &start) || start < 0)) return setMessage(SQ_E_INVALIDARG, "start=<ppq>");
++      if (a && a->getType("length") != SQ_VALUE_NONE && (!argNum(a, "length", &length) || length <= 0)) return setMessage(SQ_E_INVALIDARG, "length=<ppq>");
++      auto p = sq::makeAttributes();
++      sq_guid tid = nodeId(t.get());
++      p->setGuid("track", &tid);
++      p->setInt("kind", SQ_CLIP_AUDIO);
++      p->setDouble("start", start);
++      p->setDouble("length", length);
++      p->setString("source", absolutePath(path).c_str());
++      auto out = sq::makeAttributes();
++      sq_guid clip{};
++      const sq_result r = step("Add Audio Clip", [&] {
++        sq_result x = exec(sq::doc::kAddClip, p.get(), out.get());
++        if (SQ_SUCCEEDED(x)) out->getGuid("node", &clip);
++        return x;
++      });
++      if (SQ_FAILED(r)) return setMessage(r, std::string("add clip failed: ") + sq_result_string(r));
++      if (res) res->setGuid("node", &clip);
++      return setMessage(SQ_OK, "audio clip " + sq::toString(clip) + " at " + fmtNum(start) + " <- " + fileNameOf(path) +
++                                   (sq_fs_is_file(path.c_str()) ? "" : " (file missing)"));
++    }, haveDoc);
+     add("Transport", "Wait", "Wait", [this](IAttributes* a, IAttributes*) {
+       double ms = 0;
+       if (!argNum(a, "ms", &ms) || ms < 0 || ms > 600000) return setMessage(SQ_E_INVALIDARG, "ms=<0..600000> required");
+@@ -2272,6 +2565,11 @@ sq_result Shell::start(const ShellOptions& opt) {
+     if (std::strcmp(topic, "document.activated") == 0 || std::strcmp(topic, "document.closed") == 0) impl_->bindEngine();
+   }));
+   if (impl_->docs) impl_->docs->addObserver(impl_->docObserver.get());
++  // Loop changes from anywhere (commands, the ruler, scripts) are saved in the active song.
++  impl_->engineObserver = sq::Ptr<IObserver>::adopt(new FnObserver([this](const char* topic, IAttributes* args) {
++    if (std::strcmp(topic, "transport.loop") == 0) impl_->onLoopChanged(args);
++  }));
++  impl_->audio->addObserver(impl_->engineObserver.get());
+   std::string asDir = settings.get("Engine.Autosave.Dir");
+   if (!asDir.empty() && impl_->docs) impl_->docs->setAutosave(asDir, settings.getInt("Engine.Autosave.IntervalMs", 60000));
+   std::string drv = !opt.audioDriver.empty() ? opt.audioDriver : settings.get("Devices.Audio.Driver");
+@@ -2328,6 +2626,8 @@ void Shell::stop() {
+   impl_->closeMidiInputs();  // before the engine goes (the inbox holds a raw engine pointer)
+   impl_->midiInbox = nullptr;
+   impl_->sampleCache.clear();
++  if (impl_->audio && impl_->engineObserver) impl_->audio->removeObserver(impl_->engineObserver.get());
++  impl_->engineObserver = nullptr;
+   if (impl_->audio) {
+     impl_->audio->setDocument(nullptr);
+     impl_->audio->closeDevice();
+diff --git a/engine/audio/src/engine.cpp b/engine/audio/src/engine.cpp
+index ffe7724..fc440bb 100644
+--- a/engine/audio/src/engine.cpp
++++ b/engine/audio/src/engine.cpp
+@@ -1267,6 +1267,14 @@ sq_result AudioEngine::setLoop(sq_ppq_time start, sq_ppq_time end, sq_bool enabl
+   if (enabled && c.b <= c.a) return SQ_E_INVALIDARG;  // shorter than one frame
+   if (!core_->post(c)) return SQ_E_BUSY;
+   notify("transport.state");
++  // The requested loop (main thread; the transport snapshot lags until the audio thread ran):
++  // the app saves it in the song (document properties) from this notification.
++  auto args = sq::makeAttributes();
++  args->setDouble("start", start);
++  args->setDouble("end", end);
++  args->setBool("enabled", enabled ? SQ_TRUE : SQ_FALSE);
++  std::vector<sq::Ptr<IObserver>> obs = observers_;
++  for (auto& o : obs) o->onNotify(static_cast<IAudioEngine*>(this), "transport.loop", args.get());
+   return SQ_OK;
+ }
+ 
+diff --git a/engine/audio/tests/test_verify.cpp b/engine/audio/tests/test_verify.cpp
+index 7bd77c6..b44c0af 100644
+--- a/engine/audio/tests/test_verify.cpp
++++ b/engine/audio/tests/test_verify.cpp
+@@ -365,3 +365,38 @@ SQ_TEST("verify: record stop on a stalled device returns the takes, session free
+   eng->idle();
+   eng->closeDevice();
+ }
++
++namespace {
++class LoopSpy final : public sq::Object<LoopSpy, sq::IObserver> {
++ public:
++  int count = 0;
++  double start = -1, end = -1;
++  bool enabled = false;
++  void SQ_CALL onNotify(sq::IUnknown*, const char* topic, sq::IAttributes* args) override {
++    if (!topic || std::strcmp(topic, "transport.loop") != 0 || !args) return;
++    ++count;
++    start = args->getDouble("start", -1);
++    end = args->getDouble("end", -1);
++    enabled = args->getBool("enabled", SQ_FALSE) != 0;
++  }
++};
++}  // namespace
++
++SQ_TEST("verify: setLoop announces the requested loop at once (the song saves it)") {
++  sq::app::ClassRegistry reg;
++  sq::Ptr<AudioEngine> eng = sq::Ptr<AudioEngine>::adopt(new AudioEngine(&reg, nullptr));
++  REQUIRE_OK(eng->setGraphDesc(rampScene(rampMedia(1000), 0)));
++  auto spy = sq::Ptr<LoopSpy>::adopt(new LoopSpy());
++  REQUIRE_OK(eng->addObserver(spy.get()));
++  REQUIRE_OK(eng->setLoop(4.0, 12.0, SQ_TRUE));
++  CHECK_EQ(spy->count, 1);
++  CHECK_EQ(spy->start, 4.0);
++  CHECK_EQ(spy->end, 12.0);
++  CHECK(spy->enabled);
++  REQUIRE_OK(eng->setLoop(4.0, 12.0, SQ_FALSE));
++  CHECK_EQ(spy->count, 2);
++  CHECK(!spy->enabled);
++  CHECK_EQ(eng->setLoop(2.0, 1.0, SQ_TRUE), SQ_E_INVALIDARG);  // refused: not announced
++  CHECK_EQ(spy->count, 2);
++  REQUIRE_OK(eng->removeObserver(spy.get()));
++}
+diff --git a/engine/doc/include/sq/engine/doc/archive.hpp b/engine/doc/include/sq/engine/doc/archive.hpp
+index 833b2d6..d8c41a4 100644
+--- a/engine/doc/include/sq/engine/doc/archive.hpp
++++ b/engine/doc/include/sq/engine/doc/archive.hpp
+@@ -32,6 +32,12 @@ const char* kindExtension(int32_t kind);  // ".sqsong" | ".sqproject" | ".sqshow
+ 
+ struct ArchiveMeta {
+   std::map<std::string, std::string> extra;  // extra <MetaInfo> attributes (e.g. "originalPath")
++  // Not serialized. The folder of the song file: writeArchive stores audio clip sources that live
++  // in this folder tree RELATIVE to it ("Media/take.wav", '/' separated; anything else stays
++  // absolute); readArchive resolves relative sources against it, and an absolute source that no
++  // longer exists is looked up by file name next to the song (and in its Media folders). Empty =
++  // sources are written / read verbatim (autosave, in-memory archives).
++  std::string mediaBase;
+ };
+ 
+ // Serialized parts in archive order (name -> XML text). metainfo excluded.
+@@ -41,6 +47,13 @@ std::string writeArchive(const Store& s, const ArchiveMeta& meta = {});
+ // Parses container bytes into `out` (replaces it). err (optional) gets a message.
+ sq_result readArchive(const std::string& bytes, Store& out, ArchiveMeta* meta = nullptr, std::string* err = nullptr);
+ 
++// Media path helpers behind ArchiveMeta::mediaBase (exposed for tests).
++bool isAbsoluteMediaPath(const std::string& path);  // "/x", "\\x", "C:/x", "C:\\x"
++// `source` relative to `baseDir` when it lives inside that folder tree, else `source` unchanged.
++std::string relativeMediaPath(const std::string& source, const std::string& baseDir);
++// Inverse of relativeMediaPath (plus the moved-media lookup described at ArchiveMeta).
++std::string resolveMediaPath(const std::string& stored, const std::string& baseDir);
++
+ // Crash-safe file write: temp file in the same folder, flush, verify, rename over the target.
+ sq_result safeWriteFile(const std::string& path, const std::string& data);
+ 
+diff --git a/engine/doc/include/sq/engine/doc/document.hpp b/engine/doc/include/sq/engine/doc/document.hpp
+index c6b40ce..41ecfa4 100644
+--- a/engine/doc/include/sq/engine/doc/document.hpp
++++ b/engine/doc/include/sq/engine/doc/document.hpp
+@@ -16,6 +16,7 @@
+ // MAIN THREAD ONLY.
+ #pragma once
+ 
++#include <map>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -62,6 +63,12 @@ class UndoKeeper {
+   void pushRedo(Transaction&& t) { redo_.push_back(std::move(t)); }
+   uint64_t topSerial() const { return undo_.empty() ? 0 : undo_.back().serial; }
+   void clear() { undo_.clear(); redo_.clear(); }
++  // Every recorded step (undo and redo), for history-wide patches (DocumentImpl untracked edits).
++  template <class F>
++  void forEachStep(F&& f) {
++    for (Transaction& t : undo_) f(t);
++    for (Transaction& t : redo_) f(t);
++  }
+ 
+  private:
+   void trim();
+@@ -155,6 +162,19 @@ class DocumentImpl final : public Object<DocumentImpl, IDocument, IEditor, ISubj
+   void removeJournal(const std::string& key);
+   std::string journal(const std::string& key) const;
+ 
++  // ---- untracked edits ----
++  // State that is saved with the document but is not an edit (transport loop, media relinks): the
++  // store changes WITHOUT an undo step, and every snapshot in the undo/redo history is patched the
++  // same way, so undo/redo never brings an old value back. Refused (SQ_E_BUSY) inside a
++  // transaction.
++  // Sets (type != SQ_VALUE_NONE) or removes a document user property ("user.*" key). Marks the
++  // document modified when the value changed; SQ_S_FALSE when it was already equal.
++  sq_result setUntrackedDocProperty(const std::string& key, const Value& value);
++  // Rewrites audio clip sources (exact path match old -> new), e.g. after media was copied next to
++  // the song on save. Emits "document.changed" (reason "relink") for the clips; does not mark the
++  // document modified (the caller saves). Returns the number of clips changed in the store.
++  size_t relinkClipSources(const std::map<std::string, std::string>& oldToNew);
++
+   const std::string& path() const { return path_; }
+   void setPath(const std::string& p) { path_ = p; }
+   uint64_t editSerial() const { return editSerial_; }  // bumps on every commit/undo/redo
+diff --git a/engine/doc/src/archive.cpp b/engine/doc/src/archive.cpp
+index 0be930c..36b38c4 100644
+--- a/engine/doc/src/archive.cpp
++++ b/engine/doc/src/archive.cpp
+@@ -2,6 +2,7 @@
+ #include "sq/engine/doc/archive.hpp"
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <charconv>
+ #include <cmath>
+ #include <cstring>
+@@ -166,7 +167,7 @@ std::string partTempo(const Store& s) {
+   return xmlWrite(d);
+ }
+ 
+-void writeClip(XmlNode parent, const ClipRec& c) {
++void writeClip(XmlNode parent, const ClipRec& c, const std::string& mediaBase) {
+   XmlNode n = parent.append("Clip");
+   n.setAttr("id", guidStr(c.id));
+   n.setAttr("kind", fmtInt(c.kind));
+@@ -179,7 +180,7 @@ void writeClip(XmlNode parent, const ClipRec& c) {
+   n.setAttr("fadeOut", fmtDouble(c.fadeOut));
+   n.setAttr("flags", fmtInt(c.flags));
+   n.setAttr("color", fmtInt(c.color));
+-  n.setAttr("source", c.source);
++  n.setAttr("source", (mediaBase.empty() || c.kind != SQ_CLIP_AUDIO) ? c.source : relativeMediaPath(c.source, mediaBase));
+   for (const EventRec& e : c.events) {
+     XmlNode ev = n.append("Event");
+     ev.setAttr("pos", fmtDouble(e.pos));
+@@ -190,7 +191,7 @@ void writeClip(XmlNode parent, const ClipRec& c) {
+   writeUser(n, c.user);
+ }
+ 
+-std::string partTracks(const Store& s) {
++std::string partTracks(const Store& s, const std::string& mediaBase) {
+   auto d = xmlCreate("Tracks");
+   XmlNode r = xmlRoot(d);
+   for (const sq_guid& id : s.trackOrder) {
+@@ -219,7 +220,7 @@ std::string partTracks(const Store& s) {
+       }
+     }
+     writeUser(n, t.user);
+-    for (const sq_guid& cid : s.clipsOf(id)) writeClip(n, s.clips.at(cid));
++    for (const sq_guid& cid : s.clipsOf(id)) writeClip(n, s.clips.at(cid), mediaBase);
+   }
+   return xmlWrite(d);
+ }
+@@ -295,22 +296,83 @@ bool normalizeZipTimes(std::string& z) {
+ 
+ }  // namespace
+ 
+-std::vector<std::pair<std::string, std::string>> serializeParts(const Store& s) {
++namespace {
++std::vector<std::pair<std::string, std::string>> serializePartsWith(const Store& s, const std::string& mediaBase) {
+   const std::string k = kindName(s.props.kind);
+   std::vector<std::pair<std::string, std::string>> parts;
+   parts.emplace_back("document.xml", partDocument(s));
+   parts.emplace_back(k + "/tempo.xml", partTempo(s));
+-  parts.emplace_back(k + "/tracks.xml", partTracks(s));
++  parts.emplace_back(k + "/tracks.xml", partTracks(s, mediaBase));
+   parts.emplace_back(k + "/markers.xml", partMarkers(s));
+   parts.emplace_back("uistate.xml", partUi(s));
+   for (const auto& [name, data] : s.foreignParts) parts.emplace_back(name, data);
+   return parts;
+ }
+ 
++// '/' separators, no trailing separator (except a bare root).
++std::string slashed(std::string p) {
++  for (char& ch : p)
++    if (ch == '\\') ch = '/';
++  while (p.size() > 1 && p.back() == '/' && !(p.size() == 3 && p[1] == ':')) p.pop_back();
++  return p;
++}
++std::string normalizedAbsolute(const std::string& p) {
++  sq::Buffer b;
++  return sq_fs_absolute(p.c_str(), b.out()) == SQ_OK ? slashed(b.str()) : slashed(p);
++}
++bool samePathChar(char a, char b) {
++#if defined(_WIN32)
++  return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));  // NTFS: case-insensitive
++#else
++  return a == b;
++#endif
++}
++std::string fileNameOf(const std::string& p) {
++  const size_t s = p.find_last_of("/\\");
++  return s == std::string::npos ? p : p.substr(s + 1);
++}
++}  // namespace
++
++std::vector<std::pair<std::string, std::string>> serializeParts(const Store& s) { return serializePartsWith(s, {}); }
++
++bool isAbsoluteMediaPath(const std::string& p) {
++  if (p.empty()) return false;
++  if (p[0] == '/' || p[0] == '\\') return true;
++  return p.size() >= 2 && p[1] == ':' && std::isalpha(static_cast<unsigned char>(p[0]));
++}
++
++std::string relativeMediaPath(const std::string& source, const std::string& baseDir) {
++  if (baseDir.empty() || !isAbsoluteMediaPath(source) || source.find("://") != std::string::npos) return source;
++  const std::string base = normalizedAbsolute(baseDir), src = normalizedAbsolute(source);
++  if (base.empty() || src.size() <= base.size() + 1) return source;
++  for (size_t i = 0; i < base.size(); ++i)
++    if (!samePathChar(base[i], src[i])) return source;
++  const size_t cut = base.back() == '/' ? base.size() : base.size() + 1;  // "/" or "C:/" roots end in '/'
++  if (base.back() != '/' && src[base.size()] != '/') return source;  // "/a/song" vs "/a/songs/x"
++  std::string rel = src.substr(cut);
++  if (rel.empty() || rel == ".." || rel.rfind("../", 0) == 0 || rel.find("/../") != std::string::npos) return source;
++  return rel;
++}
++
++std::string resolveMediaPath(const std::string& stored, const std::string& baseDir) {
++  if (stored.empty() || baseDir.empty() || stored.find("://") != std::string::npos) return stored;
++  if (!isAbsoluteMediaPath(stored)) return normalizedAbsolute(sq::joinPath(baseDir, stored));
++  if (sq_fs_exists(stored.c_str())) return stored;
++  // Moved project: an absolute path that is gone, with the file next to the song (or in a media
++  // folder there) -> use that copy.
++  const std::string name = fileNameOf(slashed(stored));
++  if (name.empty()) return stored;
++  for (const char* sub : {"", "Media", "Audio"}) {
++    const std::string cand = *sub ? sq::joinPath(sq::joinPath(baseDir, sub), name) : sq::joinPath(baseDir, name);
++    if (sq_fs_is_file(cand.c_str())) return normalizedAbsolute(cand);
++  }
++  return stored;
++}
++
+ std::string writeArchive(const Store& s, const ArchiveMeta& meta) {
+   std::vector<std::pair<std::string, std::string>> parts;
+   parts.emplace_back("metainfo.xml", partMeta(s, meta));
+-  for (auto& p : serializeParts(s)) parts.push_back(std::move(p));
++  for (auto& p : serializePartsWith(s, meta.mediaBase)) parts.push_back(std::move(p));
+ 
+   mz_zip_archive zip;
+   std::memset(&zip, 0, sizeof zip);
+@@ -483,6 +545,7 @@ sq_result readArchive(const std::string& bytes, Store& out, ArchiveMeta* meta, s
+       c.flags = parseU32(cn.attr("flags"));
+       c.color = parseU32(cn.attr("color"));
+       c.source = cn.attr("source");
++      if (meta && !meta->mediaBase.empty() && c.kind == SQ_CLIP_AUDIO) c.source = resolveMediaPath(c.source, meta->mediaBase);
+       if ((c.kind != SQ_CLIP_AUDIO && c.kind != SQ_CLIP_MIDI) || !fin0(c.start) || !fin(c.length) || c.length <= 0.0 ||
+           !fin0(c.sourceOffset) || !fin(c.gainDb) || !fin0(c.fadeIn) || !fin0(c.fadeOut))
+         return fail(SQ_E_PARSE, "bad clip attributes");
+diff --git a/engine/doc/src/document.cpp b/engine/doc/src/document.cpp
+index 4c603ed..1ae4f89 100644
+--- a/engine/doc/src/document.cpp
++++ b/engine/doc/src/document.cpp
+@@ -298,6 +298,62 @@ void DocumentImpl::notify(const char* topic, IAttributes* args) {
+   for (auto& o : obs) o->onNotify(static_cast<IDocument*>(this), topic, args);
+ }
+ 
++sq_result DocumentImpl::setUntrackedDocProperty(const std::string& key, const Value& value) {
++  if (key.size() <= 5 || key.compare(0, 5, "user.") != 0) return SQ_E_INVALIDARG;
++  if (closed_) return SQ_E_CLOSED;
++  if (!levels_.empty()) return SQ_E_BUSY;
++  const bool remove = value.type == SQ_VALUE_NONE;
++  auto patch = [&](PropertyBag& bag) {
++    if (remove) bag.erase(key);
++    else bag[key] = value;
++  };
++  auto it = store_.props.user.find(key);
++  const bool same = remove ? it == store_.props.user.end() : (it != store_.props.user.end() && it->second == value);
++  if (same) return SQ_S_FALSE;
++  patch(store_.props.user);
++  undo_.forEachStep([&](Transaction& t) {
++    for (Change& c : t.changes)
++      if (auto* d = std::get_if<Delta<DocProps>>(&c.data)) {
++        if (d->before) patch(d->before->user);
++        if (d->after) patch(d->after->user);
++      }
++  });
++  ++editSerial_;  // autosave picks it up
++  markModified();
++  return SQ_OK;
++}
++
++size_t DocumentImpl::relinkClipSources(const std::map<std::string, std::string>& oldToNew) {
++  if (oldToNew.empty() || closed_ || !levels_.empty()) return 0;
++  auto patch = [&](ClipRec& c) {
++    if (c.kind != SQ_CLIP_AUDIO) return false;
++    auto it = oldToNew.find(c.source);
++    if (it == oldToNew.end() || it->second == c.source) return false;
++    c.source = it->second;
++    return true;
++  };
++  Transaction note;
++  note.description = "Relink Media";
++  for (auto& [id, c] : store_.clips)
++    if (patch(c)) {
++      Change ch;
++      ch.kind = kChangeClip;
++      ch.id = id;
++      note.changes.push_back(std::move(ch));
++    }
++  undo_.forEachStep([&](Transaction& t) {
++    for (Change& c : t.changes)
++      if (auto* d = std::get_if<Delta<ClipRec>>(&c.data)) {
++        if (d->before) patch(*d->before);
++        if (d->after) patch(*d->after);
++      }
++  });
++  if (note.changes.empty()) return 0;
++  ++editSerial_;
++  emitChanged(note, "relink");
++  return note.changes.size();
++}
++
+ void DocumentImpl::emitModifiedIfToggled(bool wasModified) {
+   const bool now = modified();
+   if (now == wasModified) return;
+diff --git a/engine/doc/src/manager.cpp b/engine/doc/src/manager.cpp
+index 1c944d9..66cf225 100644
+--- a/engine/doc/src/manager.cpp
++++ b/engine/doc/src/manager.cpp
+@@ -10,6 +10,15 @@
+ 
+ namespace sq::edoc {
+ 
++namespace {
++// Folder of a document file (media paths are stored relative to it).
++std::string folderOf(const std::string& path) {
++  const size_t s = path.find_last_of("/\\");
++  if (s == std::string::npos) return ".";
++  return s == 0 ? path.substr(0, 1) : path.substr(0, s);
++}
++}  // namespace
++
+ DocumentManagerImpl::~DocumentManagerImpl() {
+   for (auto& d : docs_) d->markClosed();
+ }
+@@ -60,7 +69,9 @@ sq_result SQ_CALL DocumentManagerImpl::openDocument(const char* path, IDocument*
+     if (!bytes) return sq_fs_exists(path) ? SQ_E_IO : SQ_E_NOTFOUND;
+     Store s;
+     std::string err;
+-    if (sq_result r = readArchive(*bytes, s, nullptr, &err); r != SQ_OK) {
++    ArchiveMeta meta;
++    meta.mediaBase = folderOf(path);
++    if (sq_result r = readArchive(*bytes, s, &meta, &err); r != SQ_OK) {
+       sq_log_printf(SQ_LOG_WARN, "doc", "cannot open '%s': %s", path, err.c_str());
+       return r;
+     }
+@@ -87,7 +98,9 @@ sq_result SQ_CALL DocumentManagerImpl::saveDocument(IDocument* doc, const char*
+   const std::string target = (path && *path) ? std::string(path) : d->path();
+   if (target.empty()) return SQ_E_INVALIDARG;
+   try {
+-    const std::string bytes = writeArchive(d->store());
++    ArchiveMeta meta;
++    meta.mediaBase = folderOf(target);
++    const std::string bytes = writeArchive(d->store(), meta);
+     if (bytes.empty()) return SQ_E_FAIL;
+     if (sq_result r = safeWriteFile(target, bytes); r != SQ_OK) return r;
+     d->setPath(target);
+diff --git a/engine/doc/tests/test_doc_archive.cpp b/engine/doc/tests/test_doc_archive.cpp
+index 4ff25d3..fea0763 100644
+--- a/engine/doc/tests/test_doc_archive.cpp
++++ b/engine/doc/tests/test_doc_archive.cpp
+@@ -1,4 +1,7 @@
+ // engine/doc: XmlArchive round trip (byte-stable), foreign parts, errors, crash-safe write, autosave.
++#include <algorithm>
++#include <map>
++
+ #include "doc_test_util.hpp"
+ 
+ using namespace doctest;
+@@ -216,3 +219,108 @@ SQ_TEST("autosave: interval tick, crash recovery, cleanup on save") {
+   CHECK_EQ(f.mgr->listRecoverable().size(), size_t(0));
+   sq_fs_remove_all(dir.c_str());
+ }
++
++SQ_TEST("archive: media inside the song folder is stored relative and follows a moved project") {
++  const std::string dir = tempDir("media");
++  const std::string proj = sq::joinPath(dir, "proj");
++  const std::string mediaDir = sq::joinPath(proj, "Media");
++  REQUIRE_OK(sq_fs_create_dirs(mediaDir.c_str()));
++  const std::string media = sq::joinPath(mediaDir, "take.wav");
++  REQUIRE_OK(sq::writeFile(media, "RIFF"));
++  const std::string outside = sq::joinPath(dir, "elsewhere.wav");
++  REQUIRE_OK(sq::writeFile(outside, "RIFF"));
++  CHECK(sq::edoc::relativeMediaPath(media, proj) == "Media/take.wav");
++  CHECK(sq::edoc::relativeMediaPath(outside, proj) == outside);
++  const std::string sibling = sq::joinPath(dir, "proj2/x.wav");
++  CHECK(sq::edoc::relativeMediaPath(sibling, proj) == sibling);  // "proj2" is not inside "proj"
++  CHECK(sq::edoc::isAbsoluteMediaPath("C:\\a.wav"));
++  CHECK(sq::edoc::isAbsoluteMediaPath("/a.wav"));
++  CHECK(!sq::edoc::isAbsoluteMediaPath("Media/a.wav"));
++  {
++    Fx f;
++    sq_guid t = addTrack(f.ed.get(), SQ_TRACK_AUDIO, "Vox");
++    addClip(f.ed.get(), t, SQ_CLIP_AUDIO, 0.0, 4.0, media.c_str());
++    sq_guid t2 = addTrack(f.ed.get(), SQ_TRACK_AUDIO, "Ext");
++    addClip(f.ed.get(), t2, SQ_CLIP_AUDIO, 0.0, 4.0, outside.c_str());
++    const std::string song = sq::joinPath(proj, "song.sqsong");
++    REQUIRE_OK(f.mgr->saveDocument(f.doc.get(), song.c_str()));
++    for (const auto& [id, c] : f.st().clips) CHECK(sq::edoc::isAbsoluteMediaPath(c.source));  // in memory: absolute
++    // The archive holds the relative path for the media in the song folder only.
++    sq::edoc::Store raw;
++    auto bytes = sq::readFile(song);
++    REQUIRE(bytes.has_value());
++    REQUIRE_OK(sq::edoc::readArchive(*bytes, raw));
++    std::vector<std::string> stored;
++    for (const auto& [id, c] : raw.clips) stored.push_back(c.source);
++    REQUIRE_EQ(stored.size(), size_t(2));
++    CHECK(std::find(stored.begin(), stored.end(), "Media/take.wav") != stored.end());
++    CHECK(std::find(stored.begin(), stored.end(), outside) != stored.end());
++  }
++  // Move the whole project folder: the relative media resolves at the new place.
++  const std::string moved = sq::joinPath(dir, "moved");
++  REQUIRE_OK(sq_fs_rename(proj.c_str(), moved.c_str()));
++  Ptr<sq::edoc::DocumentManagerImpl> mgr = Ptr<sq::edoc::DocumentManagerImpl>::adopt(new sq::edoc::DocumentManagerImpl());
++  Ptr<sq::IDocument> d;
++  REQUIRE_OK(mgr->openDocument(sq::joinPath(moved, "song.sqsong").c_str(), d.put()));
++  const sq::edoc::DocumentImpl* impl = sq::edoc::DocumentImpl::from(d.get());
++  bool found = false;
++  for (const auto& [id, c] : impl->store().clips)
++    if (c.source.find("take.wav") != std::string::npos) {
++      found = true;
++      CHECK(sq_fs_is_file(c.source.c_str()));
++      CHECK(c.source.find("moved") != std::string::npos);
++    }
++  CHECK(found);
++  // An absolute path that is gone is found next to the song (songs saved before relative paths).
++  CHECK(sq::edoc::resolveMediaPath(sq::joinPath(dir, "gone/Media/take.wav"), moved).find("moved") != std::string::npos);
++  CHECK(sq::edoc::resolveMediaPath("/nowhere/none.wav", moved) == "/nowhere/none.wav");
++  mgr->closeDocument(d.get());
++  sq_fs_remove_all(dir.c_str());
++}
++
++SQ_TEST("document: untracked properties and media relinks stay out of the undo history") {
++  const std::string dir = tempDir("untracked");
++  Fx f;
++  sq_guid t = addTrack(f.ed.get(), SQ_TRACK_AUDIO, "Vox");
++  sq_guid c = addClip(f.ed.get(), t, SQ_CLIP_AUDIO, 0.0, 4.0, "/tmp/SquizzyStudio/Media/take.wav");
++  CHECK_OK(setPropB(f.ed.get(), f.st().props.id, "removeOverlaps", true));  // a DocProps step in the history
++  const uint32_t undos = f.ed->getUndoCount();
++  const std::string p = sq::joinPath(dir, "s.sqsong");
++  REQUIRE_OK(f.mgr->saveDocument(f.doc.get(), p.c_str()));
++  CHECK(!f.impl->modified());
++  sq::edoc::Value v;
++  v.type = SQ_VALUE_DOUBLE;
++  v.d = 8.0;
++  CHECK_EQ(f.impl->setUntrackedDocProperty("user.loop.end", v), SQ_OK);
++  CHECK_EQ(f.impl->setUntrackedDocProperty("user.loop.end", v), SQ_S_FALSE);
++  CHECK_EQ(f.impl->setUntrackedDocProperty("loop.end", v), SQ_E_INVALIDARG);
++  CHECK(f.impl->modified());
++  CHECK_EQ(f.ed->getUndoCount(), undos);
++  // Undoing the earlier DocProps step keeps the loop value.
++  REQUIRE_OK(f.ed->undo());
++  REQUIRE(f.st().props.user.count("user.loop.end"));
++  CHECK_EQ(f.st().props.user.at("user.loop.end").d, 8.0);
++  REQUIRE_OK(f.ed->redo());
++  CHECK_EQ(f.st().props.user.at("user.loop.end").d, 8.0);
++  // Relink: store and history snapshots point at the new file; no undo step.
++  const std::map<std::string, std::string> m{{"/tmp/SquizzyStudio/Media/take.wav", "/songs/a Media/take.wav"}};
++  CHECK_EQ(f.impl->relinkClipSources(m), size_t(1));
++  CHECK_EQ(f.st().clip(c)->source, std::string("/songs/a Media/take.wav"));
++  CHECK_EQ(f.ed->getUndoCount(), undos);
++  REQUIRE_OK(f.ed->undo());  // removeOverlaps
++  REQUIRE_OK(f.ed->undo());  // add clip
++  CHECK(f.st().clip(c) == nullptr);
++  REQUIRE_OK(f.ed->redo());
++  REQUIRE(f.st().clip(c) != nullptr);
++  CHECK_EQ(f.st().clip(c)->source, std::string("/songs/a Media/take.wav"));
++  // Saved and reopened: the loop property persists.
++  REQUIRE_OK(f.mgr->saveDocument(f.doc.get(), p.c_str()));
++  Ptr<sq::edoc::DocumentManagerImpl> mgr = Ptr<sq::edoc::DocumentManagerImpl>::adopt(new sq::edoc::DocumentManagerImpl());
++  Ptr<sq::IDocument> d;
++  REQUIRE_OK(mgr->openDocument(p.c_str(), d.put()));
++  const auto& user = sq::edoc::DocumentImpl::from(d.get())->store().props.user;
++  REQUIRE(user.count("user.loop.end"));
++  CHECK_EQ(user.at("user.loop.end").d, 8.0);
++  mgr->closeDocument(d.get());
++  sq_fs_remove_all(dir.c_str());
++}
+diff --git a/formats/dawproject/include/sq/formats/dawproject/dawproject.hpp b/formats/dawproject/include/sq/formats/dawproject/dawproject.hpp
+index 099ff41..6a9f320 100644
+--- a/formats/dawproject/include/sq/formats/dawproject/dawproject.hpp
++++ b/formats/dawproject/include/sq/formats/dawproject/dawproject.hpp
+@@ -5,13 +5,24 @@
+ //                  <Application name="Squizzy Studio" version="..."/>
+ //                  <Transport><Tempo unit="bpm" value=".."/><TimeSignature numerator denominator/></Transport>
+ //                  <Structure>
+-//                    <Track id name contentType="audio|notes" loaded="true" color="#RRGGBB">
+-//                      <Channel id role="regular" audioChannels solo="false">
+-//                        <Volume unit="decibel" value/> <Pan unit="normalized" value(0..1)/> <Mute value/>
+-//                      </Channel></Track> ...
++//                    <Track id name contentType="audio|notes|tracks" loaded="true" color="#RRGGBB">
++//                      <Channel id role="regular|submix|effect|master" destination="<channel id>" audioChannels solo>
++//                        <Devices>   instrument (deviceRole="instrument") then inserts (deviceRole="audioFX"):
++//                          <BuiltinDevice|Vst3Plugin|ClapPlugin|Vst2Plugin|AuPlugin id deviceID deviceName
++//                             deviceVendor sqFormat sqPath>  (sqFormat/sqPath: Squizzy extension attributes)
++//                            <Enabled value/>  (false = bypassed insert)
++//                            <Parameters><RealParameter id parameterID value/>...</Parameters>
++//                        </Devices>
++//                        <Volume id unit="decibel" value/> <Pan id unit="normalized" value(0..1)/> <Mute id value/>
++//                        <Sends><Send id destination="<bus channel id>" type="pre|post"><Volume id unit="decibel" value/></Send></Sends>
++//                      </Channel>
++//                      <Track .../>  (children of a folder track: contentType="tracks", no channel)
++//                    </Track> ...
+ //                  </Structure>
+ //                  <Arrangement id><Lanes timeUnit="beats">
+-//                      <Lanes track="trackId"><Clips>
++//                      <Lanes track="trackId">
++//                        <Points unit><Target parameter="<parameter id>"/><RealPoint|BoolPoint time value/>...</Points>
++//                        <Clips>
+ //                        <Clip time duration playStart name>
+ //                          audio:  <Audio channels sampleRate duration algorithm="raw"><File path="audio/x.wav"/></Audio>
+ //                                  (playStart = source offset in SECONDS, attribute contentTimeUnit="seconds")
+@@ -24,9 +35,14 @@
+ //   metadata.xml <MetaData><Title/><Application/></MetaData>
+ //   audio/*      copies of every referenced media file (unique names)
+ //
+-// Not covered (documented gaps): automation, devices/plugins, sends, tempo/signature changes after
+-// the first point (only the first tempo and signature are exported), clip fades, comping lanes,
+-// video. Import tolerates unknown elements.
++// Every track kind is exported: audio / instrument tracks, buses (role submix), FX tracks (role
++// effect), the master (role master), folders (nested tracks). Routing is the channel destination
++// (the master channel = the default route), sends keep their level and pre/post, the instrument
++// and inserts are devices with their parameter values, and the automation lanes (volume, pan,
++// mute, send levels, device parameters) are Points targeting those parameters.
++// Not covered (documented gaps): plugin state chunks, tempo/signature changes after the first
++// point (only the first tempo and signature are exported), clip fades, comping lanes, video.
++// Import tolerates unknown elements; devices it cannot map are reported in `warnings`.
+ //
+ // Main thread only (uses document.h, which is main-thread only).
+ #pragma once
+@@ -38,7 +54,9 @@
+ namespace sq::formats::dawproject {
+ 
+ struct ExportReport {
+-  int tracks = 0, clips = 0, notes = 0, media = 0, markers = 0;
++  int tracks = 0, clips = 0, notes = 0, media = 0, markers = 0;  // tracks: every track but the master
++  int buses = 0, devices = 0, sends = 0, automation = 0;          // buses incl. FX tracks; automation lanes
++  bool master = false;
+   std::string warnings;  // newline separated
+ };
+ 
+diff --git a/formats/dawproject/src/dawproject.cpp b/formats/dawproject/src/dawproject.cpp
+index 3be74d3..34b7753 100644
+--- a/formats/dawproject/src/dawproject.cpp
++++ b/formats/dawproject/src/dawproject.cpp
+@@ -7,6 +7,7 @@
+ #include <map>
+ #include <new>
+ #include <set>
++#include <string_view>
+ #include <vector>
+ 
+ #include "sq/cpp/attributes.hpp"
+@@ -58,6 +59,144 @@ sq_result fail(std::string* error, sq_result code, const std::string& msg) {
+   return code;
+ }
+ 
++// ---- Squizzy track properties (see engine/audio automation.hpp / builtin.hpp) -------------------
++std::vector<std::string> lines(const std::string& text) {
++  std::vector<std::string> out;
++  size_t pos = 0;
++  while (pos < text.size()) {
++    const size_t nl = text.find('\n', pos);
++    std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
++    pos = nl == std::string::npos ? text.size() : nl + 1;
++    while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
++    size_t b = 0;
++    while (b < line.size() && (line[b] == ' ' || line[b] == '\t')) ++b;
++    if (b < line.size()) out.push_back(line.substr(b));
++  }
++  return out;
++}
++
++// One insert / instrument spec: "[!]<format>|<id>|<path>[|<index>=<value>]...".
++struct Spec {
++  bool bypassed = false;
++  std::string format, id, path;
++  std::vector<std::pair<uint32_t, double>> params;
++};
++bool parseSpecLine(const std::string& text, Spec& s) {
++  std::string line = text;
++  s = Spec{};
++  if (!line.empty() && line[0] == '!') {
++    s.bypassed = true;
++    line = line.substr(1);
++  }
++  std::vector<std::string> parts;
++  size_t p = 0;
++  for (;;) {
++    const size_t e = line.find('|', p);
++    parts.push_back(line.substr(p, e == std::string::npos ? std::string::npos : e - p));
++    if (e == std::string::npos) break;
++    p = e + 1;
++  }
++  if (parts.size() < 2 || parts[0].empty() || parts[1].empty()) return false;
++  s.format = parts[0];
++  s.id = parts[1];
++  if (parts.size() > 2) s.path = parts[2];
++  for (size_t i = 3; i < parts.size(); ++i) {
++    const size_t eq = parts[i].find('=');
++    int64_t idx = 0;
++    double v = 0;
++    if (eq == std::string::npos || !parseInt(std::string_view(parts[i]).substr(0, eq), idx) || idx < 0 || idx > 0xFFFFFF ||
++        !parseDouble(std::string_view(parts[i]).substr(eq + 1), v))
++      continue;
++    s.params.emplace_back(static_cast<uint32_t>(idx), v);
++  }
++  return true;
++}
++std::string formatSpecLine(const Spec& s) {
++  std::string out = (s.bypassed ? "!" : "") + s.format + "|" + s.id + "|" + s.path;
++  for (const auto& [i, v] : s.params) out += "|" + std::to_string(i) + "=" + fmt(v);
++  return out;
++}
++
++struct Lane {
++  std::string target;
++  std::vector<std::pair<double, double>> points;
++};
++std::vector<Lane> parseLanes(const std::string& text) {
++  std::vector<Lane> out;
++  for (const std::string& line : lines(text)) {
++    Lane l;
++    size_t sp = line.find(' ');
++    l.target = line.substr(0, sp);
++    while (sp != std::string::npos) {
++      const size_t b = sp + 1;
++      sp = line.find(' ', b);
++      const std::string tok = line.substr(b, sp == std::string::npos ? std::string::npos : sp - b);
++      const size_t colon = tok.find(':');
++      double pos = 0, v = 0;
++      if (colon != std::string::npos && parseDouble(std::string_view(tok).substr(0, colon), pos) &&
++          parseDouble(std::string_view(tok).substr(colon + 1), v))
++        l.points.emplace_back(pos, v);
++    }
++    if (!l.target.empty()) out.push_back(std::move(l));
++  }
++  return out;
++}
++
++// DAWproject device element <-> Squizzy spec format.
++const char* deviceElement(const std::string& format) {
++  if (format == "vst3") return "Vst3Plugin";
++  if (format == "clap") return "ClapPlugin";
++  if (format == "vst2" || format == "vst") return "Vst2Plugin";
++  if (format == "au") return "AuPlugin";
++  return "BuiltinDevice";
++}
++constexpr const char* kVendor = "Squizzy Studio";
++
++// Writes one device; `automated` = parameter indices automation lanes refer to (they need an
++// element to target even when the spec keeps their default). Returns the parameter id per index.
++std::map<uint32_t, std::string> writeDevice(XmlNode devices, const Spec& s, const char* role, const std::string& devId,
++                                            const std::set<uint32_t>& automated) {
++  XmlNode d = devices.append(deviceElement(s.format));
++  d.setAttr("id", devId);
++  d.setAttr("deviceRole", role);
++  d.setAttr("deviceID", s.id);
++  d.setAttr("deviceName", s.id);
++  d.setAttr("loaded", "true");
++  if (s.format == "builtin") d.setAttr("deviceVendor", kVendor);
++  // Extension attributes (ignored by other readers): the Squizzy spec fields.
++  d.setAttr("sqFormat", s.format);
++  if (!s.path.empty()) d.setAttr("sqPath", s.path);
++  XmlNode en = d.append("Enabled");
++  en.setAttr("id", devId + "-enabled");
++  en.setAttr("value", s.bypassed ? "false" : "true");
++  std::map<uint32_t, double> values(s.params.begin(), s.params.end());
++  std::set<uint32_t> all = automated;
++  for (const auto& [i, v] : values) all.insert(i);
++  std::map<uint32_t, std::string> ids;
++  if (all.empty()) return ids;
++  XmlNode params = d.append("Parameters");
++  for (uint32_t i : all) {
++    XmlNode p = params.append("RealParameter");
++    const std::string pid = devId + "-p" + std::to_string(i);
++    p.setAttr("id", pid);
++    p.setAttr("parameterID", std::to_string(i));
++    p.setAttr("name", "Parameter " + std::to_string(i));
++    p.setAttr("unit", "linear");
++    auto it = values.find(i);
++    if (it != values.end()) p.setAttr("value", fmt(it->second));
++    ids[i] = pid;
++  }
++  return ids;
++}
++
++struct TrackOut {
++  sq::Ptr<ITrack> t;
++  sq_track_info info{};
++  sq_guid id{}, parent{};
++  std::string tid, name, chanId;  // chanId empty: no channel (folder)
++  sq::Ptr<IAttributes> props;
++};
++
+ }  // namespace
+ 
+ sq_result exportProject(IDocument* doc, const std::string& path, ExportReport* report, std::string* error) {
+@@ -103,47 +242,191 @@ sq_result exportProject(IDocument* doc, const std::string& path, ExportReport* r
+   sq_document_info di{};
+   di.struct_size = sizeof di;
+   doc->getDocumentInfo(&di);
++
++  // Pass 1: every track with its ids (routing needs the channel ids of later tracks).
++  std::vector<TrackOut> tracks;
++  std::map<sq_guid, size_t> byId;
++  std::string masterChan;
++  for (uint32_t ti = 0; ti < di.track_count; ++ti) {
++    TrackOut o;
++    if (doc->getTrack(ti, o.t.put()) != SQ_OK || !o.t) continue;
++    o.info.struct_size = sizeof o.info;
++    if (o.t->getTrackInfo(&o.info) != SQ_OK) continue;
++    o.t->getId(&o.id);
++    o.props = sq::makeAttributes();
++    if (SQ_FAILED(o.t->getProperties(o.props.get()))) o.props = sq::makeAttributes();
++    o.props->getGuid("parent", &o.parent);
++    o.name = nodeName(o.t.get());
++    o.tid = "track" + std::to_string(tracks.size() + 1);
++    if (o.info.kind != SQ_TRACK_FOLDER) o.chanId = o.tid + "-channel";
++    if (o.info.kind == SQ_TRACK_MASTER && masterChan.empty()) masterChan = o.chanId;
++    byId[o.id] = tracks.size();
++    tracks.push_back(std::move(o));
++  }
++  auto chanOf = [&](const sq_guid& g) -> std::string {
++    auto it = byId.find(g);
++    return it == byId.end() ? std::string() : tracks[it->second].chanId;
++  };
++
+   std::map<std::string, std::string> mediaNames;  // source path -> archive member
+   std::set<std::string> usedNames;
+-  int idCounter = 0;
+-  for (uint32_t ti = 0; ti < di.track_count; ++ti) {
+-    sq::Ptr<ITrack> t;
+-    if (doc->getTrack(ti, t.put()) != SQ_OK || !t) continue;
+-    sq_track_info info{};
+-    info.struct_size = sizeof info;
+-    if (t->getTrackInfo(&info) != SQ_OK) continue;
+-    if (info.kind != SQ_TRACK_AUDIO && info.kind != SQ_TRACK_INSTRUMENT) {
+-      rep.warnings += "track '" + nodeName(t.get()) + "' skipped (only audio and instrument tracks are exported)\n";
+-      continue;
+-    }
+-    std::string tid = "track" + std::to_string(++idCounter);
+-    XmlNode tr = structure.append("Track");
+-    tr.setAttr("id", tid);
+-    tr.setAttr("name", nodeName(t.get()));
+-    tr.setAttr("contentType", info.kind == SQ_TRACK_AUDIO ? "audio" : "notes");
++  std::map<size_t, XmlNode> trackNodes;
++  for (size_t idx = 0; idx < tracks.size(); ++idx) {
++    TrackOut& o = tracks[idx];
++    const sq_track_info& info = o.info;
++    const bool master = info.kind == SQ_TRACK_MASTER, folder = info.kind == SQ_TRACK_FOLDER;
++    // Folder children nest inside the folder's <Track> (folders come before their children).
++    XmlNode parentNode = structure;
++    if (auto pit = byId.find(o.parent); !sq_guid_is_null(&o.parent) && pit != byId.end() && trackNodes.count(pit->second))
++      parentNode = trackNodes[pit->second];
++    XmlNode tr = parentNode.append("Track");
++    trackNodes[idx] = tr;
++    tr.setAttr("id", o.tid);
++    tr.setAttr("name", o.name);
++    tr.setAttr("contentType", folder ? "tracks" : info.kind == SQ_TRACK_INSTRUMENT ? "notes" : "audio");
+     tr.setAttr("loaded", "true");
+     if (info.color) tr.setAttr("color", colorStr(info.color));
+-    XmlNode ch = tr.append("Channel");
+-    ch.setAttr("id", tid + "-channel");
+-    ch.setAttr("role", "regular");
+-    ch.setAttr("audioChannels", std::to_string(info.channels ? info.channels : 2));
+-    ch.setAttr("solo", (info.flags & SQ_TRACK_SOLO) ? "true" : "false");
+-    XmlNode vol = ch.append("Volume");
+-    vol.setAttr("unit", "decibel");
+-    vol.setAttr("value", fmt(info.volume_db));
+-    XmlNode pan = ch.append("Pan");
+-    pan.setAttr("unit", "normalized");
+-    pan.setAttr("value", fmt((info.pan + 1.0) / 2.0));
+-    XmlNode mute = ch.append("Mute");
+-    mute.setAttr("value", (info.flags & SQ_TRACK_MUTE) ? "true" : "false");
+-    ++rep.tracks;
+-
+-    XmlNode tl = lanes.append("Lanes");
+-    tl.setAttr("track", tid);
+-    XmlNode clips = tl.append("Clips");
++    if (master) rep.master = true;
++    else ++rep.tracks;
++    if (info.kind == SQ_TRACK_BUS || info.kind == SQ_TRACK_FX) ++rep.buses;
++
++    const std::vector<Lane> autoLanes = parseLanes(sq::getAttrString(o.props.get(), "automation"));
++    std::map<std::string, std::string> targetIds;  // automation target -> parameter id
++    if (!folder) {
++      XmlNode ch = tr.append("Channel");
++      ch.setAttr("id", o.chanId);
++      ch.setAttr("role", master ? "master" : info.kind == SQ_TRACK_FX ? "effect" : info.kind == SQ_TRACK_BUS ? "submix" : "regular");
++      ch.setAttr("audioChannels", std::to_string(info.channels ? info.channels : 2));
++      ch.setAttr("solo", (info.flags & SQ_TRACK_SOLO) ? "true" : "false");
++      if (!master) {
++        const std::string dest = sq_guid_is_null(&info.output) ? masterChan : chanOf(info.output);
++        if (!dest.empty()) ch.setAttr("destination", dest);
++      }
++      // Devices: the instrument, then the inserts (bypassed ones disabled).
++      std::map<uint32_t, std::set<uint32_t>> insertAuto;
++      std::set<uint32_t> instAuto;
++      for (const Lane& l : autoLanes) {
++        int64_t a = 0, b = 0;
++        if (l.target.rfind("insert.", 0) == 0) {
++          const size_t dot = l.target.find('.', 7);
++          if (dot != std::string::npos && parseInt(std::string_view(l.target).substr(7, dot - 7), a) &&
++              parseInt(std::string_view(l.target).substr(dot + 1), b) && a >= 0 && b >= 0 && a < 4096 && b <= 0xFFFFFF)
++            insertAuto[static_cast<uint32_t>(a)].insert(static_cast<uint32_t>(b));
++        } else if (l.target.rfind("instrument.", 0) == 0 && parseInt(std::string_view(l.target).substr(11), a) && a >= 0 && a <= 0xFFFFFF) {
++          instAuto.insert(static_cast<uint32_t>(a));
++        }
++      }
++      const std::string instText = info.kind == SQ_TRACK_INSTRUMENT ? sq::getAttrString(o.props.get(), "user.instrument") : std::string();
++      const std::vector<std::string> inserts = lines(sq::getAttrString(o.props.get(), "user.inserts"));
++      if (!lines(instText).empty() || !inserts.empty()) {
++        XmlNode devices = ch.append("Devices");
++        Spec s;
++        const std::vector<std::string> inst = lines(instText);
++        if (!inst.empty() && parseSpecLine(inst[0], s)) {
++          for (const auto& [i, pid] : writeDevice(devices, s, "instrument", o.tid + "-instrument", instAuto))
++            targetIds["instrument." + std::to_string(i)] = pid;
++          ++rep.devices;
++        }
++        for (size_t k = 0; k < inserts.size(); ++k) {
++          if (!parseSpecLine(inserts[k], s)) {
++            rep.warnings += "track '" + o.name + "': insert " + std::to_string(k) + " not exported (unreadable spec)\n";
++            continue;
++          }
++          const std::set<uint32_t> none;
++          auto ia = insertAuto.find(static_cast<uint32_t>(k));
++          for (const auto& [i, pid] : writeDevice(devices, s, "audioFX", o.tid + "-insert" + std::to_string(k), ia == insertAuto.end() ? none : ia->second))
++            targetIds["insert." + std::to_string(k) + "." + std::to_string(i)] = pid;
++          ++rep.devices;
++        }
++      }
++      XmlNode vol = ch.append("Volume");
++      vol.setAttr("id", o.tid + "-volume");
++      vol.setAttr("name", "Volume");
++      vol.setAttr("unit", "decibel");
++      vol.setAttr("value", fmt(info.volume_db));
++      targetIds["volume"] = o.tid + "-volume";
++      XmlNode pan = ch.append("Pan");
++      pan.setAttr("id", o.tid + "-pan");
++      pan.setAttr("name", "Pan");
++      pan.setAttr("unit", "normalized");
++      pan.setAttr("min", "0");
++      pan.setAttr("max", "1");
++      pan.setAttr("value", fmt((info.pan + 1.0) / 2.0));
++      targetIds["pan"] = o.tid + "-pan";
++      XmlNode mute = ch.append("Mute");
++      mute.setAttr("id", o.tid + "-mute");
++      mute.setAttr("name", "Mute");
++      mute.setAttr("value", (info.flags & SQ_TRACK_MUTE) ? "true" : "false");
++      targetIds["mute"] = o.tid + "-mute";
++      // Sends: "<bus guid> <dB> [pre]" per line.
++      const std::vector<std::string> sends = lines(sq::getAttrString(o.props.get(), "user.sends"));
++      if (!sends.empty()) {
++        XmlNode xs = ch.append("Sends");
++        for (size_t k = 0; k < sends.size(); ++k) {
++          const size_t sp = sends[k].find(' ');
++          sq_guid bus{};
++          std::string dest;
++          if (sq::parseGuid(sends[k].substr(0, sp), bus)) dest = chanOf(bus);
++          if (dest.empty()) {
++            rep.warnings += "track '" + o.name + "': send " + std::to_string(k) + " not exported (no such bus)\n";
++            continue;
++          }
++          double db = 0;
++          if (sp != std::string::npos) {
++            const std::string rest = sends[k].substr(sp + 1);
++            parseDouble(std::string_view(rest).substr(0, rest.find(' ')), db);
++          }
++          const std::string sid = o.tid + "-send" + std::to_string(k);
++          XmlNode x = xs.append("Send");
++          x.setAttr("id", sid);
++          x.setAttr("destination", dest);
++          x.setAttr("type", sends[k].find(" pre", sp) != std::string::npos ? "pre" : "post");
++          XmlNode sv = x.append("Volume");
++          sv.setAttr("id", sid + "-volume");
++          sv.setAttr("name", "Send");
++          sv.setAttr("unit", "decibel");
++          sv.setAttr("value", fmt(db));
++          targetIds["send." + std::to_string(k)] = sid + "-volume";
++          ++rep.sends;
++        }
++      }
++    }
++
++    XmlNode tl;
++    auto trackLanes = [&]() {
++      if (!tl) {
++        tl = lanes.append("Lanes");
++        tl.setAttr("track", o.tid);
++      }
++      return tl;
++    };
++    // Automation lanes as <Points> targeting the parameters above (values in the target's unit).
++    for (const Lane& l : autoLanes) {
++      auto it = targetIds.find(l.target);
++      if (it == targetIds.end()) {
++        rep.warnings += "track '" + o.name + "': automation '" + l.target + "' not exported\n";
++        continue;
++      }
++      XmlNode pts = trackLanes().append("Points");
++      pts.setAttr("id", it->second + "-automation");
++      XmlNode target = pts.append("Target");
++      target.setAttr("parameter", it->second);
++      const bool isMute = l.target == "mute", isPan = l.target == "pan";
++      const bool isDb = l.target == "volume" || l.target.rfind("send.", 0) == 0;
++      pts.setAttr("unit", isDb ? "decibel" : isPan ? "normalized" : "linear");
++      for (const auto& [pos, v] : l.points) {
++        XmlNode pt = pts.append(isMute ? "BoolPoint" : "RealPoint");
++        pt.setAttr("time", fmt(pos));
++        pt.setAttr("value", isMute ? (v >= 0.5 ? "true" : "false") : fmt(isPan ? (v + 1.0) / 2.0 : v));
++      }
++      ++rep.automation;
++    }
++
++    if (info.clip_count == 0) continue;
++    XmlNode clips = trackLanes().append("Clips");
+     for (uint32_t ci = 0; ci < info.clip_count; ++ci) {
+       sq::Ptr<IClip> c;
+-      if (t->getClip(ci, c.put()) != SQ_OK || !c) continue;
++      if (o.t->getClip(ci, c.put()) != SQ_OK || !c) continue;
+       sq_clip_info cinfo{};
+       cinfo.struct_size = sizeof cinfo;
+       if (c->getClipInfo(&cinfo) != SQ_OK) continue;
+@@ -225,6 +508,58 @@ sq_result exportProject(IDocument* doc, const std::string& path, ExportReport* r
+ }
+ 
+ namespace {
++
++// engine/doc's kSetAutomation action (sq/engine/doc/actions.hpp): track:guid param:string
++// points:blob(double[2n]). Same class id; this library does not link engine/doc.
++constexpr sq_guid kSetAutomation = sq::guid("{14D5E2BA-6EC7-4616-A188-F9A29E14D634}");
++
++// One <Track> of the structure, flattened (nesting -> parent folder).
++struct TrackIn {
++  XmlNode node, channel;
++  std::string tid, parentTid;
++  int32_t kind = 0;
++  sq_guid guid{};
++};
++void collectTracks(XmlNode parent, const std::string& parentTid, std::vector<TrackIn>& out, std::string& warnings) {
++  for (XmlNode t : parent.children("Track")) {
++    TrackIn in;
++    in.node = t;
++    in.channel = t.child("Channel");
++    in.tid = t.attr("id");
++    in.parentTid = parentTid;
++    const std::string ct = t.attr("contentType"), role = in.channel ? in.channel.attr("role") : std::string();
++    const bool hasChildren = static_cast<bool>(t.child("Track"));
++    if (role == "master") in.kind = SQ_TRACK_MASTER;
++    else if (hasChildren || (ct.find("tracks") != std::string::npos && ct.find("notes") == std::string::npos && ct.find("audio") == std::string::npos))
++      in.kind = SQ_TRACK_FOLDER;
++    else if (role == "effect") in.kind = SQ_TRACK_FX;
++    else if (role == "submix") in.kind = SQ_TRACK_BUS;
++    else if (ct.find("notes") != std::string::npos) in.kind = SQ_TRACK_INSTRUMENT;
++    else if (ct.find("audio") != std::string::npos) in.kind = SQ_TRACK_AUDIO;
++    if (!in.kind) warnings += "track '" + t.attr("name") + "' skipped (contentType " + ct + ")\n";
++    else out.push_back(in);
++    if (hasChildren) collectTracks(t, in.kind == SQ_TRACK_FOLDER ? in.tid : parentTid, out, warnings);
++  }
++}
++void collectPoints(XmlNode n, std::vector<XmlNode>& out) {
++  for (XmlNode c : n.children()) {
++    if (c.name() == "Points") out.push_back(c);
++    else if (c.name() == "Lanes") collectPoints(c, out);
++  }
++}
++double toDb(const XmlNode& p, double v) {
++  if (p.attr("unit") == "linear") return v > 0 ? 20.0 * std::log10(v) : -144.0;
++  return v;
++}
++
++// An automatable parameter found in the structure.
++struct ParamRef {
++  sq_guid track{};
++  std::string target;  // Squizzy automation target
++  enum Kind { Db, Pan, Mute, Plain } kind = Plain;
++  bool linear = false;  // Db stored as linear gain
++};
++
+ sq_result importProjectImpl(const std::string& path, IDocument* doc, const std::string& mediaDir, ExportReport* report, std::string* error) {
+   if (!doc) return fail(error, SQ_E_INVALIDARG, "no document");
+   ZipArchive zip;
+@@ -274,54 +609,163 @@ sq_result importProjectImpl(const std::string& path, IDocument* doc, const std::
+     p->setInt("denominator", d);
+     r = exec(sq::doc::kSetSignature, p.get(), nullptr);
+   }
+-  // Tracks.
+-  std::map<std::string, std::pair<sq_guid, int32_t>> trackIds;  // dawproject id -> (guid, kind)
+-  for (XmlNode t : root.child("Structure").children("Track")) {
+-    if (SQ_FAILED(r)) break;
+-    std::string ct = t.attr("contentType");
+-    int32_t kind = ct.find("notes") != std::string::npos ? SQ_TRACK_INSTRUMENT : ct.find("audio") != std::string::npos ? SQ_TRACK_AUDIO : 0;
+-    if (!kind) {
+-      rep.warnings += "track '" + t.attr("name") + "' skipped (contentType " + ct + ")\n";
+-      continue;
++  // Tracks: create them all first (routing and sends refer to later ones).
++  std::vector<TrackIn> ins;
++  collectTracks(root.child("Structure"), {}, ins, rep.warnings);
++  std::map<std::string, size_t> byTid, byChannel;
++  sq_guid existingMaster{};
++  {
++    sq_document_info di{};
++    di.struct_size = sizeof di;
++    doc->getDocumentInfo(&di);
++    for (uint32_t i = 0; i < di.track_count; ++i) {
++      sq::Ptr<ITrack> t;
++      sq_track_info info{};
++      info.struct_size = sizeof info;
++      if (doc->getTrack(i, t.put()) == SQ_OK && t->getTrackInfo(&info) == SQ_OK && info.kind == SQ_TRACK_MASTER) t->getId(&existingMaster);
+     }
+-    XmlNode ch = t.child("Channel");
+-    auto p = sq::makeAttributes();
+-    p->setInt("kind", kind);
+-    p->setString("name", t.attr("name").c_str());
+-    int64_t chans = 2;
+-    if (ch) parseInt(ch.attr("audioChannels", "2"), chans);
+-    p->setInt("channels", chans == 1 ? 1 : 2);
+-    auto res = sq::makeAttributes();
+-    r = exec(sq::doc::kAddTrack, p.get(), res.get());
++  }
++  for (size_t k = 0; k < ins.size() && SQ_SUCCEEDED(r); ++k) {
++    TrackIn& in = ins[k];
++    if (in.kind == SQ_TRACK_MASTER && !sq_guid_is_null(&existingMaster)) {
++      in.guid = existingMaster;
++    } else {
++      auto p = sq::makeAttributes();
++      p->setInt("kind", in.kind);
++      p->setString("name", in.node.attr("name").c_str());
++      int64_t chans = 2;
++      if (in.channel) parseInt(in.channel.attr("audioChannels", "2"), chans);
++      p->setInt("channels", chans == 1 ? 1 : 2);
++      auto pt = byTid.find(in.parentTid);
++      if (!in.parentTid.empty() && pt != byTid.end()) p->setGuid("parent", &ins[pt->second].guid);
++      auto res = sq::makeAttributes();
++      r = exec(sq::doc::kAddTrack, p.get(), res.get());
++      if (SQ_FAILED(r)) break;
++      res->getGuid("node", &in.guid);
++      if (in.kind == SQ_TRACK_MASTER) existingMaster = in.guid;
++    }
++    if (in.kind == SQ_TRACK_MASTER) rep.master = true;
++    else ++rep.tracks;
++    if (in.kind == SQ_TRACK_BUS || in.kind == SQ_TRACK_FX) ++rep.buses;
++    if (!in.tid.empty()) byTid[in.tid] = k;
++    if (in.channel && in.channel.hasAttr("id")) byChannel[in.channel.attr("id")] = k;
++  }
++  // Mixer state: volume / pan / mute, routing, sends, devices; collects automatable parameters.
++  std::map<std::string, ParamRef> params;  // parameter element id -> target
++  auto setProp = [&](const sq_guid& g, const char* key, auto&& setter) {
++    auto q = sq::makeAttributes();
++    q->setGuid("node", &g);
++    q->setString("key", key);
++    setter(q.get());
++    return exec(sq::doc::kSetProperty, q.get(), nullptr);
++  };
++  auto busOf = [&](const std::string& chan) -> const TrackIn* {
++    auto it = byChannel.find(chan);
++    return it == byChannel.end() ? nullptr : &ins[it->second];
++  };
++  for (TrackIn& in : ins) {
+     if (SQ_FAILED(r)) break;
+-    sq_guid g{};
+-    res->getGuid("node", &g);
+-    trackIds[t.attr("id")] = {g, kind};
+-    ++rep.tracks;
+-    auto setProp = [&](const char* key, auto&& setter) {
+-      auto q = sq::makeAttributes();
+-      q->setGuid("node", &g);
+-      q->setString("key", key);
+-      setter(q.get());
+-      return exec(sq::doc::kSetProperty, q.get(), nullptr);
+-    };
+-    if (ch) {
++    const sq_guid g = in.guid;
++    const std::string tname = in.node.attr("name");
++    if (XmlNode ch = in.channel) {
+       if (XmlNode v = ch.child("Volume")) {
+-        double db = attrD(v, "value", 0.0);
+-        if (v.attr("unit") == "linear") db = db > 0 ? 20.0 * std::log10(db) : -144.0;
+-        if (db != 0) r = setProp("volumeDb", [&](IAttributes* a) { a->setDouble("value", db); });
++        const double db = toDb(v, attrD(v, "value", v.attr("unit") == "linear" ? 1.0 : 0.0));
++        if (db != 0) r = setProp(g, "volumeDb", [&](IAttributes* a) { a->setDouble("value", std::fmin(24.0, db)); });
++        if (v.hasAttr("id")) params[v.attr("id")] = ParamRef{g, "volume", ParamRef::Db, v.attr("unit") == "linear"};
+       }
+       if (XmlNode pn = ch.child("Pan"); pn && SQ_SUCCEEDED(r)) {
+         double v = attrD(pn, "value", 0.5);
+         double pan = pn.attr("unit") == "normalized" ? v * 2.0 - 1.0 : v;
+-        if (pan != 0) r = setProp("pan", [&](IAttributes* a) { a->setDouble("value", std::fmax(-1.0, std::fmin(1.0, pan))); });
++        if (pan != 0) r = setProp(g, "pan", [&](IAttributes* a) { a->setDouble("value", std::fmax(-1.0, std::fmin(1.0, pan))); });
++        if (pn.hasAttr("id")) params[pn.attr("id")] = ParamRef{g, "pan", pn.attr("unit") == "normalized" ? ParamRef::Pan : ParamRef::Plain, false};
++      }
++      if (XmlNode m = ch.child("Mute"); m && SQ_SUCCEEDED(r)) {
++        if (m.attr("value") == "true") r = setProp(g, "mute", [&](IAttributes* a) { a->setBool("value", SQ_TRUE); });
++        if (m.hasAttr("id")) params[m.attr("id")] = ParamRef{g, "mute", ParamRef::Mute, false};
++      }
++      if (ch.attr("solo") == "true" && in.kind != SQ_TRACK_MASTER && SQ_SUCCEEDED(r))
++        r = setProp(g, "solo", [&](IAttributes* a) { a->setBool("value", SQ_TRUE); });
++      // Output routing: a bus / effect channel (the master channel = the default route).
++      if (ch.hasAttr("destination") && in.kind != SQ_TRACK_MASTER && SQ_SUCCEEDED(r)) {
++        const TrackIn* dest = busOf(ch.attr("destination"));
++        if (dest && (dest->kind == SQ_TRACK_BUS || dest->kind == SQ_TRACK_FX) && dest != &in)
++          r = setProp(g, "output", [&](IAttributes* a) { a->setGuid("value", &dest->guid); });
++        else if (!dest || dest->kind != SQ_TRACK_MASTER)
++          rep.warnings += "track '" + tname + "': output '" + ch.attr("destination") + "' not imported\n";
++      }
++      // Sends.
++      std::string sends;
++      uint32_t sendIndex = 0;
++      for (XmlNode s : ch.child("Sends").children("Send")) {
++        const TrackIn* dest = busOf(s.attr("destination"));
++        if (!dest || (dest->kind != SQ_TRACK_BUS && dest->kind != SQ_TRACK_FX) || dest == &in) {
++          rep.warnings += "track '" + tname + "': send to '" + s.attr("destination") + "' not imported\n";
++          continue;
++        }
++        XmlNode v = s.child("Volume");
++        const double db = v ? toDb(v, attrD(v, "value", v.attr("unit") == "linear" ? 1.0 : 0.0)) : 0.0;
++        if (v && v.hasAttr("id")) params[v.attr("id")] = ParamRef{g, "send." + std::to_string(sendIndex), ParamRef::Db, v.attr("unit") == "linear"};
++        sends += sq::toString(dest->guid) + " " + fmt(std::fmax(-144.0, std::fmin(24.0, db))) + (s.attr("type") == "pre" ? " pre" : "") + "\n";
++        ++sendIndex;
++        ++rep.sends;
++      }
++      if (!sends.empty() && SQ_SUCCEEDED(r)) r = setProp(g, "user.sends", [&](IAttributes* a) { a->setString("value", sends.c_str()); });
++      // Devices: the first instrument -> "user.instrument", audio effects -> "user.inserts".
++      std::string inserts, instrument;
++      uint32_t slot = 0;
++      for (XmlNode dv : ch.child("Devices").children()) {
++        const std::string el(dv.name());
++        Spec s;
++        s.bypassed = dv.child("Enabled").attr("value") == "false";
++        s.id = dv.attr("deviceID");
++        s.path = dv.attr("sqPath");
++        if (dv.hasAttr("sqFormat")) s.format = dv.attr("sqFormat");
++        else if (el == "Vst3Plugin") s.format = "vst3";
++        else if (el == "ClapPlugin") s.format = "clap";
++        else if (el == "Vst2Plugin") s.format = "vst2";
++        else if (el == "AuPlugin") s.format = "au";
++        else if (el == "Equalizer" || el == "Compressor" || el == "NoiseGate" || el == "Limiter") {
++          s.format = "builtin";  // the format's generic devices -> the closest built-in (default settings)
++          s.id = el == "Equalizer" ? "eq" : el == "Compressor" ? "comp" : el == "NoiseGate" ? "gate" : "limiter";
++          rep.warnings += "track '" + tname + "': " + el + " imported as built-in '" + s.id + "' with default settings\n";
++        } else if (el == "BuiltinDevice" && dv.attr("deviceVendor") == kVendor) {
++          s.format = "builtin";
++        }
++        if (s.format.empty() || s.id.empty() || s.id.find('|') != std::string::npos || s.path.find('|') != std::string::npos ||
++            s.path.find('\n') != std::string::npos || s.id.find('\n') != std::string::npos) {
++          rep.warnings += "track '" + tname + "': device '" + dv.attr("deviceName", el) + "' not imported\n";
++          continue;
++        }
++        const std::string role = dv.attr("deviceRole");
++        const bool isInstrument = role == "instrument";
++        if (isInstrument && (in.kind != SQ_TRACK_INSTRUMENT || !instrument.empty())) {
++          rep.warnings += "track '" + tname + "': instrument '" + s.id + "' not imported (one per instrument track)\n";
++          continue;
++        }
++        std::vector<std::pair<std::string, uint32_t>> ids;
++        for (XmlNode p : dv.child("Parameters").children()) {
++          int64_t idx = 0;
++          if (!parseInt(p.attr("parameterID"), idx) || idx < 0 || idx > 0xFFFFFF) continue;
++          if (p.hasAttr("id")) ids.emplace_back(p.attr("id"), static_cast<uint32_t>(idx));
++          double v = 0;
++          if (p.hasAttr("value") && parseDouble(p.attr("value"), v) && std::isfinite(v)) s.params.emplace_back(static_cast<uint32_t>(idx), v);
++        }
++        const std::string prefix = isInstrument ? std::string("instrument.") : "insert." + std::to_string(slot) + ".";
++        for (const auto& [pid, idx] : ids) params[pid] = ParamRef{g, prefix + std::to_string(idx), ParamRef::Plain, false};
++        if (isInstrument) {
++          instrument = formatSpecLine(Spec{false, s.format, s.id, s.path, s.params});
++        } else {
++          inserts += formatSpecLine(s) + "\n";
++          ++slot;
++        }
++        ++rep.devices;
+       }
+-      if (XmlNode m = ch.child("Mute"); m && m.attr("value") == "true" && SQ_SUCCEEDED(r))
+-        r = setProp("mute", [&](IAttributes* a) { a->setBool("value", SQ_TRUE); });
++      if (!instrument.empty() && SQ_SUCCEEDED(r)) r = setProp(g, "user.instrument", [&](IAttributes* a) { a->setString("value", instrument.c_str()); });
++      if (!inserts.empty() && SQ_SUCCEEDED(r)) r = setProp(g, "user.inserts", [&](IAttributes* a) { a->setString("value", inserts.c_str()); });
+     }
+     uint32_t rgba = 0;
+-    if (SQ_SUCCEEDED(r) && t.hasAttr("color") && parseColor(t.attr("color"), rgba))
+-      r = setProp("color", [&](IAttributes* a) { a->setInt("value", rgba); });
++    if (SQ_SUCCEEDED(r) && in.node.hasAttr("color") && parseColor(in.node.attr("color"), rgba))
++      r = setProp(g, "color", [&](IAttributes* a) { a->setInt("value", rgba); });
+   }
+   // Clips.
+   XmlNode arrangement = root.child("Arrangement");
+@@ -329,9 +773,10 @@ sq_result importProjectImpl(const std::string& path, IDocument* doc, const std::
+   if (SQ_SUCCEEDED(r)) sq_fs_create_dirs(mediaDir.c_str());
+   for (XmlNode tl : arrangement.child("Lanes").children("Lanes")) {
+     if (SQ_FAILED(r)) break;
+-    auto it = trackIds.find(tl.attr("track"));
+-    if (it == trackIds.end()) continue;
+-    const sq_guid trackId = it->second.first;
++    auto it = byTid.find(tl.attr("track"));
++    if (it == byTid.end()) continue;
++    const sq_guid trackId = ins[it->second].guid;
++    if (ins[it->second].kind != SQ_TRACK_AUDIO && ins[it->second].kind != SQ_TRACK_INSTRUMENT) continue;
+     for (XmlNode clip : tl.child("Clips").children("Clip")) {
+       if (SQ_FAILED(r)) break;
+       double time = attrD(clip, "time"), dur = attrD(clip, "duration");
+@@ -425,6 +870,44 @@ sq_result importProjectImpl(const std::string& path, IDocument* doc, const std::
+     r = exec(sq::doc::kAddMarker, p.get(), nullptr);
+     if (SQ_SUCCEEDED(r)) ++rep.markers;
+   }
++  // Automation: <Points> whose target is one of the parameters above (values in its unit).
++  std::vector<XmlNode> pointLists;
++  collectPoints(arrangement, pointLists);
++  for (XmlNode pts : pointLists) {
++    if (SQ_FAILED(r)) break;
++    const std::string pid = pts.child("Target").attr("parameter");
++    auto it = params.find(pid);
++    if (it == params.end()) {
++      if (!pid.empty()) rep.warnings += "automation of '" + pid + "' not imported\n";
++      continue;
++    }
++    const ParamRef& ref = it->second;
++    std::vector<double> flat;
++    for (XmlNode pt : pts.children()) {
++      if (pt.name() != "RealPoint" && pt.name() != "BoolPoint" && pt.name() != "IntegerPoint") continue;
++      const double t = attrD(pt, "time", -1.0);
++      if (!(t >= 0)) continue;
++      double v = 0;
++      if (pt.name() == "BoolPoint") v = pt.attr("value") == "true" ? 1.0 : 0.0;
++      else v = attrD(pt, "value", 0.0);
++      switch (ref.kind) {
++        case ParamRef::Db: v = std::fmax(-144.0, std::fmin(24.0, ref.linear ? (v > 0 ? 20.0 * std::log10(v) : -144.0) : v)); break;
++        case ParamRef::Pan: v = std::fmax(-1.0, std::fmin(1.0, v * 2.0 - 1.0)); break;
++        case ParamRef::Mute: v = v >= 0.5 ? 1.0 : 0.0; break;
++        case ParamRef::Plain: break;
++      }
++      flat.push_back(t);
++      flat.push_back(v);
++    }
++    if (flat.empty()) continue;
++    auto p = sq::makeAttributes();
++    p->setGuid("track", &ref.track);
++    p->setString("param", ref.target.c_str());
++    p->setBlob("points", flat.data(), static_cast<uint32_t>(flat.size() * sizeof(double)));
++    const sq_result ar = exec(kSetAutomation, p.get(), nullptr);
++    if (SQ_FAILED(ar)) rep.warnings += "automation '" + ref.target + "' not imported (" + sq_result_string(ar) + ")\n";
++    else ++rep.automation;
++  }
+   if (SQ_FAILED(r)) {
+     ed->cancelTransaction();
+     return fail(error, r, std::string("import failed: ") + sq_result_string(r));
+diff --git a/formats/dawproject/tests/test_dawproject.cpp b/formats/dawproject/tests/test_dawproject.cpp
+index d6db504..a088bf9 100644
+--- a/formats/dawproject/tests/test_dawproject.cpp
++++ b/formats/dawproject/tests/test_dawproject.cpp
+@@ -179,3 +179,181 @@ SQ_TEST("dawproject: export -> import round trip through engine/doc") {
+   mgr->closeDocument(back.get());
+   sq_fs_remove_all(dir.c_str());
+ }
++
++namespace {
++void setStr(IEditor* ed, const sq_guid& node, const char* key, const std::string& v) {
++  auto p = makeAttributes();
++  p->setGuid("node", &node);
++  p->setString("key", key);
++  p->setString("value", v.c_str());
++  exec(ed, doc::kSetProperty, p.get());
++}
++void setNum(IEditor* ed, const sq_guid& node, const char* key, double v) {
++  auto p = makeAttributes();
++  p->setGuid("node", &node);
++  p->setString("key", key);
++  p->setDouble("value", v);
++  exec(ed, doc::kSetProperty, p.get());
++}
++void setLane(IEditor* ed, const sq_guid& track, const char* param, std::vector<double> pts) {
++  static constexpr sq_guid kSetAutomation = sq::guid("{14D5E2BA-6EC7-4616-A188-F9A29E14D634}");
++  auto p = makeAttributes();
++  p->setGuid("track", &track);
++  p->setString("param", param);
++  p->setBlob("points", pts.data(), static_cast<uint32_t>(pts.size() * sizeof(double)));
++  REQUIRE_OK(ed->execute(&kSetAutomation, p.get(), nullptr));
++}
++struct TrackView {
++  sq_track_info info{};
++  std::string name, instrument, inserts, sends, automation;
++  sq_guid id{}, parent{};
++};
++std::vector<TrackView> view(IDocument* d) {
++  std::vector<TrackView> out;
++  sq_document_info di{};
++  di.struct_size = sizeof di;
++  REQUIRE_OK(d->getDocumentInfo(&di));
++  for (uint32_t i = 0; i < di.track_count; ++i) {
++    Ptr<ITrack> t;
++    REQUIRE_OK(d->getTrack(i, t.put()));
++    TrackView v;
++    v.info.struct_size = sizeof v.info;
++    REQUIRE_OK(t->getTrackInfo(&v.info));
++    t->getId(&v.id);
++    auto props = makeAttributes();
++    REQUIRE_OK(t->getProperties(props.get()));
++    v.name = getAttrString(props.get(), "name");
++    v.instrument = getAttrString(props.get(), "user.instrument");
++    v.inserts = getAttrString(props.get(), "user.inserts");
++    v.sends = getAttrString(props.get(), "user.sends");
++    v.automation = getAttrString(props.get(), "automation");
++    props->getGuid("parent", &v.parent);
++    out.push_back(v);
++  }
++  return out;
++}
++const TrackView* named(const std::vector<TrackView>& v, const std::string& n) {
++  for (const auto& t : v)
++    if (t.name == n) return &t;
++  return nullptr;
++}
++const TrackView* ofKind(const std::vector<TrackView>& v, int32_t kind) {
++  for (const auto& t : v)
++    if (t.info.kind == kind) return &t;
++  return nullptr;
++}
++}  // namespace
++
++SQ_TEST("dawproject: buses, routing, sends, devices, master and automation round-trip") {
++  std::string dir = tmpDir();
++  auto mgr = Ptr<edoc::DocumentManagerImpl>::adopt(new edoc::DocumentManagerImpl());
++  Ptr<IDocument> doc;
++  REQUIRE_OK(mgr->createDocument(SQ_DOC_SONG, doc.put()));
++  Ptr<IEditor> ed;
++  REQUIRE_OK(doc->getEditor(ed.put()));
++  const auto before = view(doc.get());
++  const TrackView* m0 = ofKind(before, SQ_TRACK_MASTER);
++  REQUIRE(m0);
++  const sq_guid master = m0->id;
++  auto add = [&](int32_t kind, const char* name, const sq_guid* parent = nullptr) {
++    auto p = makeAttributes();
++    p->setInt("kind", kind);
++    p->setString("name", name);
++    if (parent) p->setGuid("parent", parent);
++    return exec(ed.get(), doc::kAddTrack, p.get());
++  };
++  const sq_guid bus = add(SQ_TRACK_BUS, "VerbBus");
++  const sq_guid fx = add(SQ_TRACK_FX, "Delays");
++  const sq_guid folder = add(SQ_TRACK_FOLDER, "Band");
++  const sq_guid synth = add(SQ_TRACK_INSTRUMENT, "Synth", &folder);
++  const sq_guid drums = add(SQ_TRACK_INSTRUMENT, "Drums", &folder);
++  setStr(ed.get(), synth, "user.instrument", "builtin|synth||0=0.5");
++  setStr(ed.get(), synth, "user.inserts", "builtin|reverb||0=0.7\n!builtin|eq||0=-3|4=1.5\n");
++  setStr(ed.get(), synth, "user.sends", toString(bus) + " -6\n" + toString(fx) + " -12 pre\n");
++  setNum(ed.get(), synth, "pan", -0.5);
++  setLane(ed.get(), synth, "volume", {0, 0, 4, -12});
++  setLane(ed.get(), synth, "pan", {0, -1, 8, 1});
++  setLane(ed.get(), synth, "send.0", {0, -6, 2, -20});
++  setLane(ed.get(), synth, "insert.0.0", {0, 0.7, 4, 0.2});
++  setLane(ed.get(), synth, "instrument.3", {0, 0.1, 4, 0.9});
++  setLane(ed.get(), synth, "mute", {0, 0, 2, 1});
++  setStr(ed.get(), drums, "user.instrument", "builtin|drums|");
++  {
++    auto p = makeAttributes();
++    p->setGuid("node", &drums);
++    p->setString("key", "output");
++    p->setGuid("value", &bus);
++    exec(ed.get(), doc::kSetProperty, p.get());
++  }
++  setStr(ed.get(), bus, "user.inserts", "builtin|reverb||0=0.7\n");
++  setNum(ed.get(), bus, "volumeDb", -3);
++  setStr(ed.get(), master, "user.inserts", "builtin|limiter|\n");
++  setNum(ed.get(), master, "volumeDb", -1.5);
++  setLane(ed.get(), master, "volume", {0, -1.5, 16, -6});
++
++  const std::string file = joinPath(dir, "mix.dawproject");
++  formats::dawproject::ExportReport er;
++  std::string err;
++  REQUIRE_OK(formats::dawproject::exportProject(doc.get(), file, &er, &err));
++  CHECK_EQ(er.tracks, 5);  // bus, fx, folder, 2 instruments
++  CHECK(er.master);
++  CHECK_EQ(er.buses, 2);
++  CHECK_EQ(er.devices, 6);  // 2 instruments + 2 synth inserts + bus insert + master insert
++  CHECK_EQ(er.sends, 2);
++  CHECK_EQ(er.automation, 7);
++  CHECK_EQ(er.warnings, std::string());
++
++  Ptr<IDocument> back;
++  REQUIRE_OK(mgr->createDocument(SQ_DOC_SONG, back.put()));
++  formats::dawproject::ExportReport ir;
++  REQUIRE_OK(formats::dawproject::importProject(file, back.get(), joinPath(dir, "media2"), &ir, &err));
++  CHECK_EQ(ir.warnings, std::string());
++  CHECK_EQ(ir.tracks, 5);
++  CHECK_EQ(ir.devices, 6);
++  CHECK_EQ(ir.sends, 2);
++  CHECK_EQ(ir.automation, 7);
++  const auto v = view(back.get());
++  CHECK_EQ(v.size(), before.size() + 5);  // the existing master is reused
++  const TrackView* b = named(v, "VerbBus");
++  const TrackView* x = named(v, "Delays");
++  const TrackView* f = named(v, "Band");
++  const TrackView* s = named(v, "Synth");
++  const TrackView* d = named(v, "Drums");
++  const TrackView* m = ofKind(v, SQ_TRACK_MASTER);
++  REQUIRE(b);
++  REQUIRE(x);
++  REQUIRE(f);
++  REQUIRE(s);
++  REQUIRE(d);
++  REQUIRE(m);
++  CHECK_EQ(b->info.kind, SQ_TRACK_BUS);
++  CHECK_EQ(x->info.kind, SQ_TRACK_FX);
++  CHECK_EQ(f->info.kind, SQ_TRACK_FOLDER);
++  CHECK(s->parent == f->id);
++  CHECK(d->parent == f->id);
++  CHECK_EQ(s->instrument, std::string("builtin|synth||0=0.5"));
++  CHECK_EQ(d->instrument, std::string("builtin|drums|"));
++  CHECK_EQ(s->inserts, std::string("builtin|reverb||0=0.7\n!builtin|eq||0=-3|4=1.5\n"));
++  CHECK_EQ(s->sends, toString(b->id) + " -6\n" + toString(x->id) + " -12 pre\n");
++  CHECK(std::fabs(s->info.pan + 0.5) < 1e-9);
++  CHECK(d->info.output == b->id);
++  CHECK(sq_guid_is_null(&s->info.output));
++  CHECK_EQ(b->inserts, std::string("builtin|reverb||0=0.7\n"));
++  CHECK(std::fabs(b->info.volume_db + 3.0) < 1e-9);
++  CHECK_EQ(m->inserts, std::string("builtin|limiter|\n"));
++  CHECK(std::fabs(m->info.volume_db + 1.5) < 1e-9);
++  // Same lanes, same points (the text view lists them sorted by target).
++  const auto orig = view(doc.get());
++  REQUIRE(named(orig, "Synth"));
++  CHECK_EQ(s->automation, named(orig, "Synth")->automation);
++  CHECK_EQ(m->automation, ofKind(orig, SQ_TRACK_MASTER)->automation);
++  CHECK(s->automation.find("instrument.3 ") != std::string::npos);
++  CHECK(s->automation.find("pan 0:-1 8:1") != std::string::npos);
++  // Still one undo step.
++  Ptr<IEditor> bed;
++  REQUIRE_OK(back->getEditor(bed.put()));
++  CHECK_EQ(bed->getUndoCount(), 1u);
++  mgr->closeDocument(doc.get());
++  mgr->closeDocument(back.get());
++  sq_fs_remove_all(dir.c_str());
++}
