@@ -22,6 +22,12 @@ EngineCore::~EngineCore() {
     sessionOwner_->finish();
   }
   lingering_.clear();
+  // Commands never applied: free the automation data they own.
+  if (hasHeld_ && held_.type == CmdType::SetAutomation) delete static_cast<AutomationData*>(held_.ptr);
+  hasHeld_ = false;
+  Command c;
+  while (cmds_.pop(c))
+    if (c.type == CmdType::SetAutomation) delete static_cast<AutomationData*>(c.ptr);
   Graph* g = nullptr;
   while (retire_.pop(g)) delete g;
   AutomationData* a = nullptr;
@@ -78,8 +84,23 @@ bool EngineCore::post(const Command& c) {
 bool EngineCore::pushLiveMidi(const uint8_t* bytes, uint32_t size) noexcept {
   if (!bytes || size == 0) return true;
   bool ok = true;
-  while (liveLock_.test_and_set(std::memory_order_acquire)) {
-  }
+  // Parsed outside the lock; the lock (producers only) is held just for the queue pushes, and a
+  // producer that finds it taken yields (the holder may be a descheduled lower-priority thread).
+  constexpr uint32_t kBatch = 32;
+  LiveMidiEvent batch[kBatch];
+  uint32_t nb = 0;
+  auto flush = [&]() {
+    if (nb == 0) return;
+    for (uint32_t spins = 0; liveLock_.test_and_set(std::memory_order_acquire); ++spins)
+      if (spins >= 16) sq_thread_yield();
+    for (uint32_t k = 0; k < nb; ++k)
+      if (!live_.push(batch[k])) {
+        liveDropped_.fetch_add(1, std::memory_order_relaxed);
+        ok = false;
+      }
+    liveLock_.clear(std::memory_order_release);
+    nb = 0;
+  };
   uint8_t status = 0;
   uint32_t i = 0;
   while (i < size) {
@@ -104,14 +125,11 @@ bool EngineCore::pushLiveMidi(const uint8_t* bytes, uint32_t size) noexcept {
     }
     const uint32_t dataLen = ((status & 0xF0u) == 0xC0 || (status & 0xF0u) == 0xD0) ? 1u : 2u;
     if (i + dataLen > size) break;  // incomplete message
-    LiveMidiEvent e{{status, bytes[i], dataLen > 1 ? bytes[i + 1] : uint8_t{0}}, static_cast<uint8_t>(1 + dataLen)};
+    batch[nb++] = LiveMidiEvent{{status, bytes[i], dataLen > 1 ? bytes[i + 1] : uint8_t{0}}, static_cast<uint8_t>(1 + dataLen)};
     i += dataLen;
-    if (!live_.push(e)) {
-      liveDropped_.fetch_add(1, std::memory_order_relaxed);
-      ok = false;
-    }
+    if (nb == kBatch) flush();
   }
-  liveLock_.clear(std::memory_order_release);
+  flush();
   return ok;
 }
 
@@ -125,7 +143,10 @@ size_t EngineCore::drainCapturedMidi(std::vector<CapturedMidi>& out) {
   return n;
 }
 
-void EngineCore::setDeviceLatency(uint32_t inFrames, uint32_t outFrames) noexcept { recordComp_.store(inFrames + outFrames); }
+void EngineCore::setDeviceLatency(uint32_t inFrames, uint32_t outFrames) noexcept {
+  recordComp_.store(inFrames + outFrames);
+  outLatency_.store(outFrames);
+}
 
 void EngineCore::startRecording(std::unique_ptr<RecordSession> session) {
   stopRecording(nullptr);
@@ -229,6 +250,81 @@ void EngineCore::installPending() noexcept {
   cur_ = p;
 }
 
+namespace {
+// Commands addressed to one graph (Command::generation).
+bool carriesGeneration(CmdType t) noexcept {
+  switch (t) {
+    case CmdType::Play:
+    case CmdType::Stop:
+    case CmdType::Locate:
+    case CmdType::Loop:
+    case CmdType::Metronome:
+    case CmdType::Record:
+    case CmdType::LowLatency:
+    case CmdType::MasterVolume:
+    case CmdType::MidiCapture: return false;
+    default: return true;
+  }
+}
+}  // namespace
+
+bool EngineCore::deferForPending(const Command& c) noexcept {
+  if (!carriesGeneration(c.type)) return false;
+  if (cur_ && c.generation == cur_->generation()) return false;
+  // Generations only grow: a command newer than the installed graph targets the published one.
+  if (cur_ && c.generation < cur_->generation()) return false;
+  installPending();
+  if (cur_ && c.generation <= cur_->generation()) return false;
+  return pending_.load(std::memory_order_acquire) != nullptr;  // install deferred: keep it
+}
+
+void EngineCore::drainCommands() noexcept {
+  if (hasHeld_) {
+    if (deferForPending(held_)) return;
+    hasHeld_ = false;
+    apply(held_);
+  }
+  Command c;
+  while (cmds_.pop(c)) {
+    if (deferForPending(c)) {
+      held_ = c;
+      hasHeld_ = true;
+      return;
+    }
+    apply(c);
+  }
+}
+
+void EngineCore::captureLive(const LiveMidiEvent& e) noexcept {
+  // The player reacts to what they hear: the output of pos_ is heard outLatency frames later.
+  const int64_t len = loopEnd_ - loopStart_;
+  const bool loopOn = looping_ && len > 0;
+  int64_t f = pos_ - static_cast<int64_t>(outLatency_.load(std::memory_order_relaxed));
+  if (loopOn && capWrapped_ && f < loopStart_ && pos_ >= loopStart_ && pos_ < loopEnd_) f += len;  // heard before the wrap
+  auto push = [&](int64_t frame, uint8_t b0, uint8_t b1, uint8_t b2) {
+    CapturedMidi cm{frame, {b0, b1, b2}, 3};
+    capture_.push(cm);  // full: dropped (the control thread drains it in idle())
+  };
+  if (capLast_ != INT64_MIN && f < capLast_) {
+    // The transport went back (loop wrap / locate): held notes end where the old pass ended and
+    // start again at the new position.
+    const int64_t closeAt = (loopOn && capLast_ >= loopStart_ && capLast_ < loopEnd_) ? loopEnd_ : capLast_;
+    const int64_t reopenAt = (loopOn && f >= loopStart_ && f < loopEnd_) ? loopStart_ : f;
+    for (uint32_t ch = 0; ch < 16; ++ch)
+      for (uint32_t k = 0; k < 128; ++k)
+        if (capVel_[ch][k]) {
+          push(closeAt, static_cast<uint8_t>(0x80u | ch), static_cast<uint8_t>(k), 0);
+          push(reopenAt, static_cast<uint8_t>(0x90u | ch), static_cast<uint8_t>(k), capVel_[ch][k]);
+        }
+  }
+  capLast_ = f;
+  const uint8_t st = e.bytes[0] & 0xF0u, ch = e.bytes[0] & 0x0Fu, key = e.bytes[1] & 0x7Fu;
+  if (st == 0x90 && e.bytes[2] > 0) capVel_[ch][key] = e.bytes[2];
+  else if (st == 0x80 || st == 0x90) capVel_[ch][key] = 0;
+  CapturedMidi cm{f, {e.bytes[0], e.bytes[1], e.bytes[2]}, e.size};
+  capture_.push(cm);
+}
+
 void EngineCore::apply(const Command& c) noexcept {
   switch (c.type) {
     case CmdType::Play: playing_ = true; break;
@@ -242,7 +338,12 @@ void EngineCore::apply(const Command& c) noexcept {
     case CmdType::Metronome: metronome_ = c.value != 0.0; break;
     case CmdType::Record:
       recording_ = c.value != 0.0;
-      if (recording_) recStartFrame_.store(pos_, std::memory_order_relaxed);
+      if (recording_) {
+        recStartFrame_.store(pos_, std::memory_order_relaxed);
+        std::memset(capVel_, 0, sizeof capVel_);
+        capLast_ = INT64_MIN;
+        capWrapped_ = false;
+      }
       break;
     case CmdType::MidiCapture: midiCapture_ = c.value != 0.0; break;
     case CmdType::SetAutomation: {
@@ -299,7 +400,10 @@ void EngineCore::apply(const Command& c) noexcept {
 
 sq_result EngineCore::onStart(const sq_stream_format*, const sq_stream_format* output, const sq_latency_info* latency) {
   if (output) sampleRate_ = output->sample_rate;
-  if (latency) recordComp_.store(latency->input_frames + latency->output_frames);
+  if (latency) {
+    recordComp_.store(latency->input_frames + latency->output_frames);
+    outLatency_.store(latency->output_frames);
+  }
   LiveMidiEvent stale;
   while (live_.pop(stale)) {
   }  // the audio thread is not running yet: we are the only consumer
@@ -311,7 +415,12 @@ sq_result EngineCore::onStart(const sq_stream_format*, const sq_stream_format* o
 
 void EngineCore::onStop() {
   running_.store(false);
+  // The audio thread is gone: we are the only consumer. Commands still queued are applied now, in
+  // order, so they never run after commands that post() applies directly from here on.
   installPending();
+  collectGarbage();
+  installPending();
+  drainCommands();
   collectGarbage();
   publish();
 }
@@ -320,8 +429,7 @@ void EngineCore::process(const sq_audio_io* io) {
   rt::Scope scope;
   const uint64_t t0 = sq_time_monotonic_ns();
   installPending();
-  Command c;
-  while (cmds_.pop(c)) apply(c);
+  drainCommands();
   if (!io) return;
   if (io->flags & SQ_AUDIO_IO_XRUN) xruns_.fetch_add(1, std::memory_order_relaxed);
   sq_audio_block* outb = io->output;
@@ -337,10 +445,7 @@ void EngineCore::process(const sq_audio_io* io) {
     LiveMidiEvent e;
     while (live_.pop(e)) {
       cur_->routeLiveMidi(e.bytes, e.size);
-      if (recording_ && playing_ && midiCapture_) {
-        CapturedMidi cm{pos_, {e.bytes[0], e.bytes[1], e.bytes[2]}, e.size};
-        capture_.push(cm);  // full: dropped (the control thread drains it in idle())
-      }
+      if (recording_ && playing_ && midiCapture_) captureLive(e);
     }
   }
   const sq_audio_block* in = io->input;
@@ -384,7 +489,10 @@ void EngineCore::process(const sq_audio_io* io) {
     }
     if (playing_) {
       pos_ += n;
-      if (loopActive && pos_ >= loopEnd_) pos_ = loopStart_;
+      if (loopActive && pos_ >= loopEnd_) {
+        pos_ = loopStart_;
+        if (recording_) capWrapped_ = true;
+      }
     }
     off += n;
   }
@@ -610,12 +718,13 @@ sq_result AudioEngine::rebuildFromDocument(bool allowMixOnly) {
 }
 
 namespace {
+bool sameValue(float a, float b) { return a == b || (std::isnan(a) && std::isnan(b)); }
 bool sameLanes(const std::vector<AutoLane>& a, const std::vector<AutoLane>& b) {
   if (a.size() != b.size()) return false;
   for (size_t i = 0; i < a.size(); ++i) {
     const AutoLane& x = a[i];
     const AutoLane& y = b[i];
-    if (x.target != y.target || x.slot != y.slot || x.param != y.param || x.staticValue != y.staticValue ||
+    if (x.target != y.target || x.slot != y.slot || x.param != y.param || !sameValue(x.staticValue, y.staticValue) ||
         x.lane.target != y.lane.target || x.lane.points != y.lane.points)
       return false;
   }

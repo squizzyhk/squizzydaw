@@ -23,16 +23,24 @@ namespace {
 
 std::atomic<int> g_synthClones{0};
 std::atomic<int> g_probeValueMilli{-1};
+std::atomic<int> g_probeLastIndex{-1};   // last setParameter call on any ProbeFx (any index)
+std::atomic<int> g_probeLastMilli{-1};
 
-// Instrument that counts its instances and plays 0.5 per held note.
+// Instrument that counts its instances and plays 0.5 per sounding note. CC64 sustains released
+// notes until the pedal goes up; CC120/CC123 silence everything. Optional reported latency.
 class CountingSynth final : public SynthProcessor {
  public:
+  explicit CountingSynth(uint32_t latency = 0) : latency_(latency) {}
   ProcessorPtr clone() const override {
     ++g_synthClones;
-    return std::make_unique<CountingSynth>();
+    return std::make_unique<CountingSynth>(latency_);
   }
   bool prepare(double, uint32_t, uint32_t) override { return true; }
-  void reset() noexcept override { held_ = 0; }
+  void reset() noexcept override {
+    held_ = sustained_ = 0;
+    pedal_ = false;
+  }
+  uint32_t latency() const noexcept override { return latency_; }
   void process(const ProcessContext& ctx, float* const* io, uint32_t channels) noexcept override {
     uint32_t ev = 0;
     for (uint32_t i = 0; i < ctx.frames; ++i) {
@@ -40,16 +48,28 @@ class CountingSynth final : public SynthProcessor {
         const auto& e = ctx.midi[ev++];
         const uint8_t st = e.bytes[0] & 0xF0u;
         if (st == 0x90 && e.bytes[2] > 0) ++held_;
-        else if ((st == 0x80 || st == 0x90) && held_ > 0) --held_;
+        else if ((st == 0x80 || st == 0x90) && held_ > 0) {
+          --held_;
+          if (pedal_) ++sustained_;
+        } else if (st == 0xB0 && e.bytes[1] == 64) {
+          pedal_ = e.bytes[2] >= 64;
+          if (!pedal_) sustained_ = 0;
+        } else if (st == 0xB0 && (e.bytes[1] == 120 || e.bytes[1] == 123)) {
+          held_ = sustained_ = 0;
+        }
       }
-      if (held_ > 0)
-        for (uint32_t c = 0; c < channels; ++c) io[c][i] += 0.5f * static_cast<float>(held_);
+      const int sounding = held_ + sustained_;
+      if (sounding > 0)
+        for (uint32_t c = 0; c < channels; ++c) io[c][i] += 0.5f * static_cast<float>(sounding);
     }
   }
 
  private:
-  int held_ = 0;
+  uint32_t latency_;
+  int held_ = 0, sustained_ = 0;
+  bool pedal_ = false;
 };
+
 
 // Gain insert with one parameter (index 0 = linear gain) that reports the live value.
 class ProbeFx final : public FxProcessor {
@@ -63,6 +83,8 @@ class ProbeFx final : public FxProcessor {
   }
   uint32_t parameterCount() const noexcept override { return 1; }
   void setParameter(uint32_t index, float v) noexcept override {
+    g_probeLastIndex.store(static_cast<int>(index));
+    g_probeLastMilli.store(static_cast<int>(std::lround(v * 1000.0f)));
     if (index != 0) return;
     gain_ = v;
     g_probeValueMilli.store(static_cast<int>(std::lround(v * 1000.0f)));
@@ -573,4 +595,350 @@ SQ_TEST("instruments: built-in synth parameter edits reach the live instance wit
   doc->fireChanged();
   CHECK_EQ(eng->compileCount(), compiles);
   CHECK(std::fabs(g->track(0).instrument()->parameter(0) - pi.def) < 1e-4f);
+}
+
+namespace {
+struct LiveRig {
+  sq::app::ClassRegistry reg;
+  sq::Ptr<fakes::MDoc> doc = sq::Ptr<fakes::MDoc>::adopt(new fakes::MDoc());
+  sq::Ptr<fakes::MTrack> keys, other;
+  sq::Ptr<AudioEngine> eng;
+  LiveRig() {
+    registerNullDriver(&reg);
+    keys = addTrack(*doc, SQ_TRACK_INSTRUMENT, 1, "Keys");
+    keys->strProps["user.instrument"] = "test|synth|";
+    other = addTrack(*doc, SQ_TRACK_INSTRUMENT, 1, "Other");
+    other->strProps["user.instrument"] = "test|synth|";
+    NullDriver::defaults()[1].blockFrames = 128;
+    eng = sq::Ptr<AudioEngine>::adopt(new AudioEngine(&reg, nullptr));
+    eng->setInsertResolver(testResolver);
+    eng->setInstrumentResolver(testResolver);
+  }
+  ~LiveRig() {
+    eng->closeDevice();
+    NullDriver::defaults()[1].blockFrames = 256;
+  }
+  // Peak of the track meter over `blocks` fresh blocks (the meter peak is reset first).
+  float peak(const sq_guid& track, uint32_t blocks) {
+    sq_meter_value mv[2];
+    uint32_t n = 0;
+    sq_guid id = track;
+    eng->getMeter(&id, mv, 2, &n);
+    dev(*eng)->pump(blocks);
+    if (SQ_FAILED(eng->getMeter(&id, mv, 2, &n)) || n == 0) return -1.0f;
+    return mv[0].peak;
+  }
+};
+}  // namespace
+
+SQ_TEST("instruments: changing the live MIDI target or arm state releases the old track's held notes and sustain pedal") {
+  LiveRig rig;
+  AudioEngine& eng = *rig.eng;
+  REQUIRE_OK(eng.setDocument(rig.doc.get()));
+  REQUIRE_OK(eng.openDevice(&kNullDriverClassId, "offline", nullptr));
+  const uint8_t on[3] = {0x90, 60, 100}, off[3] = {0x80, 60, 0};
+  const uint8_t pedalDown[3] = {0xB0, 64, 127}, pedalUp[3] = {0xB0, 64, 0};
+  // key held on Keys, then the selection moves to Other before the key is released
+  eng.setLiveMidiTarget(rig.keys->id);
+  CHECK(eng.pushLiveMidi(on, 3));
+  CHECK(rig.peak(rig.keys->id, 4) > 0.3f);
+  eng.setLiveMidiTarget(rig.other->id);
+  CHECK(eng.pushLiveMidi(off, 3));
+  dev(eng)->pump(2);
+  CHECK(rig.peak(rig.keys->id, 4) < 1e-6f);  // not stuck on the old target
+  CHECK(rig.peak(rig.other->id, 4) < 1e-6f);
+
+  // sustain pedal down on Keys, key released (sustained), then an arm moves the live MIDI away
+  eng.setLiveMidiTarget(rig.keys->id);
+  CHECK(eng.pushLiveMidi(pedalDown, 3));
+  CHECK(eng.pushLiveMidi(on, 3));
+  CHECK(eng.pushLiveMidi(off, 3));
+  CHECK(rig.peak(rig.keys->id, 4) > 0.3f);  // sustained
+  rig.other->info.flags |= SQ_TRACK_ARMED;
+  rig.doc->fireChanged();
+  REQUIRE_EQ(eng.liveMidiTracks().size(), size_t(1));
+  CHECK(eng.liveMidiTracks()[0] == rig.other->id);
+  CHECK(eng.pushLiveMidi(pedalUp, 3));
+  dev(eng)->pump(2);
+  CHECK(rig.peak(rig.keys->id, 4) < 1e-6f);
+}
+
+namespace {
+sq_clip_event clipEvent(double pos, double len, uint8_t b0, uint8_t b1, uint8_t b2) {
+  sq_clip_event e{};
+  e.struct_size = sizeof e;
+  e.position = pos;
+  e.length = len;
+  e.bytes[0] = b0;
+  e.bytes[1] = b1;
+  e.bytes[2] = b2;
+  e.size = 3;
+  return e;
+}
+}  // namespace
+
+SQ_TEST("instruments: stop, locate and loop wrap release a sequenced sustain pedal") {
+  LiveRig rig;
+  AudioEngine& eng = *rig.eng;
+  auto clip = midiClip(0, 8, {});
+  clip->events.push_back(clipEvent(0.0, 0.0, 0xB0, 64, 127));
+  clip->events.push_back(clipEvent(0.0, 1.0, 0x90, 60, 100));
+  clip->events.push_back(clipEvent(6.0, 0.0, 0xB0, 64, 0));
+  rig.keys->clips.push_back(clip);
+  REQUIRE_OK(eng.setDocument(rig.doc.get()));
+  REQUIRE_OK(eng.openDevice(&kNullDriverClassId, "offline", nullptr));
+  REQUIRE_OK(eng.play());
+  CHECK(rig.peak(rig.keys->id, 40) > 0.3f);  // 0..~0.2 ppq: note + pedal
+  REQUIRE_OK(eng.stop());
+  dev(eng)->pump(2);
+  CHECK(rig.peak(rig.keys->id, 8) < 1e-6f);  // pedal released with the transport stop
+  // later live notes are not sustained forever either
+  eng.setLiveMidiTarget(rig.keys->id);
+  const uint8_t on[3] = {0x90, 62, 100}, off[3] = {0x80, 62, 0};
+  CHECK(eng.pushLiveMidi(on, 3));
+  CHECK(rig.peak(rig.keys->id, 2) > 0.3f);
+  CHECK(eng.pushLiveMidi(off, 3));
+  dev(eng)->pump(2);
+  CHECK(rig.peak(rig.keys->id, 4) < 1e-6f);
+  eng.setLiveMidiTarget(sq_guid{});
+
+  // locate forward while the pedal holds the note: the jump releases the pedal as well
+  REQUIRE_OK(eng.locate(0.0));
+  REQUIRE_OK(eng.play());
+  dev(eng)->pump(40);
+  REQUIRE_OK(eng.locate(7.0));  // past the clip's own pedal-up
+  dev(eng)->pump(2);
+  CHECK(rig.peak(rig.keys->id, 8) < 1e-6f);
+  REQUIRE_OK(eng.stop());
+}
+
+SQ_TEST("automation: removing an insert parameter lane during playback restores the parameter's static value") {
+  sq::app::ClassRegistry reg;
+  registerNullDriver(&reg);
+  fakes::registerFakeCodec(&reg);
+  fakes::putMemFile("mem://rm.tst", 48000.0, std::vector<std::vector<float>>(1, std::vector<float>(96000 * 4, 0.5f)));
+  sq::Ptr<fakes::MDoc> doc = sq::Ptr<fakes::MDoc>::adopt(new fakes::MDoc());
+  auto t = addTrack(*doc, SQ_TRACK_AUDIO, 1, "Audio");
+  auto c = sq::Ptr<fakes::MClip>::adopt(new fakes::MClip());
+  c->info.start = 0;
+  c->info.length = 16;
+  c->path = "mem://rm.tst";
+  t->clips.push_back(c);
+  t->strProps["user.inserts"] = "test|probe|";
+  t->strProps["automation"] = "insert.0.0 0:0.125 100:0.125\n";
+  NullDriver::defaults()[1].blockFrames = 128;
+  sq::Ptr<AudioEngine> eng = sq::Ptr<AudioEngine>::adopt(new AudioEngine(&reg, nullptr));
+  eng->setInsertResolver(testResolver);
+  REQUIRE_OK(eng->setDocument(doc.get()));
+  REQUIRE_OK(eng->openDevice(&kNullDriverClassId, "offline", nullptr));
+  REQUIRE_OK(eng->play());
+  dev(*eng)->pump(4);
+  CHECK_EQ(g_probeValueMilli.load(), 125);
+  const uint64_t compiles = eng->compileCount();
+  t->strProps["automation"] = "";  // the lane is deleted while playing
+  doc->fireChanged();
+  dev(*eng)->pump(2);
+  CHECK_EQ(eng->compileCount(), compiles);
+  CHECK_EQ(g_probeValueMilli.load(), 1000);
+  REQUIRE_OK(eng->stop());
+  dev(*eng)->pump(2);
+  CHECK_EQ(g_probeValueMilli.load(), 1000);
+  eng->closeDevice();
+  NullDriver::defaults()[1].blockFrames = 256;
+}
+
+SQ_TEST("automation: a parameter without a known static value is not forced to 0 when the automation stops") {
+  sq::app::ClassRegistry reg;
+  sq::Ptr<fakes::MDoc> doc = sq::Ptr<fakes::MDoc>::adopt(new fakes::MDoc());
+  auto t = addTrack(*doc, SQ_TRACK_INSTRUMENT, 1, "Keys");
+  t->strProps["user.instrument"] = "test|synth|";
+  t->strProps["user.inserts"] = "test|probe|";  // ProbeFx reports 1 parameter: index 7 is unknown
+  t->strProps["automation"] = "insert.0.7 0:0.5 100:0.5\n";
+  InsertResolver res = testResolver;
+  InstrumentResolver inst = testResolver;
+  MediaCache cache;
+  GraphDesc d;
+  DocBuildResult info;
+  REQUIRE_OK(buildGraphDesc(doc.get(), &reg, cache, 48000.0, &d, &info, &res, &inst));
+  REQUIRE(d.automation != nullptr);
+  REQUIRE_EQ(d.automation->tracks[0].size(), size_t(1));
+  CHECK(std::isnan(d.automation->tracks[0][0].staticValue));
+  GraphConfig cfg;
+  cfg.maxBlock = 64;
+  auto g = Graph::compile(d, cfg);
+  REQUIRE(g);
+  std::vector<float> l(64), r(64);
+  float* out[2] = {l.data(), r.data()};
+  ProcessContext ctx;
+  ctx.sampleRate = 48000.0;
+  ctx.frames = 64;
+  ctx.playing = true;
+  g->process(ctx, out, 2, false, false);
+  CHECK_EQ(g_probeLastIndex.load(), 7);
+  CHECK_EQ(g_probeLastMilli.load(), 500);
+  ctx.playing = false;
+  ctx.outputFrame = 64;
+  g->process(ctx, out, 2, false, false);
+  CHECK_EQ(g_probeLastMilli.load(), 500);  // not reset to 0
+  // known static values (spec / prototype) still come back
+  t->strProps["automation"] = "insert.0.0 0:0.25 100:0.25\n";
+  REQUIRE_OK(buildGraphDesc(doc.get(), &reg, cache, 48000.0, &d, &info, &res, &inst));
+  CHECK(std::fabs(d.automation->tracks[0][0].staticValue - 1.0f) < 1e-6f);
+}
+
+SQ_TEST("instruments: instrument latency is part of the track latency (PDC)") {
+  GraphDesc d;
+  TrackDesc inst;
+  inst.channels = 1;
+  inst.instrument = std::make_shared<CountingSynth>(100u);
+  TrackDesc audio;
+  audio.channels = 1;
+  d.tracks = {inst, audio};
+  GraphConfig cfg;
+  cfg.maxBlock = 64;
+  auto g = Graph::compile(d, cfg);
+  REQUIRE(g);
+  CHECK_EQ(g->trackArrival(0), 100u);
+  CHECK_EQ(g->latency(), 100u);
+  CHECK_EQ(g->trackCompensation(1), 100u);
+  CHECK_EQ(g->trackCompensation(0), 0u);
+}
+
+SQ_TEST("automation: fader and insert lanes follow the audio through the latency in front of them") {
+  constexpr uint32_t kLat = 4800;  // 0.2 ppq at 120 bpm / 48 kHz
+  GraphDesc d;
+  TrackDesc t;
+  t.channels = 1;
+  t.instrument = std::make_shared<CountingSynth>();
+  t.midi = {TimedMidi{24000, {0x90, 60, 100}, 3}};  // held from 1 ppq on: constant 0.5
+  t.inserts = {std::make_shared<DelayFx>(kLat), std::make_shared<ProbeFx>(1.0f)};
+  t.insertParams = {{}, {}};
+  d.tracks = {t};
+  auto a = std::make_shared<AutomationData>();
+  a->tracks.resize(1);
+  AutoLane vol;
+  vol.target = AutoTarget::Volume;
+  vol.lane.target = "volume";
+  vol.lane.points = {{0.0, 0.0}, {3.0, 0.0}, {3.0, -200.0}};  // fader cut at 3 ppq (72000)
+  a->tracks[0].push_back(vol);
+  AutoLane ins;
+  ins.target = AutoTarget::Insert;
+  ins.slot = 1;
+  ins.param = 0;
+  ins.staticValue = 1.0f;
+  ins.lane.target = "insert.1.0";
+  ins.lane.points = {{0.0, 1.0}, {2.0, 1.0}, {2.0, 0.5}};  // probe gain halves at 2 ppq (48000)
+  a->tracks[0].push_back(ins);
+  d.automation = a;
+  RenderJob job;
+  job.start = 0;
+  job.end = 96000;
+  job.outputChannels = 1;
+  job.blockFrames = 256;
+  std::vector<std::vector<float>> master;
+  REQUIRE_OK(renderToMemory(d, job, &master));
+  REQUIRE(master[0].size() >= 90000);
+  CHECK(std::fabs(master[0][48000 - 1000] - 0.5f) < 1e-3f);   // before the insert step
+  CHECK(std::fabs(master[0][48000 + 1000] - 0.25f) < 1e-3f);  // after it
+  CHECK(std::fabs(master[0][72000 - 1000] - 0.25f) < 1e-3f);  // before the fader step
+  CHECK(std::fabs(master[0][72000 + 1000]) < 1e-3f);          // after it
+}
+
+SQ_TEST("instruments: a note shorter than one frame still ends after it starts") {
+  sq::app::ClassRegistry reg;
+  sq::Ptr<fakes::MDoc> doc = sq::Ptr<fakes::MDoc>::adopt(new fakes::MDoc());
+  auto keys = addTrack(*doc, SQ_TRACK_INSTRUMENT, 1, "Keys");
+  keys->strProps["user.instrument"] = "test|synth|";
+  keys->clips.push_back(midiClip(0, 2, {{0.5, 0.00001}}));
+  InsertResolver res = testResolver;
+  InstrumentResolver inst = testResolver;
+  MediaCache cache;
+  GraphDesc d;
+  DocBuildResult info;
+  REQUIRE_OK(buildGraphDesc(doc.get(), &reg, cache, 48000.0, &d, &info, &res, &inst));
+  REQUIRE_EQ(d.tracks[0].midi.size(), size_t(2));
+  CHECK_EQ(d.tracks[0].midi[0].bytes[0], 0x90);
+  CHECK_EQ(d.tracks[0].midi[1].bytes[0], 0x80);
+  CHECK(d.tracks[0].midi[1].frame > d.tracks[0].midi[0].frame);
+  // the offline render does not leave it hanging
+  RenderJob job;
+  job.start = 0;
+  job.end = 48000;
+  job.outputChannels = 1;
+  std::vector<std::vector<float>> master;
+  REQUIRE_OK(renderToMemory(d, job, &master));
+  CHECK(std::fabs(master[0][40000]) < 1e-6f);
+}
+
+SQ_TEST("instruments: loop recording closes a note held across the loop wrap at the loop end") {
+  sq::app::ClassRegistry reg;
+  registerNullDriver(&reg);
+  sq::Ptr<fakes::MDoc> doc = sq::Ptr<fakes::MDoc>::adopt(new fakes::MDoc());
+  auto keys = addTrack(*doc, SQ_TRACK_INSTRUMENT, 1, "Keys");
+  keys->info.flags |= SQ_TRACK_ARMED;
+  NullDriver::defaults()[1].blockFrames = 240;
+  sq::app::Settings settings;
+  settings.setString("Media.Folder", "mem://media");
+  sq::Ptr<AudioEngine> eng = sq::Ptr<AudioEngine>::adopt(new AudioEngine(&reg, &settings));
+  REQUIRE_OK(eng->setDocument(doc.get()));
+  REQUIRE_OK(eng->openDevice(&kNullDriverClassId, "offline", nullptr));
+  REQUIRE_OK(eng->setLoop(4.0, 5.0, SQ_TRUE));
+  REQUIRE_OK(eng->locate(4.0));
+  REQUIRE_OK(eng->play());
+  REQUIRE_OK(eng->record(SQ_TRUE));
+  dev(*eng)->pump(80);  // 0.8 ppq into the loop (minus one block of output latency)
+  const uint8_t on[3] = {0x90, 64, 80}, off[3] = {0x80, 64, 0};
+  eng->pushLiveMidi(on, 3);
+  dev(*eng)->pump(50);  // wraps after ~0.2 ppq, then ~0.3 ppq into the next pass
+  eng->pushLiveMidi(off, 3);
+  dev(*eng)->pump(10);
+  REQUIRE_OK(eng->record(SQ_FALSE));
+  auto& lg = doc->editor->log;
+  REQUIRE(lg.size() >= 3);
+  REQUIRE(lg[2].action == "events");
+  REQUIRE_EQ(lg[2].events.size(), size_t(2));  // the pass-1 part and the pass-2 part
+  for (const auto& e : lg[2].events) {
+    CHECK_EQ(e.bytes[0], 0x90);
+    CHECK(e.length > 0.15);  // never the 1/256 ppq of a note-off paired before its note-on
+  }
+  CHECK(std::fabs(lg[2].events[0].position - 0.79) < 0.02);
+  CHECK(std::fabs(lg[2].events[0].length - 0.21) < 0.02);  // closed at the loop end
+  CHECK(std::fabs(lg[2].events[1].position - 0.0) < 0.02);
+  CHECK(std::fabs(lg[2].events[1].length - 0.29) < 0.02);  // re-opened at the loop start
+  eng->closeDevice();
+  NullDriver::defaults()[1].blockFrames = 256;
+}
+
+SQ_TEST("instruments: recorded MIDI is placed where the player heard the transport (output latency)") {
+  sq::app::ClassRegistry reg;
+  registerNullDriver(&reg);
+  sq::Ptr<fakes::MDoc> doc = sq::Ptr<fakes::MDoc>::adopt(new fakes::MDoc());
+  auto keys = addTrack(*doc, SQ_TRACK_INSTRUMENT, 1, "Keys");
+  keys->info.flags |= SQ_TRACK_ARMED;
+  NullDriver::defaults()[1].blockFrames = 240;
+  NullDriver::defaults()[1].outputLatency = 4560;  // + one block = 4800 frames = 0.2 ppq
+  sq::app::Settings settings;
+  settings.setString("Media.Folder", "mem://media");
+  sq::Ptr<AudioEngine> eng = sq::Ptr<AudioEngine>::adopt(new AudioEngine(&reg, &settings));
+  REQUIRE_OK(eng->setDocument(doc.get()));
+  REQUIRE_OK(eng->openDevice(&kNullDriverClassId, "offline", nullptr));
+  REQUIRE_OK(eng->locate(4.0));
+  REQUIRE_OK(eng->play());
+  REQUIRE_OK(eng->record(SQ_TRUE));
+  dev(*eng)->pump(100);  // the transport is 1 ppq in; the player hears 0.8 ppq
+  const uint8_t on[3] = {0x90, 64, 80}, off[3] = {0x80, 64, 0};
+  eng->pushLiveMidi(on, 3);
+  dev(*eng)->pump(50);
+  eng->pushLiveMidi(off, 3);
+  dev(*eng)->pump(50);
+  REQUIRE_OK(eng->record(SQ_FALSE));
+  auto& lg = doc->editor->log;
+  REQUIRE(lg.size() >= 3);
+  REQUIRE(lg[2].action == "events");
+  REQUIRE_EQ(lg[2].events.size(), size_t(1));
+  CHECK(std::fabs(lg[2].events[0].position - 0.8) < 0.02);
+  CHECK(std::fabs(lg[2].events[0].length - 0.5) < 0.02);
+  eng->closeDevice();
+  NullDriver::defaults()[1].blockFrames = 256;
+  NullDriver::defaults()[1].outputLatency = 0;
 }

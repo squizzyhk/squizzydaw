@@ -32,6 +32,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -72,7 +73,10 @@ struct LiveMidiEvent {
   uint8_t bytes[3];
   uint8_t size;
 };
-// Live MIDI captured while recording: transport (output) frame of the block it arrived in.
+// Live MIDI captured while recording: the timeline frame the player heard when the event arrived
+// (transport frame of the block minus the device output latency). While looping, a note held
+// across the loop wrap is closed at the loop end and re-opened at the loop start (pairs of
+// synthetic note-off/note-on events), so every captured note-on pairs with a later note-off.
 struct CapturedMidi {
   int64_t frame;
   uint8_t bytes[3];
@@ -146,6 +150,12 @@ class EngineCore final : public sq::Object<EngineCore, IAudioCallback> {
   void apply(const Command& c) noexcept;
   void publish() noexcept;
   void installPending() noexcept;
+  // Applies queued commands in order. A command stamped with the generation of a graph that is
+  // published (pending_) but not installed yet is held (held_) until that graph is installed
+  // instead of being dropped; the commands behind it wait too (order is kept).
+  void drainCommands() noexcept;
+  bool deferForPending(const Command& c) noexcept;
+  void captureLive(const LiveMidiEvent& e) noexcept;
 
   // RT-owned state
   Graph* cur_ = nullptr;
@@ -153,6 +163,13 @@ class EngineCore final : public sq::Object<EngineCore, IAudioCallback> {
   bool playing_ = false, recording_ = false, looping_ = false, metronome_ = false, lowLatency_ = false;
   bool midiCapture_ = false;
   int64_t loopStart_ = 0, loopEnd_ = 0;
+  Command held_{};
+  bool hasHeld_ = false;
+  // MIDI capture state (RT): velocity of the captured notes still held (0 = off), last captured
+  // frame, and whether the loop wrapped since the record start.
+  uint8_t capVel_[16][128] = {};
+  int64_t capLast_ = INT64_MIN;
+  bool capWrapped_ = false;
   double sampleRate_ = 48000.0;
   double cpuAvg_ = 0.0;
 
@@ -168,6 +185,7 @@ class EngineCore final : public sq::Object<EngineCore, IAudioCallback> {
   std::atomic<uint32_t> latency_{0};
   std::atomic<uint64_t> generation_{0};
   std::atomic<uint32_t> recordComp_{0};
+  std::atomic<uint32_t> outLatency_{0};
   SpscQueue<LiveMidiEvent> live_{1024};
   std::atomic_flag liveLock_ = ATOMIC_FLAG_INIT;  // producers only
   std::atomic<uint64_t> liveDropped_{0};

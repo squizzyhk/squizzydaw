@@ -184,8 +184,9 @@ bool TrackProcessor::prepare(double sr, uint32_t maxFrames, uint32_t outChannels
   if (!chain_.prepare(sr, maxFrames, desc_.channels)) return false;
   instrument_ = desc_.instrument ? desc_.instrument->clone() : nullptr;
   if (instrument_ && !instrument_->prepare(sr, maxFrames, desc_.channels)) return false;
-  // sequenced events of one block (bounded) + live events + note-offs of a stop/jump
-  blockEvents_.assign(instrument_ ? std::min<size_t>(desc_.midi.size(), 4096) + kLiveCapacity + 16 * 128 : 0, sq_midi_event{});
+  // sequenced events of one block (bounded) + live events + note-offs of a stop/jump + live
+  // note releases + controller resets
+  blockEvents_.assign(instrument_ ? std::min<size_t>(desc_.midi.size(), 4096) + kLiveCapacity + 2 * 16 * 128 + 16 * 8 : 0, sq_midi_event{});
   allocPlanar(buf_, bufPtrs_, desc_.channels, maxFrames);
   gainInit_ = false;
   cursor_ = 0;
@@ -193,6 +194,10 @@ bool TrackProcessor::prepare(double sr, uint32_t maxFrames, uint32_t outChannels
   seqPlaying_ = false;
   liveCount_ = 0;
   std::memset(seqNotes_, 0, sizeof seqNotes_);
+  std::memset(seqCtl_, 0, sizeof seqCtl_);
+  std::memset(liveNotes_, 0, sizeof liveNotes_);
+  std::memset(liveSustain_, 0, sizeof liveSustain_);
+  releaseLive_ = false;
   return true;
 }
 void TrackProcessor::reset() noexcept {
@@ -204,6 +209,17 @@ void TrackProcessor::reset() noexcept {
   seqPlaying_ = false;
   liveCount_ = 0;
   std::memset(seqNotes_, 0, sizeof seqNotes_);
+  std::memset(seqCtl_, 0, sizeof seqCtl_);
+  std::memset(liveNotes_, 0, sizeof liveNotes_);
+  std::memset(liveSustain_, 0, sizeof liveSustain_);
+  releaseLive_ = false;
+}
+uint32_t TrackProcessor::latencyBefore(int32_t slot) const noexcept {
+  if (slot < 0) return 0;
+  uint32_t l = instrument_ ? instrument_->latency() : 0u;
+  for (size_t j = 0; j < static_cast<size_t>(slot) && j < chain_.size(); ++j)
+    if (const AudioProcessor* p = chain_.at(j)) l += p->latency();
+  return l;
 }
 uint32_t TrackProcessor::tail() const noexcept { return chain_.tail() + (instrument_ ? instrument_->tail() : 0); }
 int64_t TrackProcessor::contentEnd() const noexcept {
@@ -238,22 +254,52 @@ void TrackProcessor::renderInstrument(const ProcessContext& ctx) noexcept {
     me.size = size;
     me.data = nullptr;
   };
-  auto releaseSequenced = [&]() {
-    for (uint32_t ch = 0; ch < 16; ++ch)
+  constexpr uint8_t kSeqUsed = 1, kSeqSustain = 2, kSeqBend = 4, kSeqMod = 8;
+  // Transport stop / locate / loop wrap: sequenced notes end and the controllers the sequence
+  // moved go back to rest (a latched sustain pedal would otherwise hold every voice forever).
+  auto releaseSequenced = [&](bool stop) {
+    for (uint32_t ch = 0; ch < 16; ++ch) {
+      const uint8_t chb = static_cast<uint8_t>(ch);
       for (uint32_t k = 0; k < 128; ++k)
         if (seqNotes_[ch][k]) {
           seqNotes_[ch][k] = 0;
-          put(0, static_cast<uint8_t>(0x80u | ch), static_cast<uint8_t>(k), 0, 3);
+          put(0, static_cast<uint8_t>(0x80u | chb), static_cast<uint8_t>(k), 0, 3);
         }
+      const uint8_t f = seqCtl_[ch];
+      seqCtl_[ch] = 0;
+      if (!f) continue;
+      bool liveHeld = liveSustain_[ch] != 0;
+      for (uint32_t k = 0; k < 128 && !liveHeld; ++k) liveHeld = liveNotes_[ch][k] != 0;
+      if ((f & kSeqSustain) && !liveSustain_[ch]) put(0, static_cast<uint8_t>(0xB0u | chb), 64, 0, 3);
+      if (f & kSeqBend) put(0, static_cast<uint8_t>(0xE0u | chb), 0, 0x40, 3);
+      if (f & kSeqMod) put(0, static_cast<uint8_t>(0xB0u | chb), 1, 0, 3);
+      if (stop && !liveHeld) put(0, static_cast<uint8_t>(0xB0u | chb), 123, 0, 3);  // all notes off
+    }
   };
+  // The track stopped receiving live MIDI: release what the player still holds on it.
+  if (releaseLive_) {
+    releaseLive_ = false;
+    for (uint32_t ch = 0; ch < 16; ++ch) {
+      const uint8_t chb = static_cast<uint8_t>(ch);
+      for (uint32_t k = 0; k < 128; ++k)
+        if (liveNotes_[ch][k]) {
+          liveNotes_[ch][k] = 0;
+          put(0, static_cast<uint8_t>(0x80u | chb), static_cast<uint8_t>(k), 0, 3);
+        }
+      if (liveSustain_[ch]) {
+        liveSustain_[ch] = 0;
+        if (!(seqCtl_[ch] & kSeqSustain)) put(0, static_cast<uint8_t>(0xB0u | chb), 64, 0, 3);
+      }
+    }
+  }
   const int64_t t0 = ctx.timelineFrame;
   const bool playing = ctx.playing;
   if (!playing) {
-    if (seqPlaying_) releaseSequenced();  // transport stopped: sequenced notes end
+    if (seqPlaying_) releaseSequenced(true);  // transport stopped: sequenced notes end
     seqPlaying_ = false;
     expectNext_ = INT64_MIN;
   } else if (t0 != expectNext_) {
-    if (seqPlaying_) releaseSequenced();  // locate / loop wrap
+    if (seqPlaying_) releaseSequenced(false);  // locate / loop wrap
     size_t lo = 0, hi = desc_.midi.size();  // first event at or after t0
     while (lo < hi) {
       const size_t mid = (lo + hi) / 2;
@@ -262,8 +308,18 @@ void TrackProcessor::renderInstrument(const ProcessContext& ctx) noexcept {
     }
     cursor_ = lo;
   }
-  for (uint32_t i = 0; i < liveCount_; ++i)
-    if (n < cap) blockEvents_[n++] = live_[i];
+  for (uint32_t i = 0; i < liveCount_; ++i) {
+    const sq_midi_event& le = live_[i];
+    const uint8_t lst = le.bytes[0] & 0xF0u, lch = le.bytes[0] & 0x0Fu, d1 = le.bytes[1] & 0x7Fu;
+    if (lst == 0x90 && le.bytes[2] > 0) liveNotes_[lch][d1] = 1;
+    else if (lst == 0x80 || lst == 0x90) liveNotes_[lch][d1] = 0;
+    else if (lst == 0xB0) {
+      if (d1 == 64) liveSustain_[lch] = le.bytes[2] >= 64 ? 1 : 0;
+      else if (d1 == 121) liveSustain_[lch] = 0;
+      else if (d1 == 120 || d1 == 123) std::memset(liveNotes_[lch], 0, sizeof liveNotes_[lch]);
+    }
+    if (n < cap) blockEvents_[n++] = le;
+  }
   liveCount_ = 0;
   if (playing) {
     seqPlaying_ = true;
@@ -271,8 +327,19 @@ void TrackProcessor::renderInstrument(const ProcessContext& ctx) noexcept {
     while (cursor_ < desc_.midi.size() && desc_.midi[cursor_].frame < t0 + static_cast<int64_t>(ctx.frames)) {
       const TimedMidi& e = desc_.midi[cursor_++];
       const uint8_t st = e.bytes[0] & 0xF0u, ch = e.bytes[0] & 0x0Fu, key = e.bytes[1] & 0x7Fu;
+      uint8_t& ctl = seqCtl_[ch];
+      ctl = static_cast<uint8_t>(ctl | kSeqUsed);
       if (st == 0x90 && e.bytes[2] > 0) seqNotes_[ch][key] = 1;
       else if (st == 0x80 || st == 0x90) seqNotes_[ch][key] = 0;
+      else if (st == 0xE0) {
+        const bool centre = e.bytes[1] == 0 && e.bytes[2] == 0x40;
+        ctl = static_cast<uint8_t>(centre ? (ctl & ~kSeqBend) : (ctl | kSeqBend));
+      } else if (st == 0xB0) {
+        const bool on = key == 64 ? e.bytes[2] >= 64 : e.bytes[2] != 0;
+        if (key == 64) ctl = static_cast<uint8_t>(on ? (ctl | kSeqSustain) : (ctl & ~kSeqSustain));
+        else if (key == 1) ctl = static_cast<uint8_t>(on ? (ctl | kSeqMod) : (ctl & ~kSeqMod));
+        else if (key == 121) ctl = static_cast<uint8_t>(ctl & ~(kSeqSustain | kSeqBend | kSeqMod));
+      }
       put(static_cast<uint32_t>(std::max<int64_t>(0, e.frame - t0)), e.bytes[0], e.bytes[1], e.bytes[2], e.size);
     }
   }
@@ -326,6 +393,12 @@ bool SubMixProcessor::prepare(double sr, uint32_t maxFrames, uint32_t outChannel
   allocPlanar(work_, workPtrs_, channels_, maxFrames);
   gainInit_ = false;
   return true;
+}
+uint32_t SubMixProcessor::latencyBefore(int32_t slot) const noexcept {
+  uint32_t l = 0;
+  for (size_t j = 0; slot > 0 && j < static_cast<size_t>(slot) && j < chain_.size(); ++j)
+    if (const AudioProcessor* p = chain_.at(j)) l += p->latency();
+  return l;
 }
 void SubMixProcessor::reset() noexcept {
   chain_.reset();
@@ -678,11 +751,13 @@ void Graph::routeLiveMidi(const uint8_t* bytes, uint8_t size) noexcept {
 }
 
 AutomationData* Graph::swapAutomation(AutomationData* data) noexcept {
+  // Restore static values for whatever the old lanes drove (a removed or retargeted lane must
+  // not leave its parameter at the last automated value), then for the new lanes; the new lanes
+  // apply from the next block (only while playing).
+  endAutomation();
   AutomationData* old = extAutomation_;
   extAutomation_ = data;
   automation_ = data ? data : automationKeep_.get();
-  // Restore static values for whatever the old lanes drove; the new lanes apply from the next
-  // block (only while playing).
   endAutomation();
   return old;
 }
@@ -691,10 +766,14 @@ AutomationData* Graph::swapAutomation(AutomationData* data) noexcept {
 void Graph::applyAutomation(const ProcessContext& ctx) noexcept {
   const AutomationData* a = automation_;
   if (!a) return;
-  const double ppqTrack = tempo_.frameToPpq(ctx.timelineFrame);
+  // Each lane is evaluated at the timeline position of the audio its target processes in this
+  // block: sources are read at timelineFrame and reach insert k / the fader after the latency in
+  // front of it.
+  const int64_t tf = ctx.timelineFrame;
   const size_t nt = std::min(tracks_.size(), a->tracks.size());
   for (size_t i = 0; i < nt; ++i) {
     TrackProcessor& t = *tracks_[i];
+    const double ppqTrack = tempo_.frameToPpq(tf - static_cast<int64_t>(trackArrival_[i]));
     for (const AutoLane& l : a->tracks[i]) {
       switch (l.target) {
         case AutoTarget::Volume: t.setAutoVolume(dbToGain(l.lane.valueAt(ppqTrack, 0.0))); break;
@@ -708,17 +787,19 @@ void Graph::applyAutomation(const ProcessContext& ctx) noexcept {
           }
           break;
         case AutoTarget::Insert:
-        case AutoTarget::Instrument:
-          setTrackParam(i, l.target == AutoTarget::Instrument ? -1 : l.slot, l.param,
-                        static_cast<float>(l.lane.valueAt(ppqTrack, l.staticValue)));
+        case AutoTarget::Instrument: {
+          const int32_t slot = l.target == AutoTarget::Instrument ? -1 : l.slot;
+          const double ppqIns = tempo_.frameToPpq(tf - static_cast<int64_t>(t.latencyBefore(slot)));
+          setTrackParam(i, slot, l.param, static_cast<float>(l.lane.valueAt(ppqIns, l.staticValue)));
           break;
+        }
       }
     }
   }
   const size_t nb = std::min(buses_.size(), a->buses.size());
   for (size_t b = 0; b < nb; ++b) {
     SubMixProcessor& bus = *buses_[b];
-    const double ppq = tempo_.frameToPpq(ctx.timelineFrame - static_cast<int64_t>(busMaxIn_[b]));
+    const double ppq = tempo_.frameToPpq(tf - static_cast<int64_t>(busArrival_[b]));
     for (const AutoLane& l : a->buses[b]) {
       switch (l.target) {
         case AutoTarget::Volume: bus.setAutoVolume(dbToGain(l.lane.valueAt(ppq, 0.0))); break;
@@ -731,7 +812,11 @@ void Graph::applyAutomation(const ProcessContext& ctx) noexcept {
             s.hasAuto = true;
           }
           break;
-        case AutoTarget::Insert: setBusParam(b, l.slot, l.param, static_cast<float>(l.lane.valueAt(ppq, l.staticValue))); break;
+        case AutoTarget::Insert: {
+          const double ppqIns = tempo_.frameToPpq(tf - static_cast<int64_t>(busMaxIn_[b] + bus.latencyBefore(l.slot)));
+          setBusParam(b, l.slot, l.param, static_cast<float>(l.lane.valueAt(ppqIns, l.staticValue)));
+          break;
+        }
         case AutoTarget::Instrument: break;
       }
     }
@@ -747,11 +832,11 @@ void Graph::endAutomation() noexcept {
   if (const AutomationData* a = automation_) {
     for (size_t i = 0; i < std::min(tracks_.size(), a->tracks.size()); ++i)
       for (const AutoLane& l : a->tracks[i])
-        if (l.target == AutoTarget::Insert || l.target == AutoTarget::Instrument)
+        if ((l.target == AutoTarget::Insert || l.target == AutoTarget::Instrument) && !std::isnan(l.staticValue))
           setTrackParam(i, l.target == AutoTarget::Instrument ? -1 : l.slot, l.param, l.staticValue);
     for (size_t b = 0; b < std::min(buses_.size(), a->buses.size()); ++b)
       for (const AutoLane& l : a->buses[b])
-        if (l.target == AutoTarget::Insert) setBusParam(b, l.slot, l.param, l.staticValue);
+        if (l.target == AutoTarget::Insert && !std::isnan(l.staticValue)) setBusParam(b, l.slot, l.param, l.staticValue);
   }
   automating_ = false;
 }
