@@ -149,12 +149,12 @@ void trackProps(const TrackRec& t, IAttributes* d) {
   // it with parseAutomation): one lane per line "<param> <ppq>:<value> ..." (automation.hpp).
   {
     std::string lanes;
-    char buf[64];
+    char buf[80];
     for (const auto& [param, pts] : t.automation) {
       if (param.empty()) continue;
       lanes += param;
-      for (const AutoPoint& pt : pts) {
-        std::snprintf(buf, sizeof buf, " %.10g:%.10g", pt.pos, pt.value);
+      for (const AutoPoint& pt : pts) {  // %.17g: round-trips (read-modify-write keeps every point exact)
+        std::snprintf(buf, sizeof buf, " %.17g:%.17g", pt.pos, pt.value);
         lanes += buf;
       }
       lanes += '\n';
@@ -423,6 +423,7 @@ sq_result doSetProperty(Editing& ed, IAttributes* p, IAttributes*) {
     TrackRec n = *t;
     r = setTrackProp(n, key, p, "value");
     if (r == SQ_OK && key == "output" && !sq_guid_is_null(&n.output)) {
+      if (n.kind == SQ_TRACK_MASTER) return SQ_E_INVALIDARG;  // the master is the end of every route
       const TrackRec* o = s.track(n.output);
       if (!o || o->id == n.id || (o->kind != SQ_TRACK_BUS && o->kind != SQ_TRACK_FX && o->kind != SQ_TRACK_MASTER)) return SQ_E_INVALIDARG;
       if (detail::routesTo(s, n.output, n.id)) return SQ_E_INVALIDARG;  // would close a feedback loop
@@ -731,8 +732,11 @@ sq_result doSetAutomation(Editing& ed, IAttributes* p, IAttributes*) {
     n.automation.erase(param);
   } else {
     std::vector<AutoPoint> pts;
+    // volume / send lanes are dB: past +24 dB the gain explodes (Inf/NaN downstream)
+    const bool db = param == "volume" || param.compare(0, 5, "send.") == 0;
     for (size_t i = 0; i + 1 < raw.size(); i += 2) {
       if (!std::isfinite(raw[i]) || !std::isfinite(raw[i + 1]) || raw[i] < 0) return SQ_E_INVALIDARG;
+      if (db && (raw[i + 1] < -144.0 || raw[i + 1] > 24.0)) return SQ_E_INVALIDARG;
       pts.push_back(AutoPoint{raw[i], raw[i + 1]});
     }
     std::stable_sort(pts.begin(), pts.end(), [](const AutoPoint& a, const AutoPoint& b) { return a.pos < b.pos; });
