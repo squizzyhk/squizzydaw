@@ -1,6 +1,9 @@
-// Squizzy Studio engine/audio - "Delay": stereo / ping-pong echo, free time in ms or synced to a
-// `bpm` parameter (ProcessContext carries no tempo; the host may automate bpm), feedback with
-// low/high cut and soft saturation in the loop. Delay time changes glide (tape style, no clicks).
+// Squizzy Studio engine/audio - "Delay": stereo / ping-pong echo, free time in ms or synced to the
+// song tempo (ProcessContext::tempo, filled by the graph; the device's own `bpm` parameter is only
+// the fallback when the host gives no tempo), feedback with low/high cut and soft saturation in
+// the loop. Delay time changes (incl. tempo changes) glide (tape style, no clicks).
+#include <atomic>
+
 #include "device.hpp"
 
 namespace sq::engine::audio::builtin {
@@ -53,6 +56,13 @@ class Delay final : public FxDevice {
       l.time = 0.0f;
     }
     first_ = true;
+  }
+  void onContext(const ProcessContext& ctx) noexcept override {
+    const float bpm = ctx.tempo > 0.0 ? static_cast<float>(std::clamp(ctx.tempo, 1.0, 1000.0)) : 0.0f;
+    if (bpm == hostBpm_.load(std::memory_order_relaxed)) return;
+    hostBpm_.store(bpm, std::memory_order_relaxed);
+    targetL_ = static_cast<float>(clampedSamples(timeMs(true)));
+    targetR_ = static_cast<float>(clampedSamples(timeMs(false)));
   }
   void onParams(bool snap) noexcept override {
     const double s = sr();
@@ -125,7 +135,8 @@ class Delay final : public FxDevice {
   double timeMs(bool left) const noexcept {
     const int sync = static_cast<int>(t(kSync) + 0.5f);
     if (sync > 0) {
-      const double bpm = std::max(1.0f, t(kBpm));
+      const float host = hostBpm_.load(std::memory_order_relaxed);
+      const double bpm = std::max(1.0f, host > 0.0f ? host : t(kBpm));
       return 60000.0 / bpm * kBeats[sync];
     }
     return left ? t(kTimeL) : t(kTimeR);
@@ -136,6 +147,9 @@ class Delay final : public FxDevice {
   dsp::Ramp dry_, wet_, fb_, width_;
   float targetL_ = 1.0f, targetR_ = 1.0f, timeCoef_ = 0.0f;
   bool first_ = true;
+  // Song tempo of the last block (0 = none: the Tempo parameter). Atomic: tail() may read it from
+  // the control thread.
+  std::atomic<float> hostBpm_{0.0f};
 };
 
 }  // namespace

@@ -54,7 +54,7 @@ enum class CmdType : uint32_t {
   Play, Stop, Locate, Loop, Metronome, Record, LowLatency, MasterVolume,
   TrackVolume, TrackPan, TrackMute, TrackSolo, TrackMonitor, BusVolume, BusMute,
   TrackParam, BusParam, MasterParam, TrackSendLevel, BusSendLevel, TrackLiveMidi, BusPan,
-  SetAutomation, MidiCapture
+  SetAutomation, MidiCapture, MasterPan, MasterMute, BusSolo
 };
 
 struct Command {

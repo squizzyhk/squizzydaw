@@ -113,6 +113,7 @@ class Device : public Base {
 
   void process(const ProcessContext& ctx, float* const* io, uint32_t channels) noexcept final {
     if (!prepared_) return;
+    onContext(ctx);
     const uint32_t nch = channels < channels_ ? channels : channels_;
     uint32_t ev = 0;
     uint32_t pos = 0;
@@ -143,6 +144,9 @@ class Device : public Base {
   // snap = true: jump ramps to their targets).
   virtual void onParams(bool snap) noexcept = 0;
   virtual void onMidi(const sq_midi_event& e) noexcept { (void)e; }
+  // Called at the start of every process() with the block context (song tempo etc.), before
+  // any parameter smoothing / onParams of the block.
+  virtual void onContext(const ProcessContext& ctx) noexcept { (void)ctx; }
   virtual void render(float* const* io, uint32_t nch, uint32_t n) noexcept = 0;
 
   // Smoothed plain value (updated once per sub-block).

@@ -11,8 +11,8 @@
 //                           bounds, note-offs at the note or clip end). The instrument exists with no
 //                           clips too (live MIDI). Audio clips (e.g. from bounce-in-place) play like
 //                           on an audio track.
-//   SQ_TRACK_BUS / FX    -> BusDesc (+ its "user.inserts" chain)
-//   SQ_TRACK_MASTER      -> master volume + master inserts ("user.inserts")
+//   SQ_TRACK_BUS / FX    -> BusDesc (+ its "user.inserts" chain; mute and solo flags)
+//   SQ_TRACK_MASTER      -> master volume, pan, mute + master inserts ("user.inserts")
 //   SQ_TRACK_FOLDER      -> ignored
 //   sq_track_info.output -> bus by GUID (null / unknown = master)
 //   tempo map            -> constant-tempo segments at every tempo point (positions converted via
@@ -34,10 +34,14 @@
 //                           edoc::kSetAutomation), resolved into GraphDesc::automation.
 // Structure key: parameter values in specs, send levels and automation are NOT part of it, so
 // edits of those are applied live by the engine (no recompile).
-// Audio sources are decoded through the codec registry once and cached by path (MediaCache).
+// Audio sources are decoded through the codec registry once and cached by path (MediaCache), then
+// converted to the engine sample rate (windowed-sinc SRC, resample.hpp) and cached per
+// (path, rate): a 44.1 kHz file plays at its pitch and length in a 48 kHz graph. Clip source
+// offsets are source seconds (converted with the engine rate).
 #pragma once
 
 #include <map>
+#include <utility>
 #include <string>
 
 #include "sq/sdk.hpp"
@@ -51,17 +55,24 @@ class MediaCache {
  public:
   // Returns cached media or decodes it. reg = codec registry.
   sq_result get(IClassRegistry* reg, const std::string& path, MediaPtr* out);
-  void clear() { map_.clear(); }
+  // The same media converted to `rate` (resample.hpp), cached per (path, rate); rate <= 0 or the
+  // file's own rate returns the decoded media itself.
+  sq_result get(IClassRegistry* reg, const std::string& path, double rate, MediaPtr* out);
+  void clear() {
+    map_.clear();
+    converted_.clear();
+  }
   size_t size() const { return map_.size(); }
 
  private:
   std::map<std::string, MediaPtr> map_;
+  std::map<std::pair<std::string, double>, MediaPtr> converted_;
 };
 
 struct DocBuildResult {
   std::vector<std::string> warnings;  // missing media etc. (the graph is still built)
   // Everything that shapes the compiled graph EXCEPT the live mixer parameters (track/bus volume,
-  // pan, mute, solo, monitor, arm, master volume), parameter values inside insert/instrument specs,
+  // pan, mute, solo, monitor, arm, master volume / pan / mute), parameter values inside insert/instrument specs,
   // send levels, automation, and cosmetic properties (names, colours, other user.* keys). Two builds with the same key compile to the same graph structure, so the engine
   // can apply a document edit as RT mixer commands instead of recompiling (no audible
   // discontinuity, plugin instances and their state are kept).

@@ -29,6 +29,9 @@ struct ProcessContext {
   // engine does while looping: the read-ahead must wrap at the loop end before the output does).
   bool timelineExplicit = false;
   bool playing = false;          // sources render only while playing
+  // Song tempo (bpm) at the block start, at timelineFrame. Graph::process fills it from its tempo
+  // map (live and offline); 0 = unknown (a processor run outside a graph: use its own default).
+  double tempo = 0.0;
   // Device input of this block (non-interleaved), may be null.
   const float* const* input = nullptr;
   uint32_t inputChannels = 0;
