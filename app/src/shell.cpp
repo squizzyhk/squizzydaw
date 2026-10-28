@@ -343,7 +343,9 @@ struct Shell::Impl {
     });
     add("Track", "AddAudio", "Add Audio Track", [this](IAttributes* a, IAttributes* res) { return addTrackKind(a, res, SQ_TRACK_AUDIO, "Audio", {}); }, haveDoc);
     add("Track", "AddInstrument", "Add Instrument Track", [this](IAttributes* a, IAttributes* res) {
-      return addTrackKind(a, res, SQ_TRACK_INSTRUMENT, "Instrument", str(a, "instrument", engine::audio::kDefaultInstrument));
+      const std::string spec = str(a, "instrument", engine::audio::kDefaultInstrument);
+      if (!validInstrument(spec)) return setMessage(SQ_E_INVALIDARG, "malformed instrument spec (<format>|<id>|<path>[|i=v]...)");
+      return addTrackKind(a, res, SQ_TRACK_INSTRUMENT, "Instrument", spec);
     }, haveDoc);
     add("Track", "ToggleArm", "Arm Track for Recording", [this](IAttributes* a, IAttributes*) {
       auto t = track(a);
@@ -1179,9 +1181,36 @@ struct Shell::Impl {
   }
   static bool argInt(IAttributes* a, const char* key, int64_t* out) {
     double v = 0;
-    if (!argNum(a, key, &v) || v != std::floor(v)) return false;
+    if (!argNum(a, key, &v) || v != std::floor(v) || std::fabs(v) > 9.0e15) return false;
     *out = static_cast<int64_t>(v);
     return true;
+  }
+  // A parameter / slot index: a whole number in 0..2^32-1 (larger values would wrap on the cast).
+  static bool argIndex(IAttributes* a, const char* key, uint32_t* out) {
+    int64_t v = 0;
+    if (!argInt(a, key, &v) || v < 0 || v > static_cast<int64_t>(UINT32_MAX)) return false;
+    *out = static_cast<uint32_t>(v);
+    return true;
+  }
+  // dB range accepted for send levels and volume / send automation (dbToGain: <= -144 dB is silence).
+  static constexpr double kMinDb = -144.0;
+  static constexpr double kMaxDb = 24.0;
+  static bool validDb(double v) { return std::isfinite(v) && v >= kMinDb && v <= kMaxDb; }
+  // Device spec text: one line (a newline would split one insert into several) and well-formed.
+  static bool validSpec(const std::string& spec) {
+    if (spec.find_first_of("\r\n") != std::string::npos) return false;
+    engine::audio::SpecParts sp;
+    return engine::audio::parseSpec(engine::audio::specWithoutBypass(spec), &sp);
+  }
+  // Length (status included) of a MIDI message; sysex (F0/F7) is not accepted by Midi.Inject.
+  static size_t midiMessageLength(uint8_t st) {
+    if (st >= 0xF0) return st == 0xF1 || st == 0xF3 ? size_t{2} : st == 0xF2 ? size_t{3} : size_t{1};
+    return ((st & 0xF0u) == 0xC0 || (st & 0xF0u) == 0xD0) ? size_t{2} : size_t{3};
+  }
+  static bool validInstrument(const std::string& spec) {
+    if (spec.find_first_of("\r\n") != std::string::npos) return false;
+    engine::audio::SpecParts sp;
+    return engine::audio::parseSpec(spec, &sp);
   }
   static bool argBool(IAttributes* a, const char* key, bool def) {
     if (!a || a->getType(key) == SQ_VALUE_NONE) return def;
@@ -1234,6 +1263,31 @@ struct Shell::Impl {
     return true;
   }
 
+  // True when audio leaving track `from` can arrive at track `target` through outputs and sends
+  // (a null output is the master, which routes nowhere). Used to refuse feedback loops.
+  bool reaches(const sq_guid& from, const sq_guid& target) {
+    std::vector<sq_guid> todo{from};
+    std::set<std::string> seen;
+    while (!todo.empty()) {
+      const sq_guid g = todo.back();
+      todo.pop_back();
+      if (sq_guid_is_null(&g)) continue;
+      if (g == target) return true;
+      if (!seen.insert(sq::toString(g)).second) continue;
+      auto t = trackById(g);
+      if (!t) continue;
+      auto props = sq::makeAttributes();
+      t->getProperties(props.get());
+      sq_guid out{};
+      if (props->getGuid("output", &out) == SQ_OK) todo.push_back(out);
+      for (const std::string& line : splitLines(sq::getAttrString(props.get(), "user.sends"))) {
+        sq_guid dest{};
+        if (sq::parseGuid(line.substr(0, line.find(' ')), dest)) todo.push_back(dest);
+      }
+    }
+    return false;
+  }
+
   // ---- track structure ----
   sq_result addTrackKind(IAttributes* a, IAttributes* res, int32_t kind, const std::string& defName, const std::string& instrument) {
     auto p = sq::makeAttributes();
@@ -1258,17 +1312,85 @@ struct Shell::Impl {
     return setMessage(SQ_OK, "added track " + sq::toString(id) + (instrument.empty() ? std::string() : " (" + instrument + ")"));
   }
 
+  // An editable line list ("user.inserts" / "user.sends") that remembers where each line came
+  // from, so automation lanes addressed by line index ("insert.<slot>.*", "send.<n>") can follow.
+  struct LineList {
+    std::vector<std::string> lines;
+    std::vector<int64_t> origin;  // original index of each line; -1 = new line
+    explicit LineList(std::vector<std::string> l) : lines(std::move(l)) {
+      for (size_t i = 0; i < lines.size(); ++i) origin.push_back(static_cast<int64_t>(i));
+    }
+    size_t size() const { return lines.size(); }
+    std::string& operator[](size_t i) { return lines[i]; }
+    void insert(size_t at, const std::string& line) {
+      lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(at), line);
+      origin.insert(origin.begin() + static_cast<std::ptrdiff_t>(at), -1);
+    }
+    void push_back(const std::string& line) { insert(lines.size(), line); }
+    void erase(size_t at) {
+      lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(at));
+      origin.erase(origin.begin() + static_cast<std::ptrdiff_t>(at));
+    }
+    void move(size_t from, size_t to) {
+      const std::string l = lines[from];
+      const int64_t o = origin[from];
+      erase(from);
+      lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(to), l);
+      origin.insert(origin.begin() + static_cast<std::ptrdiff_t>(to), o);
+    }
+    // old index -> new index (-1 = removed); empty when nothing moved.
+    std::vector<int64_t> remap(size_t oldCount) const {
+      std::vector<int64_t> m(oldCount, -1);
+      bool moved = false;
+      for (size_t i = 0; i < origin.size(); ++i)
+        if (origin[i] >= 0) m[static_cast<size_t>(origin[i])] = static_cast<int64_t>(i);
+      for (size_t i = 0; i < oldCount; ++i) moved = moved || m[i] != static_cast<int64_t>(i);
+      return moved ? m : std::vector<int64_t>{};
+    }
+  };
+  // Renumbers the track's automation lanes "<prefix><index>[.<rest>]" by map (old -> new, -1 =
+  // delete the lane). Runs inside the caller's step, so the list edit and the lanes are one undo.
+  sq_result remapLanes(ITrack* t, const std::string& prefix, const std::vector<int64_t>& map) {
+    if (map.empty()) return SQ_OK;
+    std::vector<std::pair<std::string, std::vector<std::pair<double, double>>>> moved;
+    std::vector<std::string> removed;
+    for (const auto& l : engine::audio::parseAutomation(trackStr(t, "automation"))) {
+      if (l.target.compare(0, prefix.size(), prefix) != 0) continue;
+      const size_t dot = l.target.find('.', prefix.size());
+      const std::string idx = l.target.substr(prefix.size(), dot == std::string::npos ? std::string::npos : dot - prefix.size());
+      uint32_t old = 0;
+      if (!parseIndex(idx, &old) || old >= map.size()) continue;
+      const int64_t now = map[old];
+      if (now == static_cast<int64_t>(old)) continue;
+      removed.push_back(l.target);
+      if (now >= 0)
+        moved.emplace_back(prefix + std::to_string(now) + (dot == std::string::npos ? std::string() : l.target.substr(dot)), l.points);
+    }
+    for (const auto& target : removed) {
+      const sq_result r = setLane(t, target, {});
+      if (SQ_FAILED(r)) return r;
+    }
+    for (const auto& [target, pts] : moved) {
+      const sq_result r = setLane(t, target, pts);
+      if (SQ_FAILED(r)) return r;
+    }
+    return SQ_OK;
+  }
   // Editing the insert list ("user.inserts") of a track/bus: fn edits the lines.
   template <class F>
   sq_result editInserts(IAttributes* a, const char* title, F&& fn) {
     auto t = track(a);
     if (SQ_FAILED(needTrack(t))) return SQ_E_NOTFOUND;
-    std::vector<std::string> lines = splitLines(trackStr(t.get(), "user.inserts"));
+    LineList lines(splitLines(trackStr(t.get(), "user.inserts")));
+    const size_t before = lines.size();
     std::string msg;
     const sq_result r = fn(lines, msg);
     if (SQ_FAILED(r)) return setMessage(r, msg.empty() ? std::string(title) + ": " + sq_result_string(r) : msg);
     const bool merge = argBool(a, "merge", false);
-    const sq_result w = step(title, [&] { return setTrackString(t.get(), "user.inserts", joinLines(lines), merge); });
+    const sq_result w = step(title, [&] {
+      const sq_result x = setTrackString(t.get(), "user.inserts", joinLines(lines.lines), merge);
+      return SQ_FAILED(x) ? x : remapLanes(t.get(), "insert.", lines.remap(before));
+    });
     return setMessage(w, SQ_SUCCEEDED(w) ? msg : std::string(title) + " failed: " + sq_result_string(w));
   }
   bool slotArg(IAttributes* a, const char* key, size_t count, size_t* out) {
@@ -1278,20 +1400,24 @@ struct Shell::Impl {
     return true;
   }
 
-  sq_result editSends(IAttributes* a, const char* title, const std::function<sq_result(std::vector<std::string>&, std::string&)>& fn) {
+  sq_result editSends(IAttributes* a, const char* title, const std::function<sq_result(LineList&, std::string&)>& fn) {
     auto t = track(a);
     if (SQ_FAILED(needTrack(t))) return SQ_E_NOTFOUND;
-    std::vector<std::string> lines = splitLines(trackStr(t.get(), "user.sends"));
+    LineList lines(splitLines(trackStr(t.get(), "user.sends")));
+    const size_t before = lines.size();
     std::string msg;
     const sq_result r = fn(lines, msg);
     if (SQ_FAILED(r)) return setMessage(r, msg.empty() ? std::string(title) + ": " + sq_result_string(r) : msg);
     const bool merge = argBool(a, "merge", false);
-    const sq_result w = step(title, [&] { return setTrackString(t.get(), "user.sends", joinLines(lines), merge); });
+    const sq_result w = step(title, [&] {
+      const sq_result x = setTrackString(t.get(), "user.sends", joinLines(lines.lines), merge);
+      return SQ_FAILED(x) ? x : remapLanes(t.get(), "send.", lines.remap(before));
+    });
     return setMessage(w, SQ_SUCCEEDED(w) ? msg : std::string(title) + " failed: " + sq_result_string(w));
   }
 
   // ---- automation (edoc::kSetAutomation; the track property "automation" is the read view) ----
-  sq_result writeLane(ITrack* t, const std::string& target, const std::vector<std::pair<double, double>>& pts, const char* title) {
+  sq_result setLane(ITrack* t, const std::string& target, const std::vector<std::pair<double, double>>& pts) {
     std::vector<double> raw;
     for (const auto& [p, v] : pts) {
       raw.push_back(p);
@@ -1302,10 +1428,45 @@ struct Shell::Impl {
     p->setGuid("track", &g);
     p->setString("param", target.c_str());
     p->setBlob("points", raw.empty() ? nullptr : raw.data(), static_cast<uint32_t>(raw.size() * sizeof(double)));
-    return step(title, [&] { return exec(edoc::kSetAutomation, p.get()); });
+    return exec(edoc::kSetAutomation, p.get());
+  }
+  sq_result writeLane(ITrack* t, const std::string& target, const std::vector<std::pair<double, double>>& pts, const char* title) {
+    return step(title, [&] { return setLane(t, target, pts); });
+  }
+  // A decimal index that fits 32 bits (no sign, no wrap).
+  static bool parseIndex(const std::string& s, uint32_t* out) {
+    if (s.empty() || s.size() > 10 || s.find_first_not_of("0123456789") != std::string::npos) return false;
+    const unsigned long long v = std::strtoull(s.c_str(), nullptr, 10);
+    if (v > UINT32_MAX) return false;
+    *out = static_cast<uint32_t>(v);
+    return true;
+  }
+  // Volume and send lanes are dB values (see kMinDb / kMaxDb).
+  static bool dbTarget(const std::string& t) { return t == "volume" || t.rfind("send.", 0) == 0; }
+  // "ppq:value ppq:value ..." with every token fully numeric; false on any malformed token.
+  static bool parsePoints(const std::string& text, std::vector<std::pair<double, double>>* out) {
+    size_t p = 0;
+    while (p < text.size()) {
+      const size_t e = text.find_first_of(" \t", p);
+      const std::string tok = text.substr(p, e == std::string::npos ? std::string::npos : e - p);
+      p = e == std::string::npos ? text.size() : e + 1;
+      if (tok.empty()) continue;
+      const size_t colon = tok.find(':');
+      if (colon == std::string::npos) return false;
+      const std::string ps = tok.substr(0, colon), vs = tok.substr(colon + 1);
+      char* pe = nullptr;
+      char* ve = nullptr;
+      const double pos = std::strtod(ps.c_str(), &pe);
+      const double val = std::strtod(vs.c_str(), &ve);
+      if (ps.empty() || vs.empty() || !pe || *pe != '\0' || !ve || *ve != '\0' || !std::isfinite(pos) || !std::isfinite(val)) return false;
+      out->emplace_back(pos, val);
+    }
+    std::stable_sort(out->begin(), out->end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+    return true;
   }
   static bool validTarget(const std::string& t) {
-    auto digits = [](const std::string& s) { return !s.empty() && s.find_first_not_of("0123456789") == std::string::npos; };
+    uint32_t v = 0;
+    auto digits = [&v](const std::string& s) { return parseIndex(s, &v); };
     if (t == "volume" || t == "pan" || t == "mute") return true;
     if (t.rfind("send.", 0) == 0) return digits(t.substr(5));
     if (t.rfind("instrument.", 0) == 0) return digits(t.substr(11));
@@ -1424,7 +1585,9 @@ struct Shell::Impl {
     add("Track", "AddBus", "Add Bus", [this](IAttributes* a, IAttributes* res) { return addTrackKind(a, res, SQ_TRACK_BUS, "Bus", {}); }, haveDoc);
     add("Track", "AddFx", "Add FX Track", [this](IAttributes* a, IAttributes* res) { return addTrackKind(a, res, SQ_TRACK_FX, "FX", {}); }, haveDoc);
     add("Track", "AddDrums", "Add Drum Track", [this](IAttributes* a, IAttributes* res) {
-      return addTrackKind(a, res, SQ_TRACK_INSTRUMENT, "Drums", str(a, "instrument", "builtin|drums|"));
+      const std::string spec = str(a, "instrument", "builtin|drums|");
+      if (!validInstrument(spec)) return setMessage(SQ_E_INVALIDARG, "malformed instrument spec (<format>|<id>|<path>[|i=v]...)");
+      return addTrackKind(a, res, SQ_TRACK_INSTRUMENT, "Drums", spec);
     }, haveDoc);
     add("Track", "Remove", "Remove Track", [this](IAttributes* a, IAttributes*) {
       auto t = track(a);
@@ -1460,6 +1623,9 @@ struct Shell::Impl {
       sq_guid out{};
       std::string label;
       if (!busArg(a, &out, &label)) return setMessage(SQ_E_INVALIDARG, "bus=<bus/FX track or master> required");
+      if (trackInfo(t.get()).kind == SQ_TRACK_MASTER) return setMessage(SQ_E_INVALIDARG, "the master track has no output to route");
+      if (!sq_guid_is_null(&out) && reaches(out, nodeId(t.get())))
+        return setMessage(SQ_E_INVALIDARG, "routing to " + label + " would create a feedback loop");
       const sq_result r = step("Track Output", [&] { return setTrackProp(t.get(), "output", [&](IAttributes* p) { p->setGuid("value", &out); }); });
       return setMessage(r, SQ_SUCCEEDED(r) ? trackLabel(t.get()) + " -> " + label
                                            : std::string("set output failed (feedback loop or not a bus): ") + sq_result_string(r));
@@ -1534,8 +1700,7 @@ struct Shell::Impl {
       if (SQ_FAILED(needTrack(t))) return SQ_E_NOTFOUND;
       if (trackInfo(t.get()).kind != SQ_TRACK_INSTRUMENT) return setMessage(SQ_E_INVALIDARG, trackLabel(t.get()) + " is not an instrument track");
       const std::string spec = str(a, "spec");
-      engine::audio::SpecParts sp;
-      if (!spec.empty() && !engine::audio::parseSpec(spec, &sp)) return setMessage(SQ_E_INVALIDARG, "malformed spec (<format>|<id>|<path>[|i=v]...)");
+      if (!spec.empty() && !validInstrument(spec)) return setMessage(SQ_E_INVALIDARG, "malformed spec (<format>|<id>|<path>[|i=v]...)");
       const sq_result r = step("Set Instrument", [&] { return setTrackString(t.get(), "user.instrument", spec); });
       return setMessage(r, SQ_SUCCEEDED(r) ? trackLabel(t.get()) + " instrument " + (spec.empty() ? std::string("(default)") : spec)
                                            : std::string("set instrument failed: ") + sq_result_string(r));
@@ -1544,12 +1709,13 @@ struct Shell::Impl {
       auto t = track(a);
       if (SQ_FAILED(needTrack(t))) return SQ_E_NOTFOUND;
       if (trackInfo(t.get()).kind != SQ_TRACK_INSTRUMENT) return setMessage(SQ_E_INVALIDARG, trackLabel(t.get()) + " is not an instrument track");
-      int64_t param = 0;
+      uint32_t param = 0;
       double value = 0;
-      if (!argInt(a, "param", &param) || param < 0 || !argNum(a, "value", &value)) return setMessage(SQ_E_INVALIDARG, "param=<index> value=<plain> required");
+      if (!argIndex(a, "param", &param) || !argNum(a, "value", &value)) return setMessage(SQ_E_INVALIDARG, "param=<0..2^32-1> value=<plain> required");
       std::string spec = trackStr(t.get(), "user.instrument");
       if (spec.empty()) spec = engine::audio::kDefaultInstrument;
-      const std::string next = engine::audio::specSetParam(spec, static_cast<uint32_t>(param), value);
+      if (!validInstrument(spec)) return setMessage(SQ_E_INVALIDARG, trackLabel(t.get()) + " has a malformed instrument spec");
+      const std::string next = engine::audio::specSetParam(spec, param, value);
       const bool merge = argBool(a, "merge", false);
       const sq_result r = step("Instrument Parameter", [&] { return setTrackString(t.get(), "user.instrument", next, merge); });
       return setMessage(r, SQ_SUCCEEDED(r) ? "instrument param " + std::to_string(param) + " = " + fmtNum(value) : std::string("failed: ") + sq_result_string(r));
@@ -1558,13 +1724,13 @@ struct Shell::Impl {
     // ---- inserts ----
     add("Track", "AddInsert", "Add Insert", [this](IAttributes* a, IAttributes* res) {
       const std::string spec = str(a, "spec");
-      engine::audio::SpecParts sp;
-      if (!engine::audio::parseSpec(engine::audio::specWithoutBypass(spec), &sp)) return setMessage(SQ_E_INVALIDARG, "spec=<format>|<id>|<path>[|i=v]... required");
+      if (!validSpec(spec)) return setMessage(SQ_E_INVALIDARG, "spec=<format>|<id>|<path>[|i=v]... required (one line)");
       int64_t slot = -1;
-      return editInserts(a, "Add Insert", [&](std::vector<std::string>& lines, std::string& msg) {
+      return editInserts(a, "Add Insert", [&](LineList& lines, std::string& msg) {
         int64_t idx = static_cast<int64_t>(lines.size());
-        if (argInt(a, "index", &idx) && (idx < 0 || idx > static_cast<int64_t>(lines.size()))) return SQ_E_INVALIDARG;
-        lines.insert(lines.begin() + idx, spec);
+        if (a && a->getType("index") != SQ_VALUE_NONE && (!argInt(a, "index", &idx) || idx < 0 || idx > static_cast<int64_t>(lines.size())))
+          return msg = "index=<0.." + std::to_string(lines.size()) + "> (whole number)", SQ_E_INVALIDARG;
+        lines.insert(static_cast<size_t>(idx), spec);
         slot = idx;
         if (res) res->setInt("slot", slot);
         msg = "insert " + spec + " at slot " + std::to_string(idx);
@@ -1572,40 +1738,39 @@ struct Shell::Impl {
       });
     }, haveDoc);
     add("Track", "RemoveInsert", "Remove Insert", [this](IAttributes* a, IAttributes*) {
-      return editInserts(a, "Remove Insert", [&](std::vector<std::string>& lines, std::string& msg) {
+      return editInserts(a, "Remove Insert", [&](LineList& lines, std::string& msg) {
         size_t s = 0;
         if (!slotArg(a, "slot", lines.size(), &s)) return msg = "slot=<0.." + std::to_string(lines.size()) + "> required", SQ_E_INVALIDARG;
         msg = "removed insert " + lines[s];
-        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(s));
+        lines.erase(s);
         return SQ_OK;
       });
     }, haveDoc);
     add("Track", "MoveInsert", "Move Insert", [this](IAttributes* a, IAttributes*) {
-      return editInserts(a, "Move Insert", [&](std::vector<std::string>& lines, std::string& msg) {
+      return editInserts(a, "Move Insert", [&](LineList& lines, std::string& msg) {
         size_t s = 0, to = 0;
         if (!slotArg(a, "slot", lines.size(), &s) || !slotArg(a, "to", lines.size(), &to)) return msg = "slot= to= required", SQ_E_INVALIDARG;
-        std::string line = lines[s];
-        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(s));
-        lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(to), line);
+        lines.move(s, to);
         msg = "moved insert " + std::to_string(s) + " -> " + std::to_string(to);
         return SQ_OK;
       });
     }, haveDoc);
     add("Track", "SetInsertParam", "Set Insert Parameter", [this](IAttributes* a, IAttributes*) {
-      return editInserts(a, "Insert Parameter", [&](std::vector<std::string>& lines, std::string& msg) {
+      return editInserts(a, "Insert Parameter", [&](LineList& lines, std::string& msg) {
         size_t s = 0;
-        int64_t param = 0;
+        uint32_t param = 0;
         double value = 0;
-        if (!slotArg(a, "slot", lines.size(), &s) || !argInt(a, "param", &param) || param < 0 || !argNum(a, "value", &value))
-          return msg = "slot= param= value= required", SQ_E_INVALIDARG;
+        if (!slotArg(a, "slot", lines.size(), &s) || !argIndex(a, "param", &param) || !argNum(a, "value", &value))
+          return msg = "slot= param=<0..2^32-1> value= required", SQ_E_INVALIDARG;
+        if (!validSpec(lines[s])) return msg = "insert " + std::to_string(s) + " has a malformed spec", SQ_E_INVALIDARG;
         const bool bypassed = engine::audio::specBypassed(lines[s]);
-        lines[s] = (bypassed ? "!" : "") + engine::audio::specSetParam(engine::audio::specWithoutBypass(lines[s]), static_cast<uint32_t>(param), value);
+        lines[s] = (bypassed ? "!" : "") + engine::audio::specSetParam(engine::audio::specWithoutBypass(lines[s]), param, value);
         msg = "insert " + std::to_string(s) + " param " + std::to_string(param) + " = " + fmtNum(value);
         return SQ_OK;
       });
     }, haveDoc);
     add("Track", "BypassInsert", "Bypass Insert", [this](IAttributes* a, IAttributes*) {
-      return editInserts(a, "Bypass Insert", [&](std::vector<std::string>& lines, std::string& msg) {
+      return editInserts(a, "Bypass Insert", [&](LineList& lines, std::string& msg) {
         size_t s = 0;
         if (!slotArg(a, "slot", lines.size(), &s)) return msg = "slot= required", SQ_E_INVALIDARG;
         const bool now = engine::audio::specBypassed(lines[s]);
@@ -1622,11 +1787,14 @@ struct Shell::Impl {
       std::string label;
       if (!busArg(a, &bus, &label) || sq_guid_is_null(&bus)) return setMessage(SQ_E_INVALIDARG, "bus=<bus/FX track> required");
       double level = 0;
-      if (a && a->getType("level") != SQ_VALUE_NONE && !argNum(a, "level", &level)) return setMessage(SQ_E_INVALIDARG, "level=<dB>");
+      if (a && a->getType("level") != SQ_VALUE_NONE && (!argNum(a, "level", &level) || !validDb(level)))
+        return setMessage(SQ_E_INVALIDARG, "level=<dB> (-144..24)");
       const bool pre = argBool(a, "pre", false);
       auto t = track(a);
       if (t && nodeId(t.get()) == bus) return setMessage(SQ_E_INVALIDARG, "a track cannot send to itself");
-      return editSends(a, "Add Send", [&](std::vector<std::string>& lines, std::string& msg) {
+      if (t && trackInfo(t.get()).kind == SQ_TRACK_MASTER) return setMessage(SQ_E_INVALIDARG, "the master track cannot have sends");
+      if (t && reaches(bus, nodeId(t.get()))) return setMessage(SQ_E_INVALIDARG, "send to " + label + " would create a feedback loop");
+      return editSends(a, "Add Send", [&](LineList& lines, std::string& msg) {
         lines.push_back(sq::toString(bus) + " " + fmtNum(level) + (pre ? " pre" : ""));
         if (res) res->setInt("send", static_cast<int64_t>(lines.size() - 1));
         msg = "send " + std::to_string(lines.size() - 1) + " -> " + label + " " + fmtNum(level) + " dB" + (pre ? " pre" : "");
@@ -1634,10 +1802,11 @@ struct Shell::Impl {
       });
     }, haveDoc);
     add("Track", "SetSendLevel", "Set Send Level", [this](IAttributes* a, IAttributes*) {
-      return editSends(a, "Send Level", [&](std::vector<std::string>& lines, std::string& msg) {
+      return editSends(a, "Send Level", [&](LineList& lines, std::string& msg) {
         size_t s = 0;
         double level = 0;
-        if (!slotArg(a, "send", lines.size(), &s) || !argNum(a, "level", &level)) return msg = "send=<index> level=<dB> required", SQ_E_INVALIDARG;
+        if (!slotArg(a, "send", lines.size(), &s) || !argNum(a, "level", &level) || !validDb(level))
+          return msg = "send=<index> level=<dB> (-144..24) required", SQ_E_INVALIDARG;
         const size_t sp = lines[s].find(' ');
         const bool pre = lines[s].find(" pre") != std::string::npos;
         lines[s] = lines[s].substr(0, sp) + " " + fmtNum(level) + (pre ? " pre" : "");
@@ -1646,10 +1815,10 @@ struct Shell::Impl {
       });
     }, haveDoc);
     add("Track", "RemoveSend", "Remove Send", [this](IAttributes* a, IAttributes*) {
-      return editSends(a, "Remove Send", [&](std::vector<std::string>& lines, std::string& msg) {
+      return editSends(a, "Remove Send", [&](LineList& lines, std::string& msg) {
         size_t s = 0;
         if (!slotArg(a, "send", lines.size(), &s)) return msg = "send=<index> required", SQ_E_INVALIDARG;
-        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(s));
+        lines.erase(s);
         msg = "removed send " + std::to_string(s);
         return SQ_OK;
       });
@@ -1662,11 +1831,11 @@ struct Shell::Impl {
       const std::string target = str(a, "target");
       if (!validTarget(target)) return setMessage(SQ_E_INVALIDARG, "target= volume|pan|mute|send.<n>|insert.<slot>.<param>|instrument.<param>");
       std::vector<std::pair<double, double>> pts;
-      for (const auto& l : engine::audio::parseAutomation(target + " " + str(a, "points")))
-        pts = l.points;
-      if (pts.empty()) return setMessage(SQ_E_INVALIDARG, "points=\"ppq:value ppq:value ...\" required");
-      for (auto& [p, v] : pts)
+      if (!parsePoints(str(a, "points"), &pts) || pts.empty()) return setMessage(SQ_E_INVALIDARG, "points=\"ppq:value ppq:value ...\" required");
+      for (auto& [p, v] : pts) {
         if (p < 0) return setMessage(SQ_E_INVALIDARG, "negative position");
+        if (dbTarget(target) && !validDb(v)) return setMessage(SQ_E_INVALIDARG, target + " values are dB in -144..24");
+      }
       const sq_result r = writeLane(t.get(), target, pts, "Edit Automation");
       return setMessage(r, SQ_SUCCEEDED(r) ? trackLabel(t.get()) + " " + target + ": " + std::to_string(pts.size()) + " point(s)"
                                            : std::string("automation failed: ") + sq_result_string(r));
@@ -1678,6 +1847,7 @@ struct Shell::Impl {
       double ppq = 0, value = 0;
       if (!validTarget(target) || !argNum(a, "ppq", &ppq) || ppq < 0 || !argNum(a, "value", &value))
         return setMessage(SQ_E_INVALIDARG, "target= ppq= value= required");
+      if (dbTarget(target) && !validDb(value)) return setMessage(SQ_E_INVALIDARG, target + " values are dB in -144..24");
       std::vector<std::pair<double, double>> pts;
       for (const auto& l : engine::audio::parseAutomation(trackStr(t.get(), "automation")))
         if (l.target == target) pts = l.points;
@@ -1730,6 +1900,7 @@ struct Shell::Impl {
     add("Clip", "SetNotes", "Set Clip Notes", [this](IAttributes* a, IAttributes*) {
       auto c = clipArg(a);
       if (!c) return setMessage(SQ_E_NOTFOUND, "no such clip (clip= or a selected clip)");
+      if (!a || a->getType("notes") != SQ_VALUE_STRING) return setMessage(SQ_E_INVALIDARG, "notes=\"pos,len,pitch,vel;...\" required (notes=\"\" clears)");
       std::vector<sq_clip_event> evs;
       const std::string notes = str(a, "notes");
       size_t p = 0;
@@ -1895,15 +2066,16 @@ struct Shell::Impl {
         if (!statusPos) {
           size_t i = 0;
           while (i < bytes.size()) {
-            const uint8_t st = bytes[i];
-            const size_t len = ((st & 0xF0u) == 0xC0 || (st & 0xF0u) == 0xD0) ? 2 : 3;
+            const size_t len = midiMessageLength(bytes[i]);
             if (i + len > bytes.size()) break;
             i += len;
           }
           statusPos = i == bytes.size();
         }
         v = std::strtoul(hex ? tok.c_str() + 2 : tok.c_str(), &end, (hex || statusPos) ? 16 : 10);
-        if (!end || *end != '\0' || v > 255 || (statusPos && v < 0x80)) return setMessage(SQ_E_INVALIDARG, "bytes=\"90,60,100\" (status hex, data decimal): bad '" + tok + "'");
+        // status bytes have the high bit set; data bytes (note, velocity, ...) are 0..127
+        if (!end || *end != '\0' || v > 255 || (statusPos ? v < 0x80 || v == 0xF0 || v == 0xF7 : v > 0x7F))
+          return setMessage(SQ_E_INVALIDARG, "bytes=\"90,60,100\" (status hex, data decimal 0..127, no sysex): bad '" + tok + "'");
         bytes.push_back(static_cast<uint8_t>(v));
       }
       if (bytes.empty()) return setMessage(SQ_E_INVALIDARG, "bytes= required");

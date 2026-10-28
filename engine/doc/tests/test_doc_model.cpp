@@ -468,3 +468,41 @@ SQ_TEST("journals: UI state rides along with transactions but never makes undo s
   REQUIRE_OK(f.ed->redo());
   CHECK_EQ(f.impl->journal("selection"), sq::edoc::guidStr(t));
 }
+
+SQ_TEST("doc: master has no output, dB lanes are range-checked, the automation view round-trips") {
+  Fx f;
+  const sq_guid master = f.st().trackOrder.front();
+  REQUIRE_EQ(f.st().track(master)->kind, SQ_TRACK_MASTER);
+  const sq_guid bus = addTrack(f.ed.get(), SQ_TRACK_BUS);
+  const sq_guid a = addTrack(f.ed.get(), SQ_TRACK_AUDIO);
+  // master -> bus -> (null = master) would be a loop the routesTo walk cannot see
+  auto p = sq::makeAttributes();
+  p->setGuid("node", &master);
+  p->setString("key", "output");
+  p->setGuid("value", &bus);
+  CHECK_EQ(exec(f.ed.get(), sq::doc::kSetProperty, p.get()), SQ_E_INVALIDARG);
+  CHECK(sq_guid_is_null(&f.st().track(master)->output));
+
+  // volume / send lanes: dB within -144..24 (400 dB would be a gain of 1e20)
+  CHECK_EQ(setAutomation(f.ed.get(), a, "volume", {0.0, 400.0}), SQ_E_INVALIDARG);
+  CHECK_EQ(setAutomation(f.ed.get(), a, "send.0", {0.0, 25.0}), SQ_E_INVALIDARG);
+  CHECK_EQ(setAutomation(f.ed.get(), a, "volume", {0.0, -200.0}), SQ_E_INVALIDARG);
+  CHECK_OK(setAutomation(f.ed.get(), a, "volume", {0.0, 24.0, 1.0, -144.0}));
+  CHECK_OK(setAutomation(f.ed.get(), a, "insert.0.0", {0.0, 400.0}));  // plain parameter values: not dB
+
+  // the read view keeps full precision (read-modify-write must not round other points)
+  CHECK_OK(setAutomation(f.ed.get(), a, "pan", {1.333333333333, 0.123456789012345}));
+  Ptr<sq::INode> n;
+  REQUIRE_OK(f.doc->findNode(&a, n.put()));
+  auto props = sq::makeAttributes();
+  REQUIRE_OK(n->getProperties(props.get()));
+  const std::string view = sq::getAttrString(props.get(), "automation");
+  const size_t at = view.find("pan ");
+  REQUIRE(at != std::string::npos);
+  char* end = nullptr;
+  const double pos = std::strtod(view.c_str() + at + 4, &end);
+  REQUIRE((end && *end == ':'));
+  const double val = std::strtod(end + 1, nullptr);
+  CHECK_EQ(pos, 1.333333333333);
+  CHECK_EQ(val, 0.123456789012345);
+}
