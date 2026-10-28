@@ -266,6 +266,14 @@ class Gui final : public GuiContext {
   std::string draggedFile() const override { return dragged_; }
   void setDraggedFile(const std::string& path) override { dragged_ = path; }
   Widget* findWidget(std::string_view name) override { return tree.findByName(name); }
+  bool editFocused(std::string_view cmd) override {
+    for (Widget* w = tree.focus(); w; w = w->parent())
+      if (auto* t = dynamic_cast<gui::EditTarget*>(w); t && t->editCommand(cmd)) {
+        invalidate();
+        return true;
+      }
+    return false;
+  }
 
   // ---- setup ----
   void loadPalette() {

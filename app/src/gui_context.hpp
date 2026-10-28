@@ -115,6 +115,14 @@ struct CharInput {
   virtual bool onChar(uint32_t ch, unsigned mods) = 0;
 };
 
+// Optional interface of panels that own a selection (piano roll notes, arrange clips): Edit menu
+// commands and their shortcuts go to the focused panel first. cmd is one of
+// "Cut" "Copy" "Paste" "Delete" "Duplicate" "SelectAll" "SelectNone" "Quantize". Return true if handled.
+struct EditTarget {
+  virtual ~EditTarget() = default;
+  virtual bool editCommand(std::string_view cmd) = 0;
+};
+
 class GuiContext {
  public:
   virtual ~GuiContext() = default;
@@ -151,6 +159,8 @@ class GuiContext {
   // A file dragged out of the browser: the arrange view asks for it on mouse up.
   virtual std::string draggedFile() const = 0;
   virtual void setDraggedFile(const std::string& path) = 0;
+  // Offers an Edit command to the focused panel (EditTarget), walking up from the focused widget.
+  virtual bool editFocused(std::string_view cmd) = 0;
   // A named widget of the main window ("arrange", "mixer", ...), nullptr if absent.
   virtual Widget* findWidget(std::string_view name) = 0;
 
