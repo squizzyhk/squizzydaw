@@ -171,7 +171,8 @@ class EngineCore final : public sq::Object<EngineCore, IAudioCallback> {
   int64_t capLast_ = INT64_MIN;
   bool capWrapped_ = false;
   uint64_t transportPass_ = 0;  // bumped on every loop wrap / locate (RT thread only)
-  uint64_t capPass_ = 0;
+  uint64_t loopWraps_ = 0;  // loop wraps only (a subset of transportPass_)
+  uint64_t capPass_ = 0, capWraps_ = 0;
   double sampleRate_ = 48000.0;
   double cpuAvg_ = 0.0;
 

@@ -302,10 +302,11 @@ void EngineCore::captureLive(const LiveMidiEvent& e) noexcept {
   const int64_t len = loopEnd_ - loopStart_;
   const bool loopOn = looping_ && len > 0;
   int64_t f = pos_ - static_cast<int64_t>(outLatency_.load(std::memory_order_relaxed));
-  uint64_t pass = transportPass_;
+  uint64_t pass = transportPass_, wraps = loopWraps_;
   if (loopOn && capWrapped_ && f < loopStart_ && pos_ >= loopStart_ && pos_ < loopEnd_) {
     f += len;  // heard before the wrap
     --pass;
+    --wraps;
   }
   auto push = [&](int64_t frame, uint8_t b0, uint8_t b1, uint8_t b2) {
     CapturedMidi cm{frame, {b0, b1, b2}, 3};
@@ -318,15 +319,25 @@ void EngineCore::captureLive(const LiveMidiEvent& e) noexcept {
     // start again at the new position.
     const int64_t closeAt = (loopOn && capLast_ >= loopStart_ && capLast_ < loopEnd_) ? loopEnd_ : capLast_;
     const int64_t reopenAt = (loopOn && f >= loopStart_ && f < loopEnd_) ? loopStart_ : f;
+    // Passes the note was held through completely (several wraps without a live event, no locate)
+    // become whole-loop notes; bounded so a note held for a long time cannot flood the RT thread.
+    uint64_t whole = 0;
+    if (loopOn && pass - capPass_ == wraps - capWraps_ && wraps - capWraps_ > 1) whole = std::min<uint64_t>(wraps - capWraps_ - 1, 16);
     for (uint32_t ch = 0; ch < 16; ++ch)
       for (uint32_t k = 0; k < 128; ++k)
-        if (capVel_[ch][k]) {
-          push(closeAt, static_cast<uint8_t>(0x80u | ch), static_cast<uint8_t>(k), 0);
-          push(reopenAt, static_cast<uint8_t>(0x90u | ch), static_cast<uint8_t>(k), capVel_[ch][k]);
+        if (const uint8_t vel = capVel_[ch][k]) {
+          const auto kb = static_cast<uint8_t>(k);
+          push(closeAt, static_cast<uint8_t>(0x80u | ch), kb, 0);
+          for (uint64_t w = 0; w < whole; ++w) {
+            push(loopStart_, static_cast<uint8_t>(0x90u | ch), kb, vel);
+            push(loopEnd_, static_cast<uint8_t>(0x80u | ch), kb, 0);
+          }
+          push(reopenAt, static_cast<uint8_t>(0x90u | ch), kb, vel);
         }
   }
   capLast_ = f;
   capPass_ = pass;
+  capWraps_ = wraps;
   const uint8_t st = e.bytes[0] & 0xF0u, ch = e.bytes[0] & 0x0Fu, key = e.bytes[1] & 0x7Fu;
   if (st == 0x90 && e.bytes[2] > 0) capVel_[ch][key] = e.bytes[2];
   else if (st == 0x80 || st == 0x90) capVel_[ch][key] = 0;
@@ -514,6 +525,7 @@ void EngineCore::process(const sq_audio_io* io) {
       if (loopActive && pos_ >= loopEnd_) {
         pos_ = loopStart_;
         ++transportPass_;
+        ++loopWraps_;
         if (recording_) capWrapped_ = true;
       }
     }

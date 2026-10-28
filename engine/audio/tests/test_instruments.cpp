@@ -909,6 +909,43 @@ SQ_TEST("instruments: loop recording closes a note held across the loop wrap at 
   NullDriver::defaults()[1].blockFrames = 256;
 }
 
+SQ_TEST("instruments: a note held through several loop wraps records every pass (whole passes in between)") {
+  sq::app::ClassRegistry reg;
+  registerNullDriver(&reg);
+  sq::Ptr<fakes::MDoc> doc = sq::Ptr<fakes::MDoc>::adopt(new fakes::MDoc());
+  auto keys = addTrack(*doc, SQ_TRACK_INSTRUMENT, 1, "Keys");
+  keys->info.flags |= SQ_TRACK_ARMED;
+  NullDriver::defaults()[1].blockFrames = 240;
+  sq::app::Settings settings;
+  settings.setString("Media.Folder", "mem://media");
+  sq::Ptr<AudioEngine> eng = sq::Ptr<AudioEngine>::adopt(new AudioEngine(&reg, &settings));
+  REQUIRE_OK(eng->setDocument(doc.get()));
+  REQUIRE_OK(eng->openDevice(&kNullDriverClassId, "offline", nullptr));
+  REQUIRE_OK(eng->setLoop(4.0, 5.0, SQ_TRUE));
+  REQUIRE_OK(eng->locate(4.0));
+  REQUIRE_OK(eng->play());
+  REQUIRE_OK(eng->record(SQ_TRUE));
+  dev(*eng)->pump(80);  // 0.8 ppq into the loop
+  const uint8_t on[3] = {0x90, 64, 80}, off[3] = {0x80, 64, 0};
+  eng->pushLiveMidi(on, 3);
+  dev(*eng)->pump(150);  // wraps twice (no live event in between), then ~0.3 ppq into pass 3
+  eng->pushLiveMidi(off, 3);
+  dev(*eng)->pump(10);
+  REQUIRE_OK(eng->record(SQ_FALSE));
+  auto& lg = doc->editor->log;
+  REQUIRE(lg.size() >= 3);
+  REQUIRE(lg[2].action == "events");
+  REQUIRE_EQ(lg[2].events.size(), size_t(3));  // pass 1 tail, the whole pass 2, pass 3 head
+  CHECK(std::fabs(lg[2].events[0].position - 0.79) < 0.02);
+  CHECK(std::fabs(lg[2].events[0].length - 0.21) < 0.02);
+  CHECK(std::fabs(lg[2].events[1].position - 0.0) < 0.02);
+  CHECK(std::fabs(lg[2].events[1].length - 1.0) < 0.02);
+  CHECK(std::fabs(lg[2].events[2].position - 0.0) < 0.02);
+  CHECK(std::fabs(lg[2].events[2].length - 0.29) < 0.02);
+  eng->closeDevice();
+  NullDriver::defaults()[1].blockFrames = 256;
+}
+
 SQ_TEST("instruments: recorded MIDI is placed where the player heard the transport (output latency)") {
   sq::app::ClassRegistry reg;
   registerNullDriver(&reg);
