@@ -39,6 +39,58 @@ jobs:
         shell: pwsh
         run: ./build.ps1 -Preset ${{ matrix.preset }} -BuildDir build/ci -CMakeArgs "-DSQ_WARNINGS_AS_ERRORS=ON" -ExcludeLabel gui -KeepGoing
 
+      - name: Package (Windows, self-contained app folder + VC++ runtime)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = 'build/ci/bin'
+          $pkg = 'package/SquizzyStudio'
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item "$bin/SquizzyStudio.exe", "$bin/sq-pluginscan.exe", "$bin/THIRD_PARTY_NOTICES.txt" $pkg
+          Get-ChildItem "$bin/*.dll" | Copy-Item -Destination $pkg
+          foreach ($d in 'services', 'fonts', 'themes', 'scripts') {
+            if (Test-Path "$bin/$d") { Copy-Item -Recurse "$bin/$d" "$pkg/$d" }
+          }
+          Get-ChildItem "$pkg/services" -Filter *.pdb -ErrorAction SilentlyContinue | Remove-Item
+          # App-local VC++ runtime so the folder runs on a clean Windows 11 install.
+          $vs = & "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath
+          $crt = Get-ChildItem "$vs/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT" -Directory | Sort-Object FullName | Select-Object -Last 1
+          Get-ChildItem "$($crt.FullName)/*.dll" | Copy-Item -Destination $pkg
+          Copy-Item README.md $pkg
+          Get-ChildItem -Recurse $pkg | Measure-Object -Property Length -Sum | ForEach-Object { "package: $($_.Count) files, $([math]::Round($_.Sum / 1MB, 1)) MB" }
+
+      - name: Run packaged app (Windows, headless GUI render + command run)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        working-directory: package/SquizzyStudio
+        run: |
+          ./SquizzyStudio.exe --version
+          ./SquizzyStudio.exe --audio-driver none --run File.New --run "Track.AddDrums name=Drums" --run "Clip.CreateMidi start=0 length=4" --run "Clip.SetNotes notes=0,0.5,36,110/1,0.5,38,100" --run "Track.AddInstrument name=Keys" --run "Track.AddInsert spec=builtin|reverb|" --run "File.ExportAudio path=../windows-mixdown.wav" --run "Transport.Wait ms=2000" --screenshot ../windows-screenshot.png --size 1600x1000
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path ../windows-screenshot.png)) { Write-Error 'no screenshot'; exit 1 }
+          if ((Get-Item ../windows-mixdown.wav).Length -lt 10000) { Write-Error 'mixdown missing or empty'; exit 1 }
+
+      - name: Real window smoke test (Windows, Win32 window for 3 s)
+        if: always() && runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        working-directory: package/SquizzyStudio
+        run: |
+          $p = Start-Process ./SquizzyStudio.exe -ArgumentList '--quit-after','3000','--audio-driver','null','--settings','../window-smoke-settings.xml' -PassThru -Wait
+          "window smoke exit code: $($p.ExitCode)"
+          exit $p.ExitCode
+
+      - name: Upload Windows package
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SquizzyStudio-windows-x64
+          path: |
+            package/SquizzyStudio/
+            package/windows-screenshot.png
+            package/windows-mixdown.wav
+          if-no-files-found: error
+
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ninja-build libx11-dev
