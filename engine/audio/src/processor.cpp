@@ -21,6 +21,7 @@ Unscope::~Unscope() { t_inRt = prev_; }
 // ---- laws ----
 float dbToGain(double db) noexcept {
   if (db <= -144.0) return 0.0f;
+  if (db > 24.0) db = 24.0;  // +24 dB ceiling for every gain law (faders, sends, automation)
   return static_cast<float>(std::pow(10.0, db / 20.0));
 }
 

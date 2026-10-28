@@ -16,6 +16,7 @@
 // MAIN THREAD ONLY.
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -62,6 +63,12 @@ class UndoKeeper {
   void pushRedo(Transaction&& t) { redo_.push_back(std::move(t)); }
   uint64_t topSerial() const { return undo_.empty() ? 0 : undo_.back().serial; }
   void clear() { undo_.clear(); redo_.clear(); }
+  // Every recorded step (undo and redo), for history-wide patches (DocumentImpl untracked edits).
+  template <class F>
+  void forEachStep(F&& f) {
+    for (Transaction& t : undo_) f(t);
+    for (Transaction& t : redo_) f(t);
+  }
 
  private:
   void trim();
@@ -154,6 +161,19 @@ class DocumentImpl final : public Object<DocumentImpl, IDocument, IEditor, ISubj
   void setJournal(const std::string& key, const std::string& value);
   void removeJournal(const std::string& key);
   std::string journal(const std::string& key) const;
+
+  // ---- untracked edits ----
+  // State that is saved with the document but is not an edit (transport loop, media relinks): the
+  // store changes WITHOUT an undo step, and every snapshot in the undo/redo history is patched the
+  // same way, so undo/redo never brings an old value back. Refused (SQ_E_BUSY) inside a
+  // transaction.
+  // Sets (type != SQ_VALUE_NONE) or removes a document user property ("user.*" key). Marks the
+  // document modified when the value changed; SQ_S_FALSE when it was already equal.
+  sq_result setUntrackedDocProperty(const std::string& key, const Value& value);
+  // Rewrites audio clip sources (exact path match old -> new), e.g. after media was copied next to
+  // the song on save. Emits "document.changed" (reason "relink") for the clips; does not mark the
+  // document modified (the caller saves). Returns the number of clips changed in the store.
+  size_t relinkClipSources(const std::map<std::string, std::string>& oldToNew);
 
   const std::string& path() const { return path_; }
   void setPath(const std::string& p) { path_ = p; }

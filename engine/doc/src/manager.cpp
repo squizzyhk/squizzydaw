@@ -10,6 +10,15 @@
 
 namespace sq::edoc {
 
+namespace {
+// Folder of a document file (media paths are stored relative to it).
+std::string folderOf(const std::string& path) {
+  const size_t s = path.find_last_of("/\\");
+  if (s == std::string::npos) return ".";
+  return s == 0 ? path.substr(0, 1) : path.substr(0, s);
+}
+}  // namespace
+
 DocumentManagerImpl::~DocumentManagerImpl() {
   for (auto& d : docs_) d->markClosed();
 }
@@ -60,7 +69,9 @@ sq_result SQ_CALL DocumentManagerImpl::openDocument(const char* path, IDocument*
     if (!bytes) return sq_fs_exists(path) ? SQ_E_IO : SQ_E_NOTFOUND;
     Store s;
     std::string err;
-    if (sq_result r = readArchive(*bytes, s, nullptr, &err); r != SQ_OK) {
+    ArchiveMeta meta;
+    meta.mediaBase = folderOf(path);
+    if (sq_result r = readArchive(*bytes, s, &meta, &err); r != SQ_OK) {
       sq_log_printf(SQ_LOG_WARN, "doc", "cannot open '%s': %s", path, err.c_str());
       return r;
     }
@@ -87,7 +98,9 @@ sq_result SQ_CALL DocumentManagerImpl::saveDocument(IDocument* doc, const char* 
   const std::string target = (path && *path) ? std::string(path) : d->path();
   if (target.empty()) return SQ_E_INVALIDARG;
   try {
-    const std::string bytes = writeArchive(d->store());
+    ArchiveMeta meta;
+    meta.mediaBase = folderOf(target);
+    const std::string bytes = writeArchive(d->store(), meta);
     if (bytes.empty()) return SQ_E_FAIL;
     if (sq_result r = safeWriteFile(target, bytes); r != SQ_OK) return r;
     d->setPath(target);

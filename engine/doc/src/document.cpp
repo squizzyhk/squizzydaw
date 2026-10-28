@@ -298,6 +298,62 @@ void DocumentImpl::notify(const char* topic, IAttributes* args) {
   for (auto& o : obs) o->onNotify(static_cast<IDocument*>(this), topic, args);
 }
 
+sq_result DocumentImpl::setUntrackedDocProperty(const std::string& key, const Value& value) {
+  if (key.size() <= 5 || key.compare(0, 5, "user.") != 0) return SQ_E_INVALIDARG;
+  if (closed_) return SQ_E_CLOSED;
+  if (!levels_.empty()) return SQ_E_BUSY;
+  const bool remove = value.type == SQ_VALUE_NONE;
+  auto patch = [&](PropertyBag& bag) {
+    if (remove) bag.erase(key);
+    else bag[key] = value;
+  };
+  auto it = store_.props.user.find(key);
+  const bool same = remove ? it == store_.props.user.end() : (it != store_.props.user.end() && it->second == value);
+  if (same) return SQ_S_FALSE;
+  patch(store_.props.user);
+  undo_.forEachStep([&](Transaction& t) {
+    for (Change& c : t.changes)
+      if (auto* d = std::get_if<Delta<DocProps>>(&c.data)) {
+        if (d->before) patch(d->before->user);
+        if (d->after) patch(d->after->user);
+      }
+  });
+  ++editSerial_;  // autosave picks it up
+  markModified();
+  return SQ_OK;
+}
+
+size_t DocumentImpl::relinkClipSources(const std::map<std::string, std::string>& oldToNew) {
+  if (oldToNew.empty() || closed_ || !levels_.empty()) return 0;
+  auto patch = [&](ClipRec& c) {
+    if (c.kind != SQ_CLIP_AUDIO) return false;
+    auto it = oldToNew.find(c.source);
+    if (it == oldToNew.end() || it->second == c.source) return false;
+    c.source = it->second;
+    return true;
+  };
+  Transaction note;
+  note.description = "Relink Media";
+  for (auto& [id, c] : store_.clips)
+    if (patch(c)) {
+      Change ch;
+      ch.kind = kChangeClip;
+      ch.id = id;
+      note.changes.push_back(std::move(ch));
+    }
+  undo_.forEachStep([&](Transaction& t) {
+    for (Change& c : t.changes)
+      if (auto* d = std::get_if<Delta<ClipRec>>(&c.data)) {
+        if (d->before) patch(*d->before);
+        if (d->after) patch(*d->after);
+      }
+  });
+  if (note.changes.empty()) return 0;
+  ++editSerial_;
+  emitChanged(note, "relink");
+  return note.changes.size();
+}
+
 void DocumentImpl::emitModifiedIfToggled(bool wasModified) {
   const bool now = modified();
   if (now == wasModified) return;

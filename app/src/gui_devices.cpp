@@ -418,10 +418,13 @@ class DeviceRack final : public Widget {
     return true;
   }
 
-  void writeInserts(const std::vector<std::string>& lines) {
-    std::string all;
-    for (const auto& l : lines) all += l + "\n";
-    ctx_.setPropertyString(track_, "user.inserts", all);
+  // Insert-list edits go through the Track.* commands so automation lanes follow their slots.
+  void insertCmd(const char* cmd, const std::function<void(IAttributes*)>& args) {
+    auto a = sq::makeAttributes();
+    a->setGuid("track", &track_);
+    args(a.get());
+    if (SQ_FAILED(ctx_.shell().execute(cmd, a.get()))) ctx_.setStatus(std::string(cmd) + " failed");
+    ctx_.invalidate();
   }
   std::vector<std::string> insertLines() const {
     std::vector<std::string> v;
@@ -440,15 +443,16 @@ class DeviceRack final : public Widget {
       }
       writeCard(cd, false);
     } else if (part == kRemove && !cd.instrument) {
-      auto v = insertLines();
-      v.erase(v.begin() + cd.slot);
-      writeInserts(v);
+      const int slot = cd.slot;
+      insertCmd("Track.RemoveInsert", [&](IAttributes* a) { a->setInt("slot", slot); });
     } else if ((part == kLeft || part == kRight) && !cd.instrument) {
-      auto v = insertLines();
-      const int to = cd.slot + (part == kLeft ? -1 : 1);
-      if (to < 0 || to >= static_cast<int>(v.size())) return;
-      std::swap(v[static_cast<size_t>(cd.slot)], v[static_cast<size_t>(to)]);
-      writeInserts(v);
+      const int slot = cd.slot;
+      const int to = slot + (part == kLeft ? -1 : 1);
+      if (to < 0 || to >= static_cast<int>(insertLines().size())) return;
+      insertCmd("Track.MoveInsert", [&](IAttributes* a) {
+        a->setInt("slot", slot);
+        a->setInt("to", to);
+      });
     } else if (part == kMenu) {
       cardMenu(ci, at);
     }
@@ -474,9 +478,10 @@ class DeviceRack final : public Widget {
       MenuItem dup;
       dup.label = "Duplicate";
       dup.action = [this, cd] {
-        auto v = insertLines();
-        v.insert(v.begin() + cd.slot + 1, cd.line);
-        writeInserts(v);
+        insertCmd("Track.AddInsert", [&](IAttributes* a) {
+          a->setString("spec", cd.line.c_str());
+          a->setInt("index", cd.slot + 1);
+        });
       };
       m.push_back(dup);
     }

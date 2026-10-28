@@ -2,6 +2,7 @@
 #include "sq/engine/doc/archive.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -166,7 +167,7 @@ std::string partTempo(const Store& s) {
   return xmlWrite(d);
 }
 
-void writeClip(XmlNode parent, const ClipRec& c) {
+void writeClip(XmlNode parent, const ClipRec& c, const std::string& mediaBase) {
   XmlNode n = parent.append("Clip");
   n.setAttr("id", guidStr(c.id));
   n.setAttr("kind", fmtInt(c.kind));
@@ -179,7 +180,7 @@ void writeClip(XmlNode parent, const ClipRec& c) {
   n.setAttr("fadeOut", fmtDouble(c.fadeOut));
   n.setAttr("flags", fmtInt(c.flags));
   n.setAttr("color", fmtInt(c.color));
-  n.setAttr("source", c.source);
+  n.setAttr("source", (mediaBase.empty() || c.kind != SQ_CLIP_AUDIO) ? c.source : relativeMediaPath(c.source, mediaBase));
   for (const EventRec& e : c.events) {
     XmlNode ev = n.append("Event");
     ev.setAttr("pos", fmtDouble(e.pos));
@@ -190,7 +191,7 @@ void writeClip(XmlNode parent, const ClipRec& c) {
   writeUser(n, c.user);
 }
 
-std::string partTracks(const Store& s) {
+std::string partTracks(const Store& s, const std::string& mediaBase) {
   auto d = xmlCreate("Tracks");
   XmlNode r = xmlRoot(d);
   for (const sq_guid& id : s.trackOrder) {
@@ -219,7 +220,7 @@ std::string partTracks(const Store& s) {
       }
     }
     writeUser(n, t.user);
-    for (const sq_guid& cid : s.clipsOf(id)) writeClip(n, s.clips.at(cid));
+    for (const sq_guid& cid : s.clipsOf(id)) writeClip(n, s.clips.at(cid), mediaBase);
   }
   return xmlWrite(d);
 }
@@ -295,22 +296,83 @@ bool normalizeZipTimes(std::string& z) {
 
 }  // namespace
 
-std::vector<std::pair<std::string, std::string>> serializeParts(const Store& s) {
+namespace {
+std::vector<std::pair<std::string, std::string>> serializePartsWith(const Store& s, const std::string& mediaBase) {
   const std::string k = kindName(s.props.kind);
   std::vector<std::pair<std::string, std::string>> parts;
   parts.emplace_back("document.xml", partDocument(s));
   parts.emplace_back(k + "/tempo.xml", partTempo(s));
-  parts.emplace_back(k + "/tracks.xml", partTracks(s));
+  parts.emplace_back(k + "/tracks.xml", partTracks(s, mediaBase));
   parts.emplace_back(k + "/markers.xml", partMarkers(s));
   parts.emplace_back("uistate.xml", partUi(s));
   for (const auto& [name, data] : s.foreignParts) parts.emplace_back(name, data);
   return parts;
 }
 
+// '/' separators, no trailing separator (except a bare root).
+std::string slashed(std::string p) {
+  for (char& ch : p)
+    if (ch == '\\') ch = '/';
+  while (p.size() > 1 && p.back() == '/' && !(p.size() == 3 && p[1] == ':')) p.pop_back();
+  return p;
+}
+std::string normalizedAbsolute(const std::string& p) {
+  sq::Buffer b;
+  return sq_fs_absolute(p.c_str(), b.out()) == SQ_OK ? slashed(b.str()) : slashed(p);
+}
+bool samePathChar(char a, char b) {
+#if defined(_WIN32)
+  return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));  // NTFS: case-insensitive
+#else
+  return a == b;
+#endif
+}
+std::string fileNameOf(const std::string& p) {
+  const size_t s = p.find_last_of("/\\");
+  return s == std::string::npos ? p : p.substr(s + 1);
+}
+}  // namespace
+
+std::vector<std::pair<std::string, std::string>> serializeParts(const Store& s) { return serializePartsWith(s, {}); }
+
+bool isAbsoluteMediaPath(const std::string& p) {
+  if (p.empty()) return false;
+  if (p[0] == '/' || p[0] == '\\') return true;
+  return p.size() >= 2 && p[1] == ':' && std::isalpha(static_cast<unsigned char>(p[0]));
+}
+
+std::string relativeMediaPath(const std::string& source, const std::string& baseDir) {
+  if (baseDir.empty() || !isAbsoluteMediaPath(source) || source.find("://") != std::string::npos) return source;
+  const std::string base = normalizedAbsolute(baseDir), src = normalizedAbsolute(source);
+  if (base.empty() || src.size() <= base.size() + 1) return source;
+  for (size_t i = 0; i < base.size(); ++i)
+    if (!samePathChar(base[i], src[i])) return source;
+  const size_t cut = base.back() == '/' ? base.size() : base.size() + 1;  // "/" or "C:/" roots end in '/'
+  if (base.back() != '/' && src[base.size()] != '/') return source;  // "/a/song" vs "/a/songs/x"
+  std::string rel = src.substr(cut);
+  if (rel.empty() || rel == ".." || rel.rfind("../", 0) == 0 || rel.find("/../") != std::string::npos) return source;
+  return rel;
+}
+
+std::string resolveMediaPath(const std::string& stored, const std::string& baseDir) {
+  if (stored.empty() || baseDir.empty() || stored.find("://") != std::string::npos) return stored;
+  if (!isAbsoluteMediaPath(stored)) return normalizedAbsolute(sq::joinPath(baseDir, stored));
+  if (sq_fs_exists(stored.c_str())) return stored;
+  // Moved project: an absolute path that is gone, with the file next to the song (or in a media
+  // folder there) -> use that copy.
+  const std::string name = fileNameOf(slashed(stored));
+  if (name.empty()) return stored;
+  for (const char* sub : {"", "Media", "Audio"}) {
+    const std::string cand = *sub ? sq::joinPath(sq::joinPath(baseDir, sub), name) : sq::joinPath(baseDir, name);
+    if (sq_fs_is_file(cand.c_str())) return normalizedAbsolute(cand);
+  }
+  return stored;
+}
+
 std::string writeArchive(const Store& s, const ArchiveMeta& meta) {
   std::vector<std::pair<std::string, std::string>> parts;
   parts.emplace_back("metainfo.xml", partMeta(s, meta));
-  for (auto& p : serializeParts(s)) parts.push_back(std::move(p));
+  for (auto& p : serializePartsWith(s, meta.mediaBase)) parts.push_back(std::move(p));
 
   mz_zip_archive zip;
   std::memset(&zip, 0, sizeof zip);
@@ -458,10 +520,14 @@ sq_result readArchive(const std::string& bytes, Store& out, ArchiveMeta* meta, s
         t.pan < -1.0 || t.pan > 1.0 || (t.timebase != "musical" && t.timebase != "time"))
       return fail(SQ_E_PARSE, "bad track attributes");
     for (XmlNode an : tn.children("Automation")) {
-      auto& lane = t.automation[an.attr("param")];
+      const std::string param = an.attr("param");
+      auto& lane = t.automation[param];
+      // Gain lanes (dB) are clamped to the fader range so a hand-edited file cannot blow up the mix.
+      const bool gainDb = param == "volume" || param.rfind("send.", 0) == 0;
       for (XmlNode pn : an.children("Point")) {
         AutoPoint ap{parseDouble(pn.attr("pos")), parseDouble(pn.attr("value"))};
         if (!fin0(ap.pos) || !fin(ap.value)) return fail(SQ_E_PARSE, "bad automation point");
+        if (gainDb) ap.value = std::clamp(ap.value, -144.0, 24.0);
         lane.push_back(ap);
       }
       std::stable_sort(lane.begin(), lane.end(), [](const AutoPoint& a, const AutoPoint& b) { return a.pos < b.pos; });
@@ -483,6 +549,7 @@ sq_result readArchive(const std::string& bytes, Store& out, ArchiveMeta* meta, s
       c.flags = parseU32(cn.attr("flags"));
       c.color = parseU32(cn.attr("color"));
       c.source = cn.attr("source");
+      if (meta && !meta->mediaBase.empty() && c.kind == SQ_CLIP_AUDIO) c.source = resolveMediaPath(c.source, meta->mediaBase);
       if ((c.kind != SQ_CLIP_AUDIO && c.kind != SQ_CLIP_MIDI) || !fin0(c.start) || !fin(c.length) || c.length <= 0.0 ||
           !fin0(c.sourceOffset) || !fin(c.gainDb) || !fin0(c.fadeIn) || !fin0(c.fadeOut))
         return fail(SQ_E_PARSE, "bad clip attributes");

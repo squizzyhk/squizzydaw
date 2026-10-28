@@ -656,12 +656,7 @@ class Mixer final : public Widget {
         a->setGuid("track", &id);
         a->setGuid("bus", &bus);
         a->setDouble("level", -6.0);
-        if (SQ_FAILED(ctx_.shell().execute("Track.AddSend", a.get()))) {
-          std::string cur = ctx_.trackString(id, "user.sends");
-          if (!cur.empty() && cur.back() != '\n') cur += '\n';
-          cur += sq::toString(bus) + " -6\n";
-          ctx_.setPropertyString(id, "user.sends", cur);
-        }
+        if (SQ_FAILED(ctx_.shell().execute("Track.AddSend", a.get()))) ctx_.setStatus("Could not add the send");
         ctx_.invalidate();
       };
       m.push_back(it);

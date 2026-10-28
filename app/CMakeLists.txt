@@ -241,6 +241,52 @@ if(SQ_BUILD_TESTS)
       Track.Info "ok - 'Keys' .* clips=1 events=1 "
       Edit.Undo "ok"
       Track.Info "ok - 'Keys' .* clips=0 events=0 ")
+    # Song persistence: export renders the release / reverb tail by default (tail=0 = hard cut),
+    # the loop range is saved in the song and restored on open, missing media is reported on
+    # open and on export.
+    set(_persist "${CMAKE_BINARY_DIR}/test-output/persist")
+    file(MAKE_DIRECTORY "${_persist}/proj/Media")
+    sq_app_cli_test(app_run_song_persistence none
+      File.New "ok"
+      "Track.AddInstrument name=Keys" "ok"
+      "Clip.CreateMidi length=4" "ok"
+      "Clip.SetNotes notes=3,1,48,110" "ok - 1 note"
+      "Track.AddInsert spec=builtin|reverb|" "ok"
+      "File.ExportAudio path=${_persist}/proj/Media/tail.wav" "ok - exported .*\\(tail [0-9]*\\.?[0-9]*[1-9][0-9]* s, auto\\)"
+      "File.ExportAudio path=${_persist}/cut.wav tail=0" "ok - exported .*\\(tail 0 s\\)"
+      "Transport.SetLoop start=4 end=12" "ok"
+      "Transport.Info" "ok - loop 4\\.\\.12 on \\(song\\)"
+      "Track.AddAudio name=Vox" "ok"
+      "Clip.AddAudio path=${_persist}/proj/Media/tail.wav" "ok - audio clip"
+      "Clip.AddAudio path=${_persist}/proj/Media/never_recorded.wav start=8" "ok - audio clip .*\\(file missing\\)"
+      "File.Save path=${_persist}/proj/song.song" "ok - saved"
+      File.Close "ok"
+      File.New "ok"
+      "Transport.Info" "ok - loop 0\\.\\.0 off"
+      "File.Open path=${_persist}/proj/song.song" "ok - opened .* WARNING: 1 missing media file\\(s\\): never_recorded\\.wav"
+      "Transport.Info" "ok - loop 4\\.\\.12 on \\(song\\)"
+      Transport.ToggleLoop "ok"
+      "Transport.Info" "ok - loop 4\\.\\.12 off \\(song\\)"
+      "File.ExportAudio path=${_persist}/missing.wav" "ok - exported .* WARNING: 1 missing media file\\(s\\) rendered as silence: never_recorded\\.wav")
+    # Takes recorded / bounced into an untitled song live in the temp media folder: the first save
+    # copies them into "<song name> Media" next to the song (TMPDIR / TMP / TEMP point at a test
+    # folder so the temp media folder is known).
+    file(MAKE_DIRECTORY "${_persist}/tmp/SquizzyStudio/Media")
+    sq_app_cli_test(app_run_save_consolidates_media none
+      File.New "ok"
+      "Track.AddInstrument name=Keys" "ok"
+      "Clip.CreateMidi length=4" "ok"
+      "Clip.SetNotes notes=0,1,60,100" "ok"
+      "File.ExportAudio path=${_persist}/tmp/SquizzyStudio/Media/Audio_take_1.wav tail=0" "ok"
+      "Track.AddAudio name=Vox" "ok"
+      "Clip.AddAudio path=${_persist}/tmp/SquizzyStudio/Media/Audio_take_1.wav" "ok - audio clip"
+      "File.Save path=${_persist}/consolidate/Takes.song" "ok - saved \\(1 media file\\(s\\) copied to '.*/consolidate/Takes Media'\\)"
+      File.Save "ok - saved"
+      File.Close "ok"
+      "File.Open path=${_persist}/consolidate/Takes.song" "ok - opened")
+    set_tests_properties(app_run_save_consolidates_media PROPERTIES
+      ENVIRONMENT "TMPDIR=${_persist}/tmp;TMP=${_persist}/tmp;TEMP=${_persist}/tmp"
+      FAIL_REGULAR_EXPRESSION "missing media|could not copy|copied to .*copied to")
   endif()
   if(_sq_app_themes)
     # The real EXE: embedded stock themes, theme switch, device listing, surfaces (no hardware).

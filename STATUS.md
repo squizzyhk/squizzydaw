@@ -1,5 +1,19 @@
 # Squizzy Studio - status matrix
 
+## Third pass: complete DAW (2026-10-28) - read this first
+
+This pass turned the service platform into a usable DAW. The tables further down are from the second pass; where they disagree with this section, this section wins.
+
+- **GUI:** software renderer (`ui/src/soft_renderer.cpp`, stb_truetype + Inter) presented by Win32 (`SetDIBitsToDevice`, per-monitor-v2 DPI, `WM_DPICHANGED`) and X11. Panels (`app/src/gui_*.cpp`): menu bar, transport, browser + device browser, arrange (clips, automation lanes, loop/locators), MIDI and audio editors, mixer (inserts, sends, buses, master), device chain. Overlays: menus with submenus, prompts, confirmations, file/folder choosers. Headless `--screenshot` / `--ui-script`; CTests `app_gui_smoke` and `app_gui_smoke_hidpi`. Two QA rounds (52 GUI defects, 31 engine findings) fixed.
+- **Engine:** 18 built-in devices (instruments, drums, effects) via `builtin|<id>|<path>|i=v` specs; sample-rate conversion of media (`engine/audio/src/resample.cpp`); master mute/pan, bus solo, tempo-synced delay; automation of volume, pan, sends and insert parameters; loop recording (new pass detection by counter, held notes split at the wrap).
+- **Persistence:** relative media paths with a missing-media warning, recorded takes copied out of temp into `<song> Media/` on save, loop range + on/off saved, gain automation clamped to -144..+24 dB on load, default export tail rendered until the output falls below -90 dBFS (max 10 s). DAWproject export now carries buses, sends, routing, devices and automation.
+- **Commands:** ~40 new (`Track.*` inserts/sends/instruments, `Clip.*`, `Automation.*`, `Song.*`, `Midi.*`, `Transport.Locate/SetLoop/Wait`); the GUI edits inserts and sends through them so automation lanes follow their slots.
+- **Linux:** ALSA + PulseAudio audio, ALSA sequencer MIDI, X11 window.
+- **CI:** Windows, Linux, macOS build + full ctest. The Windows job packages `SquizzyStudio-windows-x64`, runs it headless (screenshot + non-silent mixdown export) and opens the real window.
+- **Still open:** hands-on testing on a physical Windows 11 machine (WASAPI devices, 125-200% scaling, monitor moves); macOS native window/audio; the gaps listed under "Known gaps" that this pass did not touch (ASIO/Link SDKs, plugin editors, ARA, video tracks).
+
+## Second pass
+
 Snapshot after the second integration pass (wave 2: ASIO seam, VST3, themes/skin compiler/UI Automation, MIDI control surfaces, optional M8 services, sq-pack + Ogg write), each unit adversarially verified before integration (2026-10-28). Legend: **done** = implemented and covered by tests that ran green; **partial** = works with documented gaps; **seam** = interface/hook exists, the real implementation needs something not in the tree (an SDK or a user-supplied library); **not done**.
 
 Verified platform: **Windows 11 x64, MSVC 2022, Debug, `/W4 /WX`** (unfiltered build, full `ctest`: see the end). macOS and Linux are **unverified**: the tree has `#ifdef` seams and null backends, but nothing was built or run there.

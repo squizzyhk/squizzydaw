@@ -175,7 +175,7 @@ std::vector<RawSend> parseSends(const std::string& text) {
       const char* p = line.c_str() + sp + 1;
       char* end = nullptr;
       const double v = std::strtod(p, &end);
-      if (end && end != p && std::isfinite(v)) s.db = v;
+      if (end && end != p && std::isfinite(v)) s.db = std::clamp(v, -144.0, 24.0);
       s.pre = line.find(" pre", sp) != std::string::npos;
     }
     out.push_back(s);  // unparsable lines keep their index (send.<n> counts lines)

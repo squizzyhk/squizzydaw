@@ -365,3 +365,38 @@ SQ_TEST("verify: record stop on a stalled device returns the takes, session free
   eng->idle();
   eng->closeDevice();
 }
+
+namespace {
+class LoopSpy final : public sq::Object<LoopSpy, sq::IObserver> {
+ public:
+  int count = 0;
+  double start = -1, end = -1;
+  bool enabled = false;
+  void SQ_CALL onNotify(sq::IUnknown*, const char* topic, sq::IAttributes* args) override {
+    if (!topic || std::strcmp(topic, "transport.loop") != 0 || !args) return;
+    ++count;
+    start = args->getDouble("start", -1);
+    end = args->getDouble("end", -1);
+    enabled = args->getBool("enabled", SQ_FALSE) != 0;
+  }
+};
+}  // namespace
+
+SQ_TEST("verify: setLoop announces the requested loop at once (the song saves it)") {
+  sq::app::ClassRegistry reg;
+  sq::Ptr<AudioEngine> eng = sq::Ptr<AudioEngine>::adopt(new AudioEngine(&reg, nullptr));
+  REQUIRE_OK(eng->setGraphDesc(rampScene(rampMedia(1000), 0)));
+  auto spy = sq::Ptr<LoopSpy>::adopt(new LoopSpy());
+  REQUIRE_OK(eng->addObserver(spy.get()));
+  REQUIRE_OK(eng->setLoop(4.0, 12.0, SQ_TRUE));
+  CHECK_EQ(spy->count, 1);
+  CHECK_EQ(spy->start, 4.0);
+  CHECK_EQ(spy->end, 12.0);
+  CHECK(spy->enabled);
+  REQUIRE_OK(eng->setLoop(4.0, 12.0, SQ_FALSE));
+  CHECK_EQ(spy->count, 2);
+  CHECK(!spy->enabled);
+  CHECK_EQ(eng->setLoop(2.0, 1.0, SQ_TRUE), SQ_E_INVALIDARG);  // refused: not announced
+  CHECK_EQ(spy->count, 2);
+  REQUIRE_OK(eng->removeObserver(spy.get()));
+}

@@ -208,6 +208,7 @@ struct Shell::Impl {
   void bindEngine() {
 #if SQ_SHELL_ENGINE
     if (audio) audio->setDocument(active().get());
+    applyLoopFromDocument();
 #endif
   }
 
@@ -232,7 +233,7 @@ struct Shell::Impl {
       }
       return setMessage(SQ_OK, "new song");
     });
-    add("File", "Open", "Open...", [this](IAttributes* a, IAttributes*) {
+    add("File", "Open", "Open...", [this](IAttributes* a, IAttributes* res) {
       std::string path = str(a, "path");
       if (path.empty() || !docs) return SQ_E_INVALIDARG;
       sq::Ptr<IDocument> d;
@@ -240,14 +241,28 @@ struct Shell::Impl {
       if (SQ_FAILED(r)) return setMessage(r, "cannot open " + path + ": " + sq_result_string(r));
       docs->setActiveDocument(d.get());
       bindEngine();
-      return setMessage(SQ_OK, "opened " + path);
+      const std::vector<std::string> missing = missingMedia();
+      if (res) res->setInt("missing", static_cast<int64_t>(missing.size()));
+      if (!missing.empty()) sq_log_printf(SQ_LOG_WARN, kTag, "%s: %zu media file(s) missing", path.c_str(), missing.size());
+      return setMessage(SQ_OK, "opened " + path + missingNote(missing, ""));
     });
-    add("File", "Save", "Save", [this](IAttributes* a, IAttributes*) {
+    add("File", "Save", "Save", [this](IAttributes* a, IAttributes* res) {
       auto d = active();
       if (!d || !docs) return SQ_E_NOTFOUND;
       std::string path = str(a, "path");
-      sq_result r = docs->saveDocument(d.get(), path.empty() ? nullptr : path.c_str());
-      return setMessage(r, SQ_SUCCEEDED(r) ? "saved" : std::string("save failed: ") + sq_result_string(r));
+      if (path.empty()) {
+        char buf[4096];
+        uint32_t need = 0;
+        if (d->getPath(buf, sizeof buf, &need) == SQ_OK) path = buf;
+      }
+      if (path.empty()) return setMessage(SQ_E_INVALIDARG, "save failed: no path (path=<file>)");
+      std::string note;
+      const size_t moved = consolidateMedia(path, &note);
+      if (res) res->setInt("media_copied", static_cast<int64_t>(moved));
+      sq_result r = docs->saveDocument(d.get(), path.c_str());
+      std::string msg = SQ_SUCCEEDED(r) ? std::string("saved") : std::string("save failed: ") + sq_result_string(r);
+      if (moved) msg += " (" + std::to_string(moved) + " media file(s) copied to '" + mediaFolderFor(path) + "')";
+      return setMessage(r, msg + note);
     }, haveDoc);
     add("File", "Close", "Close", [this](IAttributes*, IAttributes*) {
       auto d = active();
@@ -268,7 +283,7 @@ struct Shell::Impl {
       formats::dawproject::ExportReport rep;
       std::string err;
       sq_result r = formats::dawproject::exportProject(d.get(), path, &rep, &err);
-      return setMessage(r, SQ_SUCCEEDED(r) ? "exported " + std::to_string(rep.tracks) + " track(s) to " + path : err);
+      return setMessage(r, SQ_SUCCEEDED(r) ? "exported " + dawSummary(rep) + " to " + path : err);
     }, haveDoc);
     add("File", "ImportDawProject", "Import DAWproject...", [this](IAttributes* a, IAttributes* res) {
       std::string path = str(a, "path");
@@ -287,7 +302,7 @@ struct Shell::Impl {
       docs->setActiveDocument(d.get());
       bindEngine();
       if (res) res->setInt("tracks", rep.tracks);
-      return setMessage(SQ_OK, "imported " + path);
+      return setMessage(SQ_OK, "imported " + dawSummary(rep) + " from " + path);
     });
 #endif
     add("Transport", "Play", "Play", [this](IAttributes*, IAttributes*) { return audio ? audio->play() : SQ_E_UNSUPPORTED; });
@@ -317,8 +332,12 @@ struct Shell::Impl {
       sq_transport_state ts{};
       ts.struct_size = sizeof ts;
       audio->getTransportState(&ts);
-      double s = num(a, "start", ts.loop_start), e = num(a, "end", ts.loop_end > ts.loop_start ? ts.loop_end : s + 16);
-      return audio->setLoop(s, e, (ts.flags & SQ_TRANSPORT_LOOPING) ? SQ_FALSE : SQ_TRUE);
+      // The song's loop is the main-thread truth (the transport snapshot lags one audio block).
+      double ls = ts.loop_start, le = ts.loop_end;
+      bool on = (ts.flags & SQ_TRANSPORT_LOOPING) != 0;
+      readLoop(activeImpl(), &ls, &le, &on);
+      double s = num(a, "start", ls), e = num(a, "end", le > ls ? le : s + 16);
+      return audio->setLoop(s, e, on ? SQ_FALSE : SQ_TRUE);
     });
     add("Transport", "ToggleMetronome", "Metronome", [this](IAttributes*, IAttributes*) {
       if (!audio) return SQ_E_UNSUPPORTED;
@@ -343,7 +362,8 @@ struct Shell::Impl {
     });
     add("Track", "AddAudio", "Add Audio Track", [this](IAttributes* a, IAttributes* res) { return addTrackKind(a, res, SQ_TRACK_AUDIO, "Audio", {}); }, haveDoc);
     add("Track", "AddInstrument", "Add Instrument Track", [this](IAttributes* a, IAttributes* res) {
-      const std::string spec = str(a, "instrument", engine::audio::kDefaultInstrument);
+      std::string spec = str(a, "instrument", engine::audio::kDefaultInstrument);
+      if (spec.empty()) spec = engine::audio::kDefaultInstrument;  // instrument="" = the default
       if (!validInstrument(spec)) return setMessage(SQ_E_INVALIDARG, "malformed instrument spec (<format>|<id>|<path>[|i=v]...)");
       return addTrackKind(a, res, SQ_TRACK_INSTRUMENT, "Instrument", spec);
     }, haveDoc);
@@ -710,6 +730,144 @@ struct Shell::Impl {
   }
 
 #if SQ_SHELL_ENGINE
+#if SQ_SHELL_DAWPROJECT
+  static std::string dawSummary(const formats::dawproject::ExportReport& rep) {
+    size_t warnings = 0;
+    for (char ch : rep.warnings) warnings += ch == '\n' ? 1u : 0u;
+    if (!rep.warnings.empty()) sq_log_printf(SQ_LOG_WARN, kTag, "DAWproject:\n%s", rep.warnings.c_str());
+    return std::to_string(rep.tracks) + " track(s)" + (rep.master ? " + master" : "") + ", " + std::to_string(rep.buses) + " bus(es), " +
+           std::to_string(rep.devices) + " device(s), " + std::to_string(rep.sends) + " send(s), " + std::to_string(rep.automation) +
+           " automation lane(s), " + std::to_string(rep.clips) + " clip(s)" + (warnings ? " (" + std::to_string(warnings) + " warning(s), see log)" : "");
+  }
+#endif
+  // ---- song persistence: loop, media ------------------------------------------------------------
+  // The transport loop is saved in the song as document user properties (not undo steps).
+  static constexpr const char* kLoopStartKey = "user.loop.start";
+  static constexpr const char* kLoopEndKey = "user.loop.end";
+  static constexpr const char* kLoopEnabledKey = "user.loop.enabled";
+  bool applyingLoop = false;  // document -> transport in progress: do not write it back
+  sq::Ptr<IObserver> engineObserver;
+
+  static bool readLoop(const edoc::DocumentImpl* impl, double* start, double* end, bool* enabled) {
+    if (!impl) return false;
+    const edoc::PropertyBag& u = impl->store().props.user;
+    auto s = u.find(kLoopStartKey), e = u.find(kLoopEndKey), on = u.find(kLoopEnabledKey);
+    if (s == u.end() || e == u.end() || s->second.type != SQ_VALUE_DOUBLE || e->second.type != SQ_VALUE_DOUBLE) return false;
+    if (!std::isfinite(s->second.d) || !std::isfinite(e->second.d) || s->second.d < 0) return false;
+    *start = s->second.d;
+    *end = e->second.d;
+    *enabled = on != u.end() && on->second.type == SQ_VALUE_BOOL && on->second.i != 0 && e->second.d > s->second.d;
+    return true;
+  }
+  // Document -> transport (open, new, activation). A song without a saved loop has looping off.
+  void applyLoopFromDocument() {
+    if (!audio) return;
+    edoc::DocumentImpl* impl = activeImpl();
+    if (!impl) return;
+    double s = 0, e = 0;
+    bool on = false;
+    applyingLoop = true;
+    if (readLoop(impl, &s, &e, &on)) audio->setLoop(s, e, on ? SQ_TRUE : SQ_FALSE);
+    else audio->setLoop(0.0, 0.0, SQ_FALSE);
+    applyingLoop = false;
+  }
+  // Transport -> document: every loop change (commands, ruler drags, scripts) ends up in the song.
+  void onLoopChanged(IAttributes* args) {
+    if (applyingLoop || !args) return;
+    edoc::DocumentImpl* impl = activeImpl();
+    if (!impl) return;
+    const double s = args->getDouble("start", 0.0), e = args->getDouble("end", 0.0);
+    if (!std::isfinite(s) || !std::isfinite(e)) return;
+    edoc::Value v;
+    v.type = SQ_VALUE_DOUBLE;
+    v.d = s;
+    impl->setUntrackedDocProperty(kLoopStartKey, v);
+    v.d = e;
+    impl->setUntrackedDocProperty(kLoopEndKey, v);
+    edoc::Value b;
+    b.type = SQ_VALUE_BOOL;
+    b.i = args->getBool("enabled", SQ_FALSE) ? 1 : 0;
+    impl->setUntrackedDocProperty(kLoopEnabledKey, b);
+  }
+
+  // Audio clip sources of the active song whose file does not exist (sorted, unique).
+  std::vector<std::string> missingMedia() const {
+    std::vector<std::string> out;
+    const edoc::DocumentImpl* impl = activeImpl();
+    if (!impl) return out;
+    std::set<std::string> seen;
+    for (const auto& [id, c] : impl->store().clips)
+      if (c.kind == SQ_CLIP_AUDIO && !c.source.empty() && seen.insert(c.source).second && !sq_fs_is_file(c.source.c_str()))
+        out.push_back(c.source);
+    std::sort(out.begin(), out.end());
+    return out;
+  }
+  static std::string fileNameOf(const std::string& p) {
+    const size_t sl = p.find_last_of("/\\");
+    return sl == std::string::npos ? p : p.substr(sl + 1);
+  }
+  static std::string missingNote(const std::vector<std::string>& missing, const char* consequence) {
+    if (missing.empty()) return {};
+    std::string out = " - WARNING: " + std::to_string(missing.size()) + " missing media file(s)" + consequence + ": ";
+    for (size_t i = 0; i < missing.size() && i < 8; ++i) out += (i ? ", " : "") + fileNameOf(missing[i]);
+    if (missing.size() > 8) out += ", ...";
+    return out;
+  }
+
+  static std::string absolutePath(const std::string& p) {
+    sq::Buffer b;
+    std::string out = sq_fs_absolute(p.c_str(), b.out()) == SQ_OK ? b.str() : p;
+    for (char& ch : out)
+      if (ch == '\\') ch = '/';
+    return out;
+  }
+  // "<song folder>/<song name> Media": where takes of an untitled song move to on the first save.
+  static std::string mediaFolderFor(const std::string& songPath) {
+    std::string name = fileNameOf(songPath);
+    const size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) name = name.substr(0, dot);
+    if (name.empty()) name = "Song";
+    return sq::joinPath(dirOf(absolutePath(songPath)), name + " Media");
+  }
+  // Media recorded or bounced while the song had no file lives in the temp media folder: copy it
+  // into "<song name> Media" next to the song and point the clips at the copies (one untracked
+  // step, not an undo step; the temp files stay for other songs that may still use them).
+  // Returns the number of files copied; `note` gets a warning for files that could not be copied.
+  size_t consolidateMedia(const std::string& songPath, std::string* note) {
+    edoc::DocumentImpl* impl = activeImpl();
+    if (!impl) return 0;
+    std::string temp = absolutePath(sq::joinPath(sq::joinPath(sq::specialDir(SQ_DIR_TEMP), "SquizzyStudio"), "Media"));
+    if (temp.empty()) return 0;
+    if (temp.back() != '/') temp += '/';
+    const std::string dest = mediaFolderFor(songPath);
+    std::map<std::string, std::string> relink;
+    std::vector<std::string> failed;
+    std::set<std::string> used;
+    for (const auto& [id, c] : impl->store().clips) {
+      if (c.kind != SQ_CLIP_AUDIO || c.source.empty() || relink.count(c.source)) continue;
+      const std::string abs = absolutePath(c.source);
+      if (abs.compare(0, temp.size(), temp) != 0 || !sq_fs_is_file(abs.c_str())) continue;
+      sq_fs_create_dirs(dest.c_str());
+      const std::string name = fileNameOf(abs);
+      const size_t dot = name.find_last_of('.');
+      const std::string stem = dot == std::string::npos ? name : name.substr(0, dot), ext = dot == std::string::npos ? "" : name.substr(dot);
+      std::string target = sq::joinPath(dest, name);
+      for (int k = 2; sq_fs_exists(target.c_str()) || used.count(target); ++k) target = sq::joinPath(dest, stem + "-" + std::to_string(k) + ext);
+      if (SQ_FAILED(sq_fs_copy_file(abs.c_str(), target.c_str(), SQ_FALSE))) {
+        failed.push_back(name);
+        continue;
+      }
+      used.insert(target);
+      relink[c.source] = target;
+    }
+    if (!failed.empty() && note) {
+      *note = " - WARNING: could not copy " + std::to_string(failed.size()) + " media file(s) next to the song:";
+      for (const std::string& f : failed) *note += " " + f;
+    }
+    if (!relink.empty()) impl->relinkClipSources(relink);
+    return relink.size();
+  }
+
   template <class F>
   sq_result setTrackProp(ITrack* t, const char* key, F&& setter, bool merge = false) {
     auto p = sq::makeAttributes();
@@ -719,6 +877,89 @@ struct Shell::Impl {
     setter(p.get());
     if (merge) p->setBool("merge", SQ_TRUE);
     return exec(sq::doc::kSetProperty, p.get());
+  }
+
+  // Mixdown / stems. tail=<seconds> renders that much past the end (tail=0: hard cut at the end);
+  // without tail= the export renders until the output has decayed below -90 dBFS (at most
+  // kAutoTailMaxSeconds): a probe render with the maximum tail into a temp WAV measures it.
+  static constexpr double kAutoTailMaxSeconds = 10.0;
+  static constexpr double kTailSilence = 3.1622776601683795e-5;  // -90 dBFS
+
+  sq_result runRender(const sq_render_request& rq, std::vector<std::string>* outputs) {
+    sq::Ptr<IRenderTask> task;
+    sq_result r = audio->startRender(&rq, nullptr, task.put());
+    if (SQ_FAILED(r)) return r;
+    r = task->wait(600000);
+    audio->idle();  // main thread: release the finished render's graph (plugin instances) now
+    if (SQ_SUCCEEDED(r)) r = task->getResult();
+    if (SQ_SUCCEEDED(r) && outputs) {
+      for (uint32_t i = 0; i < task->getOutputCount(); ++i) {
+        char buf[4096];
+        uint32_t need = 0;
+        if (task->getOutputPath(i, buf, sizeof buf, &need) == SQ_OK) outputs->push_back(buf);
+      }
+    }
+    return r;
+  }
+  // Frames at the end of the WAV `path` (whose last `tailSeconds` are the rendered tail) that are
+  // still above -90 dBFS after the end of the range; -1 if the file cannot be read.
+  int64_t audibleTailFrames(const std::string& path, double tailSeconds, double* rate) {
+    auto codecSvc = sq::Ptr<ICodecService>::adopt(codec::findCodec(&sh.registry, "wav", nullptr, SQ_CODEC_READ));
+    if (!codecSvc) return -1;
+    sq::Ptr<IAudioFileReader> reader;
+    if (SQ_FAILED(codecSvc->createReader(reader.put())) || !reader || SQ_FAILED(reader->open(path.c_str()))) return -1;
+    sq_audio_file_format fmt{};
+    fmt.struct_size = sizeof fmt;
+    if (SQ_FAILED(reader->getFormat(&fmt)) || fmt.channels == 0 || fmt.channels > 64 || !(fmt.sample_rate > 0)) return -1;
+    constexpr uint32_t kChunk = 8192;
+    std::vector<float> buf(static_cast<size_t>(kChunk) * fmt.channels);
+    std::vector<float*> ptrs(fmt.channels);
+    for (uint32_t c = 0; c < fmt.channels; ++c) ptrs[c] = &buf[static_cast<size_t>(c) * kChunk];
+    int64_t pos = 0, lastLoud = -1;
+    for (;;) {
+      sq_audio_block blk{ptrs.data(), fmt.channels, kChunk, pos};
+      uint32_t got = 0;
+      if (SQ_FAILED(reader->read(&blk, &got)) || got == 0) break;
+      for (uint32_t c = 0; c < fmt.channels; ++c)
+        for (uint32_t f = 0; f < got; ++f)
+          if (std::fabs(static_cast<double>(ptrs[c][f])) > kTailSilence) lastLoud = std::max<int64_t>(lastLoud, pos + f);
+      pos += got;
+      if (got < kChunk) break;
+    }
+    *rate = fmt.sample_rate;
+    const int64_t body = pos - static_cast<int64_t>(std::llround(tailSeconds * fmt.sample_rate));
+    return std::max<int64_t>(0, lastLoud + 1 - body);
+  }
+  // Tail (seconds) the request needs until its output(s) decayed below -90 dBFS.
+  sq_result measureAutoTail(const sq_render_request& base, double* tail) {
+    *tail = 0;
+    const std::string probe = sq::joinPath(sq::joinPath(sq::specialDir(SQ_DIR_TEMP), "SquizzyStudio"),
+                                           "export-probe-" + std::to_string(sq_process_id()));
+    const bool stems = base.kind == SQ_RENDER_STEMS;
+    const std::string probeOut = stems ? probe : probe + ".wav";
+    sq_render_request rq = base;
+    rq.flags |= SQ_RENDER_TAIL;
+    rq.tail_seconds = kAutoTailMaxSeconds;
+    rq.output = probeOut.c_str();
+    rq.file_extension = "wav";
+    rq.codec_options = nullptr;
+    std::vector<std::string> outputs;
+    sq_result r = runRender(rq, &outputs);
+    if (SQ_SUCCEEDED(r)) {
+      for (const std::string& f : outputs) {
+        double rate = 0;
+        const int64_t frames = audibleTailFrames(f, kAutoTailMaxSeconds, &rate);
+        if (frames < 0) {
+          r = SQ_E_IO;
+          break;
+        }
+        *tail = std::max(*tail, std::ceil(static_cast<double>(frames) / rate * 1000.0) / 1000.0);  // whole ms
+      }
+    }
+    for (const std::string& f : outputs) sq_fs_remove(f.c_str());
+    if (stems) sq_fs_remove_all(probe.c_str());
+    *tail = std::min(*tail, kAutoTailMaxSeconds);
+    return r;
   }
 
   sq_result render(IAttributes* a, IAttributes* res, int32_t kind) {
@@ -736,18 +977,28 @@ struct Shell::Impl {
     rq.start = num(a, "start", 0.0);
     rq.end = num(a, "end", di.length);
     if (!(rq.end > rq.start)) return setMessage(SQ_E_INVALIDARG, "nothing to export (empty range)");
-    rq.tail_seconds = num(a, "tail", 0.0);
+    const bool autoTail = !a || a->getType("tail") == SQ_VALUE_NONE;
+    if (autoTail) {
+      const sq_result pr = measureAutoTail(rq, &rq.tail_seconds);
+      if (SQ_FAILED(pr)) return setMessage(pr, std::string("export failed (tail probe): ") + sq_result_string(pr));
+    } else {
+      rq.tail_seconds = num(a, "tail", 0.0);
+      if (!(rq.tail_seconds >= 0.0 && rq.tail_seconds <= 3600.0)) return setMessage(SQ_E_INVALIDARG, "tail=<0..3600 seconds>");
+    }
     if (rq.tail_seconds > 0) rq.flags |= SQ_RENDER_TAIL;
     rq.output = out.c_str();
     rq.file_extension = ext.c_str();
-    sq::Ptr<IRenderTask> task;
-    sq_result r = audio->startRender(&rq, nullptr, task.put());
-    if (SQ_FAILED(r)) return setMessage(r, std::string("render failed to start: ") + sq_result_string(r));
-    r = task->wait(600000);
-    audio->idle();  // main thread: release the finished render's graph (plugin instances) now
-    if (SQ_SUCCEEDED(r)) r = task->getResult();
-    if (res && SQ_SUCCEEDED(r)) res->setInt("outputs", task->getOutputCount());
-    return setMessage(r, SQ_SUCCEEDED(r) ? "exported " + out : std::string("export failed: ") + sq_result_string(r));
+    std::vector<std::string> outputs;
+    const sq_result r = runRender(rq, &outputs);
+    if (SQ_FAILED(r)) return setMessage(r, std::string("export failed: ") + sq_result_string(r));
+    const std::vector<std::string> missing = missingMedia();
+    if (res) {
+      res->setInt("outputs", static_cast<int64_t>(outputs.size()));
+      res->setDouble("tail", rq.tail_seconds);
+      res->setInt("missing", static_cast<int64_t>(missing.size()));
+    }
+    return setMessage(r, "exported " + out + " (tail " + fmtNum(rq.tail_seconds) + " s" + (autoTail ? ", auto" : "") + ")" +
+                             missingNote(missing, " rendered as silence"));
   }
 
   sq_result exportMidi(IAttributes* a, IAttributes* res) {
@@ -1585,7 +1836,8 @@ struct Shell::Impl {
     add("Track", "AddBus", "Add Bus", [this](IAttributes* a, IAttributes* res) { return addTrackKind(a, res, SQ_TRACK_BUS, "Bus", {}); }, haveDoc);
     add("Track", "AddFx", "Add FX Track", [this](IAttributes* a, IAttributes* res) { return addTrackKind(a, res, SQ_TRACK_FX, "FX", {}); }, haveDoc);
     add("Track", "AddDrums", "Add Drum Track", [this](IAttributes* a, IAttributes* res) {
-      const std::string spec = str(a, "instrument", "builtin|drums|");
+      std::string spec = str(a, "instrument", "builtin|drums|");
+      if (spec.empty()) spec = "builtin|drums|";  // instrument="" = the default kit
       if (!validInstrument(spec)) return setMessage(SQ_E_INVALIDARG, "malformed instrument spec (<format>|<id>|<path>[|i=v]...)");
       return addTrackKind(a, res, SQ_TRACK_INSTRUMENT, "Drums", spec);
     }, haveDoc);
@@ -2006,6 +2258,49 @@ struct Shell::Impl {
       const sq_result r = audio->setLoop(s, e, on ? SQ_TRUE : SQ_FALSE);
       return setMessage(r, SQ_SUCCEEDED(r) ? "loop " + fmtNum(s) + ".." + fmtNum(e) + (on ? " on" : " off") : std::string("set loop failed: ") + sq_result_string(r));
     });
+    add("Transport", "Info", "Transport Info", [this](IAttributes*, IAttributes* res) {
+      if (!audio) return SQ_E_UNSUPPORTED;
+      sq_transport_state ts{};
+      ts.struct_size = sizeof ts;
+      audio->getTransportState(&ts);
+      double s = ts.loop_start, e = ts.loop_end;
+      bool on = (ts.flags & SQ_TRANSPORT_LOOPING) != 0;
+      const bool saved = readLoop(activeImpl(), &s, &e, &on);  // main-thread truth (the snapshot lags a block)
+      if (res) {
+        res->setDouble("loop_start", s);
+        res->setDouble("loop_end", e);
+        res->setBool("looping", on ? SQ_TRUE : SQ_FALSE);
+      }
+      return setMessage(SQ_OK, "loop " + fmtNum(s) + ".." + fmtNum(e) + (on ? " on" : " off") + (saved ? " (song)" : ""));
+    });
+    add("Clip", "AddAudio", "Add Audio Clip", [this](IAttributes* a, IAttributes* res) {
+      auto t = track(a);
+      if (SQ_FAILED(needTrack(t))) return SQ_E_NOTFOUND;
+      if (trackInfo(t.get()).kind != SQ_TRACK_AUDIO) return setMessage(SQ_E_INVALIDARG, trackLabel(t.get()) + " is not an audio track");
+      const std::string path = str(a, "path");
+      if (path.empty()) return setMessage(SQ_E_INVALIDARG, "path=<audio file> required");
+      double start = 0, length = 4;
+      if (a && a->getType("start") != SQ_VALUE_NONE && (!argNum(a, "start", &start) || start < 0)) return setMessage(SQ_E_INVALIDARG, "start=<ppq>");
+      if (a && a->getType("length") != SQ_VALUE_NONE && (!argNum(a, "length", &length) || length <= 0)) return setMessage(SQ_E_INVALIDARG, "length=<ppq>");
+      auto p = sq::makeAttributes();
+      sq_guid tid = nodeId(t.get());
+      p->setGuid("track", &tid);
+      p->setInt("kind", SQ_CLIP_AUDIO);
+      p->setDouble("start", start);
+      p->setDouble("length", length);
+      p->setString("source", absolutePath(path).c_str());
+      auto out = sq::makeAttributes();
+      sq_guid clip{};
+      const sq_result r = step("Add Audio Clip", [&] {
+        sq_result x = exec(sq::doc::kAddClip, p.get(), out.get());
+        if (SQ_SUCCEEDED(x)) out->getGuid("node", &clip);
+        return x;
+      });
+      if (SQ_FAILED(r)) return setMessage(r, std::string("add clip failed: ") + sq_result_string(r));
+      if (res) res->setGuid("node", &clip);
+      return setMessage(SQ_OK, "audio clip " + sq::toString(clip) + " at " + fmtNum(start) + " <- " + fileNameOf(path) +
+                                   (sq_fs_is_file(path.c_str()) ? "" : " (file missing)"));
+    }, haveDoc);
     add("Transport", "Wait", "Wait", [this](IAttributes* a, IAttributes*) {
       double ms = 0;
       if (!argNum(a, "ms", &ms) || ms < 0 || ms > 600000) return setMessage(SQ_E_INVALIDARG, "ms=<0..600000> required");
@@ -2272,6 +2567,11 @@ sq_result Shell::start(const ShellOptions& opt) {
     if (std::strcmp(topic, "document.activated") == 0 || std::strcmp(topic, "document.closed") == 0) impl_->bindEngine();
   }));
   if (impl_->docs) impl_->docs->addObserver(impl_->docObserver.get());
+  // Loop changes from anywhere (commands, the ruler, scripts) are saved in the active song.
+  impl_->engineObserver = sq::Ptr<IObserver>::adopt(new FnObserver([this](const char* topic, IAttributes* args) {
+    if (std::strcmp(topic, "transport.loop") == 0) impl_->onLoopChanged(args);
+  }));
+  impl_->audio->addObserver(impl_->engineObserver.get());
   std::string asDir = settings.get("Engine.Autosave.Dir");
   if (!asDir.empty() && impl_->docs) impl_->docs->setAutosave(asDir, settings.getInt("Engine.Autosave.IntervalMs", 60000));
   std::string drv = !opt.audioDriver.empty() ? opt.audioDriver : settings.get("Devices.Audio.Driver");
@@ -2328,6 +2628,8 @@ void Shell::stop() {
   impl_->closeMidiInputs();  // before the engine goes (the inbox holds a raw engine pointer)
   impl_->midiInbox = nullptr;
   impl_->sampleCache.clear();
+  if (impl_->audio && impl_->engineObserver) impl_->audio->removeObserver(impl_->engineObserver.get());
+  impl_->engineObserver = nullptr;
   if (impl_->audio) {
     impl_->audio->setDocument(nullptr);
     impl_->audio->closeDevice();

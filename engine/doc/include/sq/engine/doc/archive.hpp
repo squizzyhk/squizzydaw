@@ -32,6 +32,12 @@ const char* kindExtension(int32_t kind);  // ".sqsong" | ".sqproject" | ".sqshow
 
 struct ArchiveMeta {
   std::map<std::string, std::string> extra;  // extra <MetaInfo> attributes (e.g. "originalPath")
+  // Not serialized. The folder of the song file: writeArchive stores audio clip sources that live
+  // in this folder tree RELATIVE to it ("Media/take.wav", '/' separated; anything else stays
+  // absolute); readArchive resolves relative sources against it, and an absolute source that no
+  // longer exists is looked up by file name next to the song (and in its Media folders). Empty =
+  // sources are written / read verbatim (autosave, in-memory archives).
+  std::string mediaBase;
 };
 
 // Serialized parts in archive order (name -> XML text). metainfo excluded.
@@ -40,6 +46,13 @@ std::vector<std::pair<std::string, std::string>> serializeParts(const Store& s);
 std::string writeArchive(const Store& s, const ArchiveMeta& meta = {});
 // Parses container bytes into `out` (replaces it). err (optional) gets a message.
 sq_result readArchive(const std::string& bytes, Store& out, ArchiveMeta* meta = nullptr, std::string* err = nullptr);
+
+// Media path helpers behind ArchiveMeta::mediaBase (exposed for tests).
+bool isAbsoluteMediaPath(const std::string& path);  // "/x", "\\x", "C:/x", "C:\\x"
+// `source` relative to `baseDir` when it lives inside that folder tree, else `source` unchanged.
+std::string relativeMediaPath(const std::string& source, const std::string& baseDir);
+// Inverse of relativeMediaPath (plus the moved-media lookup described at ArchiveMeta).
+std::string resolveMediaPath(const std::string& stored, const std::string& baseDir);
 
 // Crash-safe file write: temp file in the same folder, flush, verify, rename over the target.
 sq_result safeWriteFile(const std::string& path, const std::string& data);

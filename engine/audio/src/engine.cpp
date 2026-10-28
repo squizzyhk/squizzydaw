@@ -302,12 +302,18 @@ void EngineCore::captureLive(const LiveMidiEvent& e) noexcept {
   const int64_t len = loopEnd_ - loopStart_;
   const bool loopOn = looping_ && len > 0;
   int64_t f = pos_ - static_cast<int64_t>(outLatency_.load(std::memory_order_relaxed));
-  if (loopOn && capWrapped_ && f < loopStart_ && pos_ >= loopStart_ && pos_ < loopEnd_) f += len;  // heard before the wrap
+  uint64_t pass = transportPass_;
+  if (loopOn && capWrapped_ && f < loopStart_ && pos_ >= loopStart_ && pos_ < loopEnd_) {
+    f += len;  // heard before the wrap
+    --pass;
+  }
   auto push = [&](int64_t frame, uint8_t b0, uint8_t b1, uint8_t b2) {
     CapturedMidi cm{frame, {b0, b1, b2}, 3};
     capture_.push(cm);  // full: dropped (the control thread drains it in idle())
   };
-  if (capLast_ != INT64_MIN && f < capLast_) {
+  // A new transport pass (loop wrap / locate) is detected by counter, not by f going backwards
+  // (latency-adjusted frames can step back within one pass).
+  if (capLast_ != INT64_MIN && pass != capPass_) {
     // The transport went back (loop wrap / locate): held notes end where the old pass ended and
     // start again at the new position.
     const int64_t closeAt = (loopOn && capLast_ >= loopStart_ && capLast_ < loopEnd_) ? loopEnd_ : capLast_;
@@ -320,6 +326,7 @@ void EngineCore::captureLive(const LiveMidiEvent& e) noexcept {
         }
   }
   capLast_ = f;
+  capPass_ = pass;
   const uint8_t st = e.bytes[0] & 0xF0u, ch = e.bytes[0] & 0x0Fu, key = e.bytes[1] & 0x7Fu;
   if (st == 0x90 && e.bytes[2] > 0) capVel_[ch][key] = e.bytes[2];
   else if (st == 0x80 || st == 0x90) capVel_[ch][key] = 0;
@@ -331,7 +338,10 @@ void EngineCore::apply(const Command& c) noexcept {
   switch (c.type) {
     case CmdType::Play: playing_ = true; break;
     case CmdType::Stop: playing_ = false; recording_ = false; break;
-    case CmdType::Locate: pos_ = c.a; break;
+    case CmdType::Locate:
+      pos_ = c.a;
+      ++transportPass_;
+      break;
     case CmdType::Loop:
       loopStart_ = c.a;
       loopEnd_ = c.b;
@@ -503,6 +513,7 @@ void EngineCore::process(const sq_audio_io* io) {
       pos_ += n;
       if (loopActive && pos_ >= loopEnd_) {
         pos_ = loopStart_;
+        ++transportPass_;
         if (recording_) capWrapped_ = true;
       }
     }
@@ -1292,6 +1303,14 @@ sq_result AudioEngine::setLoop(sq_ppq_time start, sq_ppq_time end, sq_bool enabl
   if (enabled && c.b <= c.a) return SQ_E_INVALIDARG;  // shorter than one frame
   if (!core_->post(c)) return SQ_E_BUSY;
   notify("transport.state");
+  // The requested loop (main thread; the transport snapshot lags until the audio thread ran):
+  // the app saves it in the song (document properties) from this notification.
+  auto args = sq::makeAttributes();
+  args->setDouble("start", start);
+  args->setDouble("end", end);
+  args->setBool("enabled", enabled ? SQ_TRUE : SQ_FALSE);
+  std::vector<sq::Ptr<IObserver>> obs = observers_;
+  for (auto& o : obs) o->onNotify(static_cast<IAudioEngine*>(this), "transport.loop", args.get());
   return SQ_OK;
 }
 

@@ -2,7 +2,7 @@
 
 A cross-platform, recording-first DAW built from scratch. Windows comes first. The architecture is in [`REBUILD-PLAN.md`](REBUILD-PLAN.md), the rules for contributors and agents are in [`docs/CONTRACTS.md`](docs/CONTRACTS.md), and what is actually done (per plan section and milestone) is in [`STATUS.md`](STATUS.md).
 
-**Status:** integrated on Windows (second integration pass): a thin shell EXE over versioned service DLLs (two-export, GUID-addressed, COM-style factory ABI with no COM dependency), an in-process engine (document model with transactions/undo, edit tools, realtime audio graph with PDC, recording, offline render), plugin hosting (CLAP + VST3 + out-of-process scanner), WASAPI audio and an ASIO seam, codecs (incl. Ogg Vorbis write), a SQLite content index, JavaScript scripting with binary packages, a skin-XML GUI with compiled themes (`theme://`, @2x, dark/light) and a UI Automation bridge, MIDI control surfaces, OSC/mDNS, and the optional cloud, tempo-sync and video services. Skia/Yoga are not used (own layout + GDI backend), ASIO streaming needs the separately licensed SDK, and macOS/Linux are unverified; see `STATUS.md`.
+**Status:** integrated on Windows (second integration pass): a thin shell EXE over versioned service DLLs (two-export, GUID-addressed, COM-style factory ABI with no COM dependency), an in-process engine (document model with transactions/undo, edit tools, realtime audio graph with PDC, recording, offline render), plugin hosting (CLAP + VST3 + out-of-process scanner), WASAPI audio and an ASIO seam, codecs (incl. Ogg Vorbis write), a SQLite content index, JavaScript scripting with binary packages, a skin-XML GUI with compiled themes (`theme://`, @2x, dark/light) and a UI Automation bridge, MIDI control surfaces, OSC/mDNS, and the optional cloud, tempo-sync and video services. Skia/Yoga are not used (own layout + software renderer with stb_truetype text, presented through Win32 or X11), and ASIO streaming needs the separately licensed SDK. CI builds and tests Windows, Linux and macOS on every push, and the Windows job ships a self-contained `SquizzyStudio-windows-x64` package (app-local VC++ runtime) that is run headless and as a real window; see `STATUS.md`.
 
 ## Build (Windows)
 
@@ -24,7 +24,7 @@ Optional, user-supplied components (never vendored, loaded at runtime): LAME for
 
 SDKs that need a licence agreement are seams: the tree builds and runs without them. ASIO: `-DSQ_ASIO_SDK_DIR=<Steinberg ASIO SDK>` compiles the ASIO host into `services/audiodriver-asio` (without it the driver loads, lists 0 devices and `Audio.ListDevices` says why). Ableton Link: `-DSQ_LINK_SDK_DIR=<Link SDK>` (without it `services/link-ableton` runs a local-only tempo clock). Neither SDK path has been compiled in this tree's CI.
 
-Linux and macOS: `cmake --preset linux` (or `macos`), then `cmake --build --preset linux` and `ctest --preset linux`. These platforms are **not verified** (the code has `#ifdef` seams; no CI run has been checked).
+Linux and macOS: `cmake --preset linux` (or `macos`), then `cmake --build --preset linux` and `ctest --preset linux`. Both build and pass the test suite in CI; on Linux the window uses X11 and audio goes through ALSA or PulseAudio. macOS has no native window or audio driver yet (headless and batch modes only).
 
 ## Run
 
@@ -37,6 +37,8 @@ SquizzyStudio.exe --selftest | --list-classes | --reload-test 25 | --new-guid 3 
 ```
 
 Options: `--audio-driver none|null|offline|wasapi|asio|alsa|pulse` (default: WASAPI for the window on Windows, ALSA then Pulse then null on Linux, none for batch modes; also `Devices.Audio.Driver` / `Devices.Audio.Device`), `--settings FILE`, `--services-dir DIR`, `--log-level LEVEL`, `--quit-after MS`.
+
+GUI: menu bar, transport, browser (files + built-in devices), arrange view (clips, automation lanes, loop/locators, drag/resize/split), piano-roll and audio clip editors, mixer (faders, pan, mute/solo/arm/monitor, inserts, sends, buses), device chain with 18 built-in instruments and effects, file/folder choosers and prompts. Per-monitor DPI aware on Windows. Headless rendering for tests: `--screenshot out.png [--size WxH --scale N]` and `--ui-script file.uiscript`.
 
 Window keys: Space play/stop, R record, S split at cursor, L loop, Q quantize, G glue, Delete delete, arrows cursor/track, Ctrl+arrows nudge, Tab next clip, Ctrl+N/S/Z/Y/D/A new/save/undo/redo/duplicate/select all, Home go to start, F5 reload every service module, Esc quit. Every button, key and fader goes through the same command system (`Shell::execute`) the CLI and scripts use.
 

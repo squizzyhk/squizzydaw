@@ -1,4 +1,7 @@
 // engine/doc: XmlArchive round trip (byte-stable), foreign parts, errors, crash-safe write, autosave.
+#include <algorithm>
+#include <map>
+
 #include "doc_test_util.hpp"
 
 using namespace doctest;
@@ -214,5 +217,110 @@ SQ_TEST("autosave: interval tick, crash recovery, cleanup on save") {
   REQUIRE_OK(f.mgr->saveDocument(f.doc.get(), nullptr));
   CHECK(!sq_fs_exists(ap.c_str()));
   CHECK_EQ(f.mgr->listRecoverable().size(), size_t(0));
+  sq_fs_remove_all(dir.c_str());
+}
+
+SQ_TEST("archive: media inside the song folder is stored relative and follows a moved project") {
+  const std::string dir = tempDir("media");
+  const std::string proj = sq::joinPath(dir, "proj");
+  const std::string mediaDir = sq::joinPath(proj, "Media");
+  REQUIRE_OK(sq_fs_create_dirs(mediaDir.c_str()));
+  const std::string media = sq::joinPath(mediaDir, "take.wav");
+  REQUIRE_OK(sq::writeFile(media, "RIFF"));
+  const std::string outside = sq::joinPath(dir, "elsewhere.wav");
+  REQUIRE_OK(sq::writeFile(outside, "RIFF"));
+  CHECK(sq::edoc::relativeMediaPath(media, proj) == "Media/take.wav");
+  CHECK(sq::edoc::relativeMediaPath(outside, proj) == outside);
+  const std::string sibling = sq::joinPath(dir, "proj2/x.wav");
+  CHECK(sq::edoc::relativeMediaPath(sibling, proj) == sibling);  // "proj2" is not inside "proj"
+  CHECK(sq::edoc::isAbsoluteMediaPath("C:\\a.wav"));
+  CHECK(sq::edoc::isAbsoluteMediaPath("/a.wav"));
+  CHECK(!sq::edoc::isAbsoluteMediaPath("Media/a.wav"));
+  {
+    Fx f;
+    sq_guid t = addTrack(f.ed.get(), SQ_TRACK_AUDIO, "Vox");
+    addClip(f.ed.get(), t, SQ_CLIP_AUDIO, 0.0, 4.0, media.c_str());
+    sq_guid t2 = addTrack(f.ed.get(), SQ_TRACK_AUDIO, "Ext");
+    addClip(f.ed.get(), t2, SQ_CLIP_AUDIO, 0.0, 4.0, outside.c_str());
+    const std::string song = sq::joinPath(proj, "song.sqsong");
+    REQUIRE_OK(f.mgr->saveDocument(f.doc.get(), song.c_str()));
+    for (const auto& [id, c] : f.st().clips) CHECK(sq::edoc::isAbsoluteMediaPath(c.source));  // in memory: absolute
+    // The archive holds the relative path for the media in the song folder only.
+    sq::edoc::Store raw;
+    auto bytes = sq::readFile(song);
+    REQUIRE(bytes.has_value());
+    REQUIRE_OK(sq::edoc::readArchive(*bytes, raw));
+    std::vector<std::string> stored;
+    for (const auto& [id, c] : raw.clips) stored.push_back(c.source);
+    REQUIRE_EQ(stored.size(), size_t(2));
+    CHECK(std::find(stored.begin(), stored.end(), "Media/take.wav") != stored.end());
+    CHECK(std::find(stored.begin(), stored.end(), outside) != stored.end());
+  }
+  // Move the whole project folder: the relative media resolves at the new place.
+  const std::string moved = sq::joinPath(dir, "moved");
+  REQUIRE_OK(sq_fs_rename(proj.c_str(), moved.c_str()));
+  Ptr<sq::edoc::DocumentManagerImpl> mgr = Ptr<sq::edoc::DocumentManagerImpl>::adopt(new sq::edoc::DocumentManagerImpl());
+  Ptr<sq::IDocument> d;
+  REQUIRE_OK(mgr->openDocument(sq::joinPath(moved, "song.sqsong").c_str(), d.put()));
+  const sq::edoc::DocumentImpl* impl = sq::edoc::DocumentImpl::from(d.get());
+  bool found = false;
+  for (const auto& [id, c] : impl->store().clips)
+    if (c.source.find("take.wav") != std::string::npos) {
+      found = true;
+      CHECK(sq_fs_is_file(c.source.c_str()));
+      CHECK(c.source.find("moved") != std::string::npos);
+    }
+  CHECK(found);
+  // An absolute path that is gone is found next to the song (songs saved before relative paths).
+  CHECK(sq::edoc::resolveMediaPath(sq::joinPath(dir, "gone/Media/take.wav"), moved).find("moved") != std::string::npos);
+  CHECK(sq::edoc::resolveMediaPath("/nowhere/none.wav", moved) == "/nowhere/none.wav");
+  mgr->closeDocument(d.get());
+  sq_fs_remove_all(dir.c_str());
+}
+
+SQ_TEST("document: untracked properties and media relinks stay out of the undo history") {
+  const std::string dir = tempDir("untracked");
+  Fx f;
+  sq_guid t = addTrack(f.ed.get(), SQ_TRACK_AUDIO, "Vox");
+  sq_guid c = addClip(f.ed.get(), t, SQ_CLIP_AUDIO, 0.0, 4.0, "/tmp/SquizzyStudio/Media/take.wav");
+  CHECK_OK(setPropB(f.ed.get(), f.st().props.id, "removeOverlaps", true));  // a DocProps step in the history
+  const uint32_t undos = f.ed->getUndoCount();
+  const std::string p = sq::joinPath(dir, "s.sqsong");
+  REQUIRE_OK(f.mgr->saveDocument(f.doc.get(), p.c_str()));
+  CHECK(!f.impl->modified());
+  sq::edoc::Value v;
+  v.type = SQ_VALUE_DOUBLE;
+  v.d = 8.0;
+  CHECK_EQ(f.impl->setUntrackedDocProperty("user.loop.end", v), SQ_OK);
+  CHECK_EQ(f.impl->setUntrackedDocProperty("user.loop.end", v), SQ_S_FALSE);
+  CHECK_EQ(f.impl->setUntrackedDocProperty("loop.end", v), SQ_E_INVALIDARG);
+  CHECK(f.impl->modified());
+  CHECK_EQ(f.ed->getUndoCount(), undos);
+  // Undoing the earlier DocProps step keeps the loop value.
+  REQUIRE_OK(f.ed->undo());
+  REQUIRE(f.st().props.user.count("user.loop.end"));
+  CHECK_EQ(f.st().props.user.at("user.loop.end").d, 8.0);
+  REQUIRE_OK(f.ed->redo());
+  CHECK_EQ(f.st().props.user.at("user.loop.end").d, 8.0);
+  // Relink: store and history snapshots point at the new file; no undo step.
+  const std::map<std::string, std::string> m{{"/tmp/SquizzyStudio/Media/take.wav", "/songs/a Media/take.wav"}};
+  CHECK_EQ(f.impl->relinkClipSources(m), size_t(1));
+  CHECK_EQ(f.st().clip(c)->source, std::string("/songs/a Media/take.wav"));
+  CHECK_EQ(f.ed->getUndoCount(), undos);
+  REQUIRE_OK(f.ed->undo());  // removeOverlaps
+  REQUIRE_OK(f.ed->undo());  // add clip
+  CHECK(f.st().clip(c) == nullptr);
+  REQUIRE_OK(f.ed->redo());
+  REQUIRE(f.st().clip(c) != nullptr);
+  CHECK_EQ(f.st().clip(c)->source, std::string("/songs/a Media/take.wav"));
+  // Saved and reopened: the loop property persists.
+  REQUIRE_OK(f.mgr->saveDocument(f.doc.get(), p.c_str()));
+  Ptr<sq::edoc::DocumentManagerImpl> mgr = Ptr<sq::edoc::DocumentManagerImpl>::adopt(new sq::edoc::DocumentManagerImpl());
+  Ptr<sq::IDocument> d;
+  REQUIRE_OK(mgr->openDocument(p.c_str(), d.put()));
+  const auto& user = sq::edoc::DocumentImpl::from(d.get())->store().props.user;
+  REQUIRE(user.count("user.loop.end"));
+  CHECK_EQ(user.at("user.loop.end").d, 8.0);
+  mgr->closeDocument(d.get());
   sq_fs_remove_all(dir.c_str());
 }
