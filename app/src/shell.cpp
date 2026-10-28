@@ -426,8 +426,8 @@ struct Shell::Impl {
 #if SQ_SHELL_ENGINE
     add("Audio", "SelectDevice", "Select Audio Device...", [this](IAttributes* a, IAttributes*) {
       std::string drv = lower(str(a, "driver"));
-      static const std::set<std::string> known = {"none", "null", "offline", "wasapi", "asio"};
-      if (!known.count(drv)) return setMessage(SQ_E_INVALIDARG, "driver must be none|null|offline|wasapi|asio");
+      static const std::set<std::string> known = {"none", "null", "offline", "wasapi", "asio", "alsa", "pulse"};
+      if (!known.count(drv)) return setMessage(SQ_E_INVALIDARG, "driver must be none|null|offline|wasapi|asio|alsa|pulse");
       std::string dev = str(a, "device");
       const std::string oldDrv = sh.settings.get("Devices.Audio.Driver"), oldDev = sh.settings.get("Devices.Audio.Device");
       sh.settings.setString("Devices.Audio.Driver", drv.c_str());
@@ -1181,9 +1181,23 @@ sq_result Shell::start(const ShellOptions& opt) {
   std::string asDir = settings.get("Engine.Autosave.Dir");
   if (!asDir.empty() && impl_->docs) impl_->docs->setAutosave(asDir, settings.getInt("Engine.Autosave.IntervalMs", 60000));
   std::string drv = !opt.audioDriver.empty() ? opt.audioDriver : settings.get("Devices.Audio.Driver");
-  if (drv.empty()) drv = opt.gui ? "wasapi" : "none";
+#if defined(__linux__)
+  const char* const platformDriver = "alsa";
+#else
+  const char* const platformDriver = "wasapi";  // Windows (macOS: no native driver yet)
+#endif
+  const bool defaulted = drv.empty();
+  if (drv.empty()) drv = opt.gui ? platformDriver : "none";
   if (drv != "none") {
     sq_result dr = openAudioDevice(drv);
+#if defined(__linux__)
+    if (SQ_FAILED(dr) && opt.gui && defaulted) {  // Linux default chain: alsa, then pulse, then null
+      sq_log_printf(SQ_LOG_WARN, kTag, "audio driver 'alsa' unavailable (%s); trying 'pulse'", sq_result_string(dr));
+      dr = openAudioDevice(drv = "pulse");
+    }
+#else
+    (void)defaulted;
+#endif
     if (SQ_FAILED(dr) && opt.gui && drv != "null") {
       sq_log_printf(SQ_LOG_WARN, kTag, "audio device '%s' unavailable (%s); using the null device", drv.c_str(), sq_result_string(dr));
       openAudioDevice("null");
@@ -1294,6 +1308,29 @@ sq_result Shell::openAudioDevice(const std::string& driverIn) {
     if (dev.empty()) dev = "wasapi:default";
   } else if (drv == "asio") {
     cls = sq::audiodevice::kAsioDriverClassId;
+  } else if (drv == "alsa" || drv == "pulse") {
+    // Linux driver services: found by their driver name ("ALSA", "Pulse"), case-insensitively.
+    bool found = false;
+    for (uint32_t i = 0; i < registry.getClassCount() && !found; ++i) {
+      sq_class_info ci{};
+      ci.struct_size = sizeof ci;
+      if (registry.getClassInfo(i, &ci) != SQ_OK || !ci.category || std::strcmp(ci.category, sq::audiodevice::kCategory) != 0) continue;
+      auto d = sq::createInstance<IAudioDriver>(&registry, ci.class_id);
+      sq_audio_driver_info di{};
+      di.struct_size = sizeof di;
+      if (!d || d->getDriverInfo(&di) != SQ_OK) continue;
+      std::string n(di.name, ::strnlen(di.name, sizeof di.name));
+      for (char& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (n == drv) {
+        cls = ci.class_id;
+        found = true;
+      }
+    }
+    if (!found) {
+      message_ = "audio driver '" + drv + "' not available (service not loaded)";
+      return SQ_E_NOTFOUND;
+    }
+    if (dev.empty() && drv == "pulse") dev = "pulse:default";
   } else {
     message_ = "unknown audio driver '" + drv + "'";
     return SQ_E_INVALIDARG;

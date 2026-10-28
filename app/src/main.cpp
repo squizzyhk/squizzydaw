@@ -54,7 +54,7 @@ void printUsage() {
       "  --reload-test [N]     load/unload/reload the dummy service N times (default 10)\n"
       "  --services-dir DIR    service module folder (default: <exe dir>/services)\n"
       "  --settings FILE       settings XML (GUI default: <user config>/settings.xml)\n"
-      "  --audio-driver D      none|null|offline|wasapi|asio (overrides Devices.Audio.Driver)\n"
+      "  --audio-driver D      none|null|offline|wasapi|asio|alsa|pulse (overrides Devices.Audio.Driver)\n"
       "  --log-level LEVEL     trace|debug|info|warn|error\n"
       "  --quit-after MS       GUI smoke test: close the window after MS milliseconds\n"
       "  --new-guid [N]        print N fresh GUIDs for class/interface IDs\n"
