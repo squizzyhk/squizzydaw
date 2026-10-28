@@ -13,6 +13,21 @@ sq_add_library(NAME sqengine_audio
     src/doc_builder.cpp
     src/engine.cpp
     src/plugin_fx.cpp
+    # built-in instruments + effects (builtin.hpp)
+    src/builtin/catalog.cpp
+    src/builtin/synth.cpp
+    src/builtin/drums.cpp
+    src/builtin/keys.cpp
+    src/builtin/bass.cpp
+    src/builtin/sampler.cpp
+    src/builtin/eq.cpp
+    src/builtin/dynamics.cpp
+    src/builtin/reverb.cpp
+    src/builtin/delay.cpp
+    src/builtin/modulation.cpp
+    src/builtin/distortion.cpp
+    src/builtin/filter.cpp
+    src/builtin/utility.cpp
   INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/include")
 add_library(sq::engine_audio ALIAS sqengine_audio)
 if(WIN32)
@@ -30,3 +45,6 @@ sq_add_test(NAME engine_audio_rtsafety SOURCES tests/test_rtsafety.cpp LIBS ${_e
 sq_add_test(NAME engine_audio_service SOURCES tests/test_service.cpp LIBS ${_ea_libs})
 sq_add_test(NAME engine_audio_verify SOURCES tests/test_verify.cpp LIBS ${_ea_libs})
 sq_add_test(NAME engine_audio_plugin_fx SOURCES tests/test_plugin_fx.cpp LIBS ${_ea_libs})
+sq_add_test(NAME engine_audio_builtin SOURCES tests/test_builtin.cpp LIBS ${_ea_libs})
+sq_add_test(NAME engine_audio_builtin_dsp SOURCES tests/test_builtin_dsp.cpp LIBS ${_ea_libs})
+sq_add_test(NAME engine_audio_builtin_rtsafety SOURCES tests/test_builtin_rtsafety.cpp LIBS ${_ea_libs})

@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "sq/engine/audio/nodes.hpp"
 #include "sq/engine/audio/processor.hpp"
 
 namespace sq::engine::audio {
@@ -62,5 +63,16 @@ struct SpecParts {
 };
 bool parseSpec(const std::string& spec, SpecParts* out);
 std::string formatSpec(const SpecParts& parts);
+
+// Devices that play an audio file ("sampler"): the HOST resolves the spec's path field and
+// decodes it (loadMediaFile) before calling this. A null media makes a silent sampler (that is
+// also what makeBuiltin("sampler", ...) returns). For ids that take no media this is makeBuiltin.
+ProcessorProto makeBuiltinWithMedia(const std::string& id, MediaPtr media, const std::vector<std::pair<uint32_t, double>>& params,
+                                    std::string* error);
+
+// Level meter of a built-in dynamics device for the GUI: current gain reduction in dB (>= 0) for
+// "compressor", "limiter" and "gate"; 0 for anything else (incl. non built-in processors). Safe to
+// call from any thread while the processor is alive (relaxed atomic read).
+float builtinMeterValue(const AudioProcessor* processor) noexcept;
 
 }  // namespace sq::engine::audio
