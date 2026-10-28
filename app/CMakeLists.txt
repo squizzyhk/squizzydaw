@@ -90,6 +90,91 @@ if(SQ_BUILD_TESTS)
               --run Edit.Undo --list-commands
       WORKING_DIRECTORY "${SQ_BIN_DIR}")
     set_tests_properties(app_run_commands PROPERTIES PASS_REGULAR_EXPRESSION "Edit +Split.*run Edit\\.Undo: ok")
+    # Every new mixer / instrument / automation / clip / song / MIDI command through the CLI. The
+    # helper takes (command, expected-result regex) pairs: the test passes only when every command
+    # printed "run <Name>: <expected>" in order.
+    function(sq_app_cli_test name driver)
+      set(_args --audio-driver ${driver})
+      set(_re "")
+      set(_list ${ARGN})
+      list(LENGTH _list _n)
+      math(EXPR _last "${_n} - 1")
+      foreach(_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _list ${_i} _cmd)
+        list(GET _list ${_j} _exp)
+        list(APPEND _args --run "${_cmd}")
+        string(REGEX MATCH "^[A-Za-z]+\\.[A-Za-z]+" _nm "${_cmd}")
+        string(REPLACE "." "\\." _nm "${_nm}")
+        if(_re)
+          string(APPEND _re ".*")
+        endif()
+        string(APPEND _re "run ${_nm}: ${_exp}")
+      endforeach()
+      add_test(NAME ${name} COMMAND SquizzyStudio ${_args} WORKING_DIRECTORY "${SQ_BIN_DIR}")
+      set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${_re}" TIMEOUT 120)
+    endfunction()
+    sq_app_cli_test(app_run_mixer_commands none
+      File.New "ok"
+      "Track.AddBus name=Verb" "ok - added track"
+      "Track.AddInstrument name=Keys" "ok - added track .* \\(builtin\\|synth\\|\\)"
+      "Track.AddInsert spec=builtin|eq||0=-3" "ok - insert builtin\\|eq\\|\\|0=-3 at slot 0"
+      "Track.AddInsert spec=builtin|comp|" "ok - insert builtin\\|comp\\| at slot 1"
+      "Track.SetInsertParam slot=0 param=1 value=2.5 merge=true" "ok"
+      "Track.BypassInsert slot=1" "ok - insert 1 bypassed"
+      "Track.MoveInsert slot=1 to=0" "ok"
+      "Track.AddSend bus=Verb level=-6" "ok - send 0 -> 'Verb' -6 dB"
+      "Track.SetSendLevel send=0 level=-3 merge=true" "ok"
+      "Track.SetInstrumentParam param=0 value=0.5 merge=true" "ok"
+      "Automation.SetLane target=volume points=\"0:0 4:-12\"" "ok - 'Keys' volume: 2 point"
+      "Automation.AddPoint target=send.0 ppq=2 value=-6" "ok"
+      "Clip.CreateMidi start=0 length=4" "ok - MIDI clip"
+      "Clip.SetNotes notes=\"0,1,60,100/1,1,64,90\"" "ok - 2 note"
+      "Track.Info" "ok - 'Keys' kind=instrument instrument=builtin\\|synth\\|\\|0=0\\.5 inserts=\\[!builtin\\|comp\\| / builtin\\|eq\\|\\|0=-3\\|1=2\\.5\\] sends=\\[{[-0-9A-F]+} -3\\] automation=\\[send\\.0\\(1\\),volume\\(2\\)\\] clips=1 events=2"
+      "Track.Rename name=Piano" "ok"
+      "Track.SetColor color=0xFF8800FF" "ok - 'Piano' color 0xFF8800FF"
+      "Track.SetOutput bus=Verb" "ok - 'Piano' -> 'Verb'"
+      "Track.SetOutput bus=master" "ok"
+      "Track.Move index=0" "ok"
+      "Clip.Rename name=Riff" "ok"
+      "Clip.SetColor color=0x00FF00FF" "ok"
+      "Song.SetTempo bpm=100 position=0" "ok"
+      "Song.SetSignature num=3 den=4" "ok"
+      "Transport.Locate ppq=4" "ok"
+      "Transport.SetLoop start=0 end=8 enabled=true" "ok"
+      "Automation.RemoveLane target=volume" "ok"
+      "Track.RemoveInsert slot=0" "ok"
+      "Track.RemoveSend send=0" "ok"
+      "Track.SetInstrument spec=builtin|synth|" "ok"
+      "Track.Info track=Piano" "ok - 'Piano' kind=instrument instrument=builtin\\|synth\\| inserts=\\[builtin\\|eq\\|\\|0=-3\\|1=2\\.5\\] sends=\\[\\] automation=\\[send\\.0\\(1\\)\\]"
+      "Track.AddDrums" "ok - added track .*\\(builtin\\|drums\\|\\)"
+      "Track.Remove" "ok - removed track 'Drums'"
+      "Track.Remove track=Verb" "ok"
+      Edit.Undo "ok"
+      Midi.ListInputs "ok"
+      "Midi.Inject bytes=90,60,100" "ok - 3 byte"
+      "Midi.Inject bytes=0x80,60,0" "ok")
+    # Live MIDI through the null device: sound while stopped, then a MIDI recording creates one
+    # clip (one undo step).
+    sq_app_cli_test(app_run_live_midi null
+      File.New "ok"
+      "Track.AddInstrument name=Keys" "ok"
+      "Midi.Inject bytes=90,60,100" "ok - 3 byte\\(s\\) -> 1 live MIDI track"
+      "Transport.Wait ms=150" "ok"
+      Track.Info "ok - 'Keys' .* clips=0 events=0 peak=0\\.[0-9]*[1-9]"
+      "Midi.Inject bytes=80,60,0" "ok"
+      Track.ToggleArm "ok"
+      Transport.ToggleMetronome "ok"
+      Transport.Record "ok"
+      "Transport.Wait ms=200" "ok"
+      "Midi.Inject bytes=90,64,100" "ok"
+      "Transport.Wait ms=150" "ok"
+      "Midi.Inject bytes=80,64,0" "ok"
+      "Transport.Wait ms=100" "ok"
+      Transport.Stop "ok"
+      Track.Info "ok - 'Keys' .* clips=1 events=1 "
+      Edit.Undo "ok"
+      Track.Info "ok - 'Keys' .* clips=0 events=0 ")
   endif()
   if(_sq_app_themes)
     # The real EXE: embedded stock themes, theme switch, device listing, surfaces (no hardware).

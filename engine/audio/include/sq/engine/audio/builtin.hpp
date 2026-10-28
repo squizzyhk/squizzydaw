@@ -64,6 +64,17 @@ struct SpecParts {
 bool parseSpec(const std::string& spec, SpecParts* out);
 std::string formatSpec(const SpecParts& parts);
 
+// Insert-line helpers (spec.cpp). A line of "user.inserts" that starts with '!' is BYPASSED: the
+// doc builder keeps its slot number (automation / command slots count every line) but leaves the
+// processor out of the chain. Toggling the marker is a structural edit (the graph recompiles).
+inline bool specBypassed(const std::string& line) { return !line.empty() && line[0] == '!'; }
+inline std::string specWithoutBypass(const std::string& line) { return specBypassed(line) ? line.substr(1) : line; }
+// The spec with its "|i=v" parameter values removed (structure key: parameter-only edits are
+// applied live instead of recompiling). Unparsable specs are returned unchanged.
+std::string specStructure(const std::string& spec);
+// Sets (or adds) one parameter value of a spec; the other fields and values stay as they are.
+std::string specSetParam(const std::string& spec, uint32_t index, double value);
+
 // Devices that play an audio file ("sampler"): the HOST resolves the spec's path field and
 // decodes it (loadMediaFile) before calling this. A null media makes a silent sampler (that is
 // also what makeBuiltin("sampler", ...) returns). For ids that take no media this is makeBuiltin.

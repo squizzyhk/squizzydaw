@@ -11,9 +11,24 @@
 //   - METERS RT->any thread through MeterBank atomics; TRANSPORT snapshot through a seqlock of
 //     atomics (readers never block the writer; the writer never waits).
 //   - Recording: RecordStream rings (recorder.hpp) drained by a non-RT disk writer thread.
+//   - LIVE MIDI: pushLiveMidi() (any non-RT thread; producers serialise on a spinlock that the
+//     audio thread never takes) -> bounded queue (overflow drops) -> at the start of each callback
+//     the audio thread routes the events to the tracks whose liveMidi flag is set (instrument
+//     tracks render while the transport is stopped). While recording with MIDI capture on, the
+//     same events are copied with the transport frame into an RT->control capture queue.
+//   - AUTOMATION SWAP: a SetAutomation command carries a heap AutomationData; the audio thread
+//     installs it into the current graph (Graph::swapAutomation) and pushes the replaced one (or
+//     the command's own data if the generation no longer matches) into an RT->control retire
+//     queue; collectGarbage() deletes it. Graphs delete their installed data in ~Graph.
 //
 // AudioEngine implements IAudioEngine + ITransport + ISubject (main thread), owns the device and
 // the document binding, builds GraphDescs from IDocument (doc_builder.hpp) and runs render tasks.
+// A document edit whose structure key is unchanged is applied without a recompile: mixer values,
+// insert/instrument parameter values (TrackParam/BusParam/MasterParam -> setParameter on the live
+// processors), send levels, live-MIDI routing and automation (SetAutomation swap) are commands.
+// Instrument tracks: one synth per track (InstrumentResolver), live MIDI to the armed instrument
+// tracks or else the live MIDI target (selected track), MIDI recording into one clip per armed
+// instrument track committed with the audio takes in one undo step.
 #pragma once
 
 #include <atomic>
@@ -36,15 +51,32 @@ namespace sq::engine::audio {
 
 enum class CmdType : uint32_t {
   Play, Stop, Locate, Loop, Metronome, Record, LowLatency, MasterVolume,
-  TrackVolume, TrackPan, TrackMute, TrackSolo, TrackMonitor, BusVolume, BusMute
+  TrackVolume, TrackPan, TrackMute, TrackSolo, TrackMonitor, BusVolume, BusMute,
+  TrackParam, BusParam, MasterParam, TrackSendLevel, BusSendLevel, TrackLiveMidi, BusPan,
+  SetAutomation, MidiCapture
 };
 
 struct Command {
   CmdType type = CmdType::Play;
   int32_t index = -1;           // track / bus index for Track* / Bus*
-  uint64_t generation = 0;      // graph generation for Track* / Bus*
+  uint64_t generation = 0;      // graph generation for Track* / Bus* / *Param / SetAutomation
   double value = 0.0;
-  int64_t a = 0, b = 0;         // Locate: a; Loop: a..b, value != 0 = enabled
+  int64_t a = 0, b = 0;         // Locate: a; Loop: a..b, value != 0 = enabled;
+                                // *Param: a = chain slot (-1 = instrument), b = parameter;
+                                // *SendLevel: a = send index
+  void* ptr = nullptr;          // SetAutomation: AutomationData* (ownership passes to the core)
+};
+
+// Live MIDI event (short channel message).
+struct LiveMidiEvent {
+  uint8_t bytes[3];
+  uint8_t size;
+};
+// Live MIDI captured while recording: transport (output) frame of the block it arrived in.
+struct CapturedMidi {
+  int64_t frame;
+  uint8_t bytes[3];
+  uint8_t size;
 };
 
 struct TransportSnapshot {
@@ -80,6 +112,14 @@ class EngineCore final : public sq::Object<EngineCore, IAudioCallback> {
   // collectGarbage() once a later callback completed: the RT side never sees freed memory.
   bool stopRecording(std::vector<RecordedTake>* takes);
   bool isRecordingSessionActive() const noexcept { return session_.load() != nullptr; }
+  // Any non-RT thread: one or more short MIDI messages (running status allowed; sysex, system
+  // common and realtime bytes are skipped). false when something was dropped (queue full).
+  bool pushLiveMidi(const uint8_t* bytes, uint32_t size) noexcept;
+  uint64_t liveMidiDropped() const noexcept { return liveDropped_.load(); }
+  // Control thread: moves captured MIDI (recording) into out. Returns the number moved.
+  size_t drainCapturedMidi(std::vector<CapturedMidi>& out);
+  // Transport frame where the last record start was applied by the audio thread (-1 = none yet).
+  int64_t recordStartFrame() const noexcept { return recStartFrame_.load(); }
   bool running() const noexcept { return running_.load(); }
   // Waits until the audio thread finished at least one more callback (no-op when not running).
   bool waitForCallback(uint32_t timeoutMs);
@@ -111,6 +151,7 @@ class EngineCore final : public sq::Object<EngineCore, IAudioCallback> {
   Graph* cur_ = nullptr;
   int64_t pos_ = 0;
   bool playing_ = false, recording_ = false, looping_ = false, metronome_ = false, lowLatency_ = false;
+  bool midiCapture_ = false;
   int64_t loopStart_ = 0, loopEnd_ = 0;
   double sampleRate_ = 48000.0;
   double cpuAvg_ = 0.0;
@@ -127,6 +168,12 @@ class EngineCore final : public sq::Object<EngineCore, IAudioCallback> {
   std::atomic<uint32_t> latency_{0};
   std::atomic<uint64_t> generation_{0};
   std::atomic<uint32_t> recordComp_{0};
+  SpscQueue<LiveMidiEvent> live_{1024};
+  std::atomic_flag liveLock_ = ATOMIC_FLAG_INIT;  // producers only
+  std::atomic<uint64_t> liveDropped_{0};
+  SpscQueue<CapturedMidi> capture_{16384};
+  std::atomic<int64_t> recStartFrame_{-1};
+  SpscQueue<AutomationData*> autoRetire_{2048};
   std::unique_ptr<RecordSession> sessionOwner_;
   std::vector<std::pair<uint64_t, std::unique_ptr<RecordSession>>> lingering_;  // (free at epoch, session)
 
@@ -188,6 +235,25 @@ class AudioEngine final : public sq::Object<AudioEngine, IAudioEngine, ITranspor
   // Turns track insert specs (track property "user.inserts") into processors; see plugin_fx.hpp.
   // Takes effect at the next rebuild.
   void setInsertResolver(InsertResolver resolver) { inserts_ = std::move(resolver); }
+  // Turns an instrument track's "user.instrument" spec into its synth prototype (doc_builder.hpp:
+  // empty / unresolvable -> kDefaultInstrument through this resolver -> SineSynth). Takes effect
+  // at the next rebuild.
+  void setInstrumentResolver(InstrumentResolver resolver) { instruments_ = std::move(resolver); }
+
+  // ---- live MIDI ----
+  // Any non-RT thread (MIDI driver threads, the main thread): short MIDI messages for the live
+  // MIDI target tracks; lock-free for the audio thread, bounded (drops on overflow).
+  bool pushLiveMidi(const uint8_t* bytes, uint32_t size) noexcept { return core_->pushLiveMidi(bytes, size); }
+  // Main thread. Live MIDI goes to every ARMED instrument track; when none is armed, to this
+  // track (the GUI sets the selected track; null = none). Non-instrument tracks are ignored.
+  void setLiveMidiTarget(const sq_guid& trackId);
+  const sq_guid& liveMidiTarget() const noexcept { return liveTarget_; }
+  // Track ids currently receiving live MIDI (main thread view).
+  std::vector<sq_guid> liveMidiTracks() const;
+  // While recording with armed instrument tracks the live MIDI is captured; at the record stop
+  // one MIDI clip per armed instrument track is added in the same undo step as the audio takes.
+  // Events captured by the last recording (frames = transport frames).
+  const std::vector<CapturedMidi>& lastMidiTake() const noexcept { return lastMidi_; }
   // Warnings of the last document build (missing media, unavailable inserts).
   const std::vector<std::string>& buildWarnings() const noexcept { return buildWarnings_; }
   // Registers / unregisters this engine as the IAudioEngine service.
@@ -234,6 +300,9 @@ class AudioEngine final : public sq::Object<AudioEngine, IAudioEngine, ITranspor
   sq_result beginRecording();
   sq_result endRecording();
   sq_result commitTakes(const std::vector<RecordedTake>& takes);
+  void appendMidiClips(IEditor* ed, bool* any);
+  void updateLiveTargets(bool post);
+  bool wantsLiveMidi(const TrackDesc& t) const;
   sq_result applyBounce(RenderTask& task);
   void detachDocument();
   void checkDevice();
@@ -324,7 +393,13 @@ class AudioEngine final : public sq::Object<AudioEngine, IAudioEngine, ITranspor
   std::vector<RecordedTake> lastTakes_;
   bool recordingActive_ = false;
   InsertResolver inserts_;
+  InstrumentResolver instruments_;
   std::vector<std::string> buildWarnings_;
+  sq_guid liveTarget_{};
+  std::vector<sq_guid> midiRecTracks_;     // armed instrument tracks of the running recording
+  std::vector<CapturedMidi> capturedMidi_;  // drained while recording
+  std::vector<CapturedMidi> lastMidi_;
+  int64_t midiRecStart_ = -1, midiRecEnd_ = -1;
 };
 
 }  // namespace sq::engine::audio

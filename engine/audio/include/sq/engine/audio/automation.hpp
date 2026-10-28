@@ -1,6 +1,9 @@
 // Squizzy Studio engine/audio - automation lanes (document format, header-only, no engine deps).
 //
-// Track property "user.automation" (string): one lane per line
+// Lanes live in the document model (engine/doc TrackRec::automation, edited with the action
+// edoc::kSetAutomation track:guid param:<target> points:blob(double[2n]); persisted by the archive,
+// moved by the automation-follow side effect). Consumers of IDocument read them through the
+// track's READ-ONLY string property "automation": one lane per line
 //     <target> <ppq>:<value> <ppq>:<value> ...
 // points sorted by ppq; linear interpolation between points, constant before the first / after
 // the last. Values are PLAIN values of the target:

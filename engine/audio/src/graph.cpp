@@ -162,9 +162,10 @@ void applyFaderPan(const float* const* src, uint32_t srcCh, float* const* dst, u
 
 // ---- TrackProcessor ----
 TrackProcessor::TrackProcessor(const TrackDesc& d)
-    : desc_(d), volume_(d.volume), pan_(d.pan), mute_(d.mute), solo_(d.solo), monitor_(d.monitor) {
+    : desc_(d), volume_(d.volume), pan_(d.pan), mute_(d.mute), solo_(d.solo), monitor_(d.monitor), liveMidi_(d.liveMidi) {
   if (desc_.channels == 0) desc_.channels = 1;
   if (desc_.channels > kMaxChannels) desc_.channels = kMaxChannels;
+  std::stable_sort(desc_.midi.begin(), desc_.midi.end(), [](const TimedMidi& x, const TimedMidi& y) { return x.frame < y.frame; });
 }
 ProcessorPtr TrackProcessor::clone() const { return std::make_unique<TrackProcessor>(desc_); }
 bool TrackProcessor::prepare(double sr, uint32_t maxFrames, uint32_t outChannels) {
@@ -181,19 +182,104 @@ bool TrackProcessor::prepare(double sr, uint32_t maxFrames, uint32_t outChannels
   for (auto& p : desc_.inserts)
     if (p) chain_.add(p->clone());
   if (!chain_.prepare(sr, maxFrames, desc_.channels)) return false;
+  instrument_ = desc_.instrument ? desc_.instrument->clone() : nullptr;
+  if (instrument_ && !instrument_->prepare(sr, maxFrames, desc_.channels)) return false;
+  // sequenced events of one block (bounded) + live events + note-offs of a stop/jump
+  blockEvents_.assign(instrument_ ? std::min<size_t>(desc_.midi.size(), 4096) + kLiveCapacity + 16 * 128 : 0, sq_midi_event{});
   allocPlanar(buf_, bufPtrs_, desc_.channels, maxFrames);
   gainInit_ = false;
+  cursor_ = 0;
+  expectNext_ = INT64_MIN;
+  seqPlaying_ = false;
+  liveCount_ = 0;
+  std::memset(seqNotes_, 0, sizeof seqNotes_);
   return true;
 }
 void TrackProcessor::reset() noexcept {
   for (auto& s : sources_) s->reset();
   chain_.reset();
+  if (instrument_) instrument_->reset();
   gainInit_ = false;
+  expectNext_ = INT64_MIN;
+  seqPlaying_ = false;
+  liveCount_ = 0;
+  std::memset(seqNotes_, 0, sizeof seqNotes_);
 }
+uint32_t TrackProcessor::tail() const noexcept { return chain_.tail() + (instrument_ ? instrument_->tail() : 0); }
 int64_t TrackProcessor::contentEnd() const noexcept {
   int64_t e = 0;
   for (auto& s : sources_) e = std::max(e, s->endFrame());
+  if (instrument_ && !desc_.midi.empty()) e = std::max(e, desc_.midi.back().frame + 1);
   return e;
+}
+bool TrackProcessor::pushLiveMidi(const uint8_t* bytes, uint8_t size) noexcept {
+  if (!instrument_ || liveCount_ >= kLiveCapacity || size == 0 || size > 3) return false;
+  sq_midi_event& e = live_[liveCount_++];
+  e.frame_offset = 0;
+  e.bytes[0] = bytes[0];
+  e.bytes[1] = size > 1 ? bytes[1] : 0;
+  e.bytes[2] = size > 2 ? bytes[2] : 0;
+  e.bytes[3] = 0;
+  e.size = size;
+  e.data = nullptr;
+  return true;
+}
+void TrackProcessor::renderInstrument(const ProcessContext& ctx) noexcept {
+  uint32_t n = 0;
+  const uint32_t cap = static_cast<uint32_t>(blockEvents_.size());
+  auto put = [&](uint32_t offset, uint8_t b0, uint8_t b1, uint8_t b2, uint32_t size) {
+    if (n >= cap) return;
+    sq_midi_event& me = blockEvents_[n++];
+    me.frame_offset = offset;
+    me.bytes[0] = b0;
+    me.bytes[1] = b1;
+    me.bytes[2] = b2;
+    me.bytes[3] = 0;
+    me.size = size;
+    me.data = nullptr;
+  };
+  auto releaseSequenced = [&]() {
+    for (uint32_t ch = 0; ch < 16; ++ch)
+      for (uint32_t k = 0; k < 128; ++k)
+        if (seqNotes_[ch][k]) {
+          seqNotes_[ch][k] = 0;
+          put(0, static_cast<uint8_t>(0x80u | ch), static_cast<uint8_t>(k), 0, 3);
+        }
+  };
+  const int64_t t0 = ctx.timelineFrame;
+  const bool playing = ctx.playing;
+  if (!playing) {
+    if (seqPlaying_) releaseSequenced();  // transport stopped: sequenced notes end
+    seqPlaying_ = false;
+    expectNext_ = INT64_MIN;
+  } else if (t0 != expectNext_) {
+    if (seqPlaying_) releaseSequenced();  // locate / loop wrap
+    size_t lo = 0, hi = desc_.midi.size();  // first event at or after t0
+    while (lo < hi) {
+      const size_t mid = (lo + hi) / 2;
+      if (desc_.midi[mid].frame < t0) lo = mid + 1;
+      else hi = mid;
+    }
+    cursor_ = lo;
+  }
+  for (uint32_t i = 0; i < liveCount_; ++i)
+    if (n < cap) blockEvents_[n++] = live_[i];
+  liveCount_ = 0;
+  if (playing) {
+    seqPlaying_ = true;
+    expectNext_ = t0 + ctx.frames;
+    while (cursor_ < desc_.midi.size() && desc_.midi[cursor_].frame < t0 + static_cast<int64_t>(ctx.frames)) {
+      const TimedMidi& e = desc_.midi[cursor_++];
+      const uint8_t st = e.bytes[0] & 0xF0u, ch = e.bytes[0] & 0x0Fu, key = e.bytes[1] & 0x7Fu;
+      if (st == 0x90 && e.bytes[2] > 0) seqNotes_[ch][key] = 1;
+      else if (st == 0x80 || st == 0x90) seqNotes_[ch][key] = 0;
+      put(static_cast<uint32_t>(std::max<int64_t>(0, e.frame - t0)), e.bytes[0], e.bytes[1], e.bytes[2], e.size);
+    }
+  }
+  ProcessContext sc = ctx;
+  sc.midi = blockEvents_.data();
+  sc.midiCount = n;
+  instrument_->process(sc, bufPtrs_.data(), desc_.channels);
 }
 void TrackProcessor::process(const ProcessContext& ctx, float* const* io, uint32_t channels) noexcept {
   const uint32_t ch = desc_.channels;
@@ -203,6 +289,7 @@ void TrackProcessor::process(const ProcessContext& ctx, float* const* io, uint32
     if (!ctx.playing && s->needsPlayback()) continue;
     s->render(ctx, bufPtrs_.data(), ch);
   }
+  if (instrument_) renderInstrument(ctx);
   if (monitor_ && monitorInMain_ && ctx.input && !desc_.inputChannels.empty()) {
     for (uint32_t c = 0; c < ch; ++c) {
       const uint32_t src = desc_.inputChannels[c < desc_.inputChannels.size() ? c : desc_.inputChannels.size() - 1];
@@ -211,8 +298,8 @@ void TrackProcessor::process(const ProcessContext& ctx, float* const* io, uint32
     }
   }
   chain_.process(ctx, bufPtrs_.data(), ch);
-  const float vol = (mute_ || soloSilenced_) ? 0.0f : volume_;
-  applyFaderPan(bufPtrs_.data(), ch, io, channels, n, vol, pan_, curGain_, &gainInit_);
+  const float vol = audible() ? effectiveVolume() : 0.0f;
+  applyFaderPan(bufPtrs_.data(), ch, io, channels, n, vol, effectivePan(), curGain_, &gainInit_);
 }
 
 // ---- SubMixProcessor ----
@@ -275,8 +362,8 @@ void SubMixProcessor::process(const ProcessContext& ctx, float* const* io, uint3
     }
   }
   chain_.process(ctx, workPtrs_.data(), channels_);
-  const float vol = mute_ ? 0.0f : volume_;
-  applyFaderPan(workPtrs_.data(), channels_, io, channels, n, vol, pan_, curGain_, &gainInit_);
+  const float vol = audible() ? effectiveVolume() : 0.0f;
+  applyFaderPan(workPtrs_.data(), channels_, io, channels, n, vol, effectivePan(), curGain_, &gainInit_);
 }
 
 // ---- Metronome ----
@@ -314,7 +401,7 @@ void Metronome::render(int64_t frame, uint32_t frames, float* const* out, uint32
 }
 
 // ---- Graph ----
-Graph::~Graph() = default;
+Graph::~Graph() { delete extAutomation_; }
 
 std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& cfg, std::string* error) {
   auto fail = [&](const char* msg) -> std::unique_ptr<Graph> {
@@ -323,10 +410,17 @@ std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& 
   };
   if (cfg.maxBlock == 0 || cfg.outputChannels == 0 || cfg.outputChannels > kMaxChannels) return fail("invalid graph config");
   const int32_t nb = static_cast<int32_t>(desc.buses.size());
-  for (auto& t : desc.tracks)
+  for (auto& t : desc.tracks) {
     if (t.output < -1 || t.output >= nb) return fail("track routed to a missing bus");
-  for (auto& b : desc.buses)
+    for (auto& sd : t.sends)
+      if (sd.bus < 0 || sd.bus >= nb) return fail("track send to a missing bus");
+  }
+  for (size_t i = 0; i < desc.buses.size(); ++i) {
+    const BusDesc& b = desc.buses[i];
     if (b.output < -1 || b.output >= nb) return fail("bus routed to a missing bus");
+    for (auto& sd : b.sends)
+      if (sd.bus < 0 || sd.bus >= nb || sd.bus == static_cast<int32_t>(i)) return fail("bus send to a missing bus / itself");
+  }
 
   std::unique_ptr<Graph> g(new Graph());
   g->sr_ = desc.sampleRate > 0 ? desc.sampleRate : 48000.0;
@@ -340,11 +434,18 @@ std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& 
   g->numerator_ = desc.numerator ? desc.numerator : 4;
   g->denominator_ = desc.denominator ? desc.denominator : 4;
   g->metronome_.configure(&g->tempo_, g->numerator_, g->denominator_, g->sr_);
+  g->automationKeep_ = desc.automation;
+  g->automation_ = g->automationKeep_.get();
 
-  // topological order of buses (inputs before consumers)
+  // topological order of buses over output + send edges (inputs before consumers)
+  std::vector<std::vector<uint32_t>> busEdges(desc.buses.size());
   std::vector<int32_t> pendingIn(desc.buses.size(), 0);
-  for (auto& b : desc.buses)
-    if (b.output >= 0) ++pendingIn[static_cast<size_t>(b.output)];
+  for (uint32_t i = 0; i < desc.buses.size(); ++i) {
+    const BusDesc& b = desc.buses[i];
+    if (b.output >= 0) busEdges[i].push_back(static_cast<uint32_t>(b.output));
+    for (auto& sd : b.sends) busEdges[i].push_back(static_cast<uint32_t>(sd.bus));
+    for (uint32_t d : busEdges[i]) ++pendingIn[d];
+  }
   std::vector<uint32_t> order;
   std::vector<uint32_t> ready;
   for (uint32_t i = 0; i < desc.buses.size(); ++i)
@@ -353,11 +454,10 @@ std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& 
     const uint32_t b = ready.back();
     ready.pop_back();
     order.push_back(b);
-    const int32_t o = desc.buses[b].output;
-    if (o >= 0 && --pendingIn[static_cast<size_t>(o)] == 0) ready.push_back(static_cast<uint32_t>(o));
+    for (uint32_t d : busEdges[b])
+      if (--pendingIn[d] == 0) ready.push_back(d);
   }
   if (order.size() != desc.buses.size()) return fail("bus routing has a cycle");
-  // Kahn above releases a bus once all its BUS inputs are done; keep a stable order of that.
   g->busOrder_ = order;
 
   auto destChannels = [&](int32_t dest) -> uint32_t {
@@ -389,8 +489,27 @@ std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& 
   g->masterVolume_ = desc.masterVolume;
   allocPlanar(g->masterBuf_, g->masterPtrs_, cfg.outputChannels, cfg.maxBlock);
 
-  // ---- latency bookkeeping ----
+  // sends (edges)
   const size_t nt = g->tracks_.size();
+  g->trackSends_.assign(nt, {});
+  g->busSends_.assign(desc.buses.size(), {});
+  auto addSend = [&](bool fromBus, uint32_t src, const SendDesc& sd) {
+    auto s = std::make_unique<Send>();
+    s->fromBus = fromBus;
+    s->source = src;
+    s->dest = sd.bus;
+    s->pre = sd.pre;
+    s->level = sd.level;
+    allocPlanar(s->buf, s->ptrs, destChannels(sd.bus), cfg.maxBlock);
+    (fromBus ? g->busSends_ : g->trackSends_)[src].push_back(static_cast<uint32_t>(g->sends_.size()));
+    g->sends_.push_back(std::move(s));
+  };
+  for (size_t i = 0; i < nt; ++i)
+    for (auto& sd : desc.tracks[i].sends) addSend(false, static_cast<uint32_t>(i), sd);
+  for (size_t b = 0; b < desc.buses.size(); ++b)
+    for (auto& sd : desc.buses[b].sends) addSend(true, static_cast<uint32_t>(b), sd);
+
+  // ---- latency bookkeeping ----
   g->trackArrival_.resize(nt);
   for (size_t i = 0; i < nt; ++i) g->trackArrival_[i] = g->tracks_[i]->latency();
   std::vector<uint32_t> busMaxIn(desc.buses.size(), 0);
@@ -400,12 +519,17 @@ std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& 
     if (dest < 0) masterMaxIn = std::max(masterMaxIn, arrival);
     else busMaxIn[static_cast<size_t>(dest)] = std::max(busMaxIn[static_cast<size_t>(dest)], arrival);
   };
-  for (size_t i = 0; i < nt; ++i) feed(g->trackDest_[i], g->trackArrival_[i]);
+  for (size_t i = 0; i < nt; ++i) {
+    feed(g->trackDest_[i], g->trackArrival_[i]);
+    for (uint32_t si : g->trackSends_[i]) feed(g->sends_[si]->dest, g->trackArrival_[i]);
+  }
   for (uint32_t b : order) {
     g->busArrival_[b] = busMaxIn[b] + g->buses_[b]->latency();
     feed(g->busDest_[b], g->busArrival_[b]);
+    for (uint32_t si : g->busSends_[b]) feed(g->sends_[si]->dest, g->busArrival_[b]);
   }
   g->latency_ = masterMaxIn + g->master_->latency();
+  g->busMaxIn_ = busMaxIn;
   auto maxIn = [&](int32_t dest) { return dest < 0 ? masterMaxIn : busMaxIn[static_cast<size_t>(dest)]; };
 
   g->trackComp_.resize(nt);
@@ -425,19 +549,29 @@ std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& 
     g->busComp_[b].prepare(ch, maxIn(g->busDest_[b]) - g->busArrival_[b], cfg.maxBlock);
     allocPlanar(g->busOut_[b], g->busOutPtrs_[b], ch, cfg.maxBlock);
   }
+  for (auto& s : g->sends_) {
+    const uint32_t arrival = s->fromBus ? g->busArrival_[s->source] : g->trackArrival_[s->source];
+    s->comp.prepare(destChannels(s->dest), maxIn(s->dest) - arrival, cfg.maxBlock);
+  }
 
   // ---- fast lane: zero-latency clones of each track's inserts ----
   g->fastChains_.resize(nt);
+  g->fastSlot_.assign(nt, {});
   uint32_t maxTrackCh = 1;
   for (size_t i = 0; i < nt; ++i) {
     const TrackDesc& td = desc.tracks[i];
     const uint32_t ch = g->tracks_[i]->channels();
     maxTrackCh = std::max(maxTrackCh, ch);
     for (auto& proto : td.inserts) {
-      if (!proto) continue;
+      if (!proto) continue;  // TrackProcessor skips null prototypes as well
       ProcessorPtr p = proto->clone();
       if (!p->prepare(g->sr_, cfg.maxBlock, ch)) return fail("fast lane prepare failed");
-      if (p->latency() == 0) g->fastChains_[i].add(std::move(p));
+      if (p->latency() == 0) {
+        g->fastSlot_[i].push_back(static_cast<int32_t>(g->fastChains_[i].size()));
+        g->fastChains_[i].add(std::move(p));
+      } else {
+        g->fastSlot_[i].push_back(-1);
+      }
     }
   }
   allocPlanar(g->fastBuf_, g->fastPtrs_, maxTrackCh + cfg.outputChannels, cfg.maxBlock);
@@ -470,6 +604,10 @@ void Graph::reset() noexcept {
   for (auto& d : trackComp_) d.reset();
   for (auto& d : busComp_) d.reset();
   for (auto& d : stemDelay_) d.reset();
+  for (auto& s : sends_) {
+    s->comp.reset();
+    s->init = false;
+  }
   for (auto& c : fastChains_) c.reset();
   for (size_t i = 0; i < tracks_.size(); ++i) fastGainInit_[i] = false;
 }
@@ -503,9 +641,133 @@ uint32_t Graph::maxTail() const noexcept {
   return tt + bt + master_->tail();
 }
 
+// ---- live parameters ----
+void Graph::setTrackParam(size_t track, int32_t slot, uint32_t param, float value) noexcept {
+  if (track >= tracks_.size()) return;
+  TrackProcessor& t = *tracks_[track];
+  if (slot < 0) {
+    if (AudioProcessor* p = t.instrument()) p->setParameter(param, value);
+    return;
+  }
+  if (AudioProcessor* p = t.insert(static_cast<size_t>(slot))) p->setParameter(param, value);
+  const auto& fs = fastSlot_[track];
+  if (static_cast<size_t>(slot) < fs.size() && fs[static_cast<size_t>(slot)] >= 0)
+    if (AudioProcessor* p = fastChains_[track].at(static_cast<size_t>(fs[static_cast<size_t>(slot)]))) p->setParameter(param, value);
+}
+void Graph::setBusParam(size_t bus, int32_t slot, uint32_t param, float value) noexcept {
+  if (bus >= buses_.size() || slot < 0) return;
+  if (AudioProcessor* p = buses_[bus]->insert(static_cast<size_t>(slot))) p->setParameter(param, value);
+}
+void Graph::setMasterParam(int32_t slot, uint32_t param, float value) noexcept {
+  if (slot < 0) return;
+  if (AudioProcessor* p = master_->insert(static_cast<size_t>(slot))) p->setParameter(param, value);
+}
+void Graph::setTrackSendLevel(size_t track, size_t send, float level) noexcept {
+  if (track < trackSends_.size() && send < trackSends_[track].size()) sends_[trackSends_[track][send]]->level = level;
+}
+void Graph::setBusSendLevel(size_t bus, size_t send, float level) noexcept {
+  if (bus < busSends_.size() && send < busSends_[bus].size()) sends_[busSends_[bus][send]]->level = level;
+}
+uint32_t Graph::sendCompensation(size_t track, size_t send) const noexcept {
+  if (track < trackSends_.size() && send < trackSends_[track].size()) return sends_[trackSends_[track][send]]->comp.delay();
+  return 0;
+}
+void Graph::routeLiveMidi(const uint8_t* bytes, uint8_t size) noexcept {
+  for (auto& t : tracks_)
+    if (t->liveMidi()) t->pushLiveMidi(bytes, size);
+}
+
+AutomationData* Graph::swapAutomation(AutomationData* data) noexcept {
+  AutomationData* old = extAutomation_;
+  extAutomation_ = data;
+  automation_ = data ? data : automationKeep_.get();
+  // Restore static values for whatever the old lanes drove; the new lanes apply from the next
+  // block (only while playing).
+  endAutomation();
+  return old;
+}
+
+// ---- automation (RT) ----
+void Graph::applyAutomation(const ProcessContext& ctx) noexcept {
+  const AutomationData* a = automation_;
+  if (!a) return;
+  const double ppqTrack = tempo_.frameToPpq(ctx.timelineFrame);
+  const size_t nt = std::min(tracks_.size(), a->tracks.size());
+  for (size_t i = 0; i < nt; ++i) {
+    TrackProcessor& t = *tracks_[i];
+    for (const AutoLane& l : a->tracks[i]) {
+      switch (l.target) {
+        case AutoTarget::Volume: t.setAutoVolume(dbToGain(l.lane.valueAt(ppqTrack, 0.0))); break;
+        case AutoTarget::Pan: t.setAutoPan(static_cast<float>(std::clamp(l.lane.valueAt(ppqTrack, 0.0), -1.0, 1.0))); break;
+        case AutoTarget::Mute: t.setAutoMute(l.lane.valueAt(ppqTrack, 0.0) >= 0.5); break;
+        case AutoTarget::Send:
+          if (l.slot >= 0 && static_cast<size_t>(l.slot) < trackSends_[i].size()) {
+            Send& s = *sends_[trackSends_[i][static_cast<size_t>(l.slot)]];
+            s.autoLevel = dbToGain(l.lane.valueAt(ppqTrack, 0.0));
+            s.hasAuto = true;
+          }
+          break;
+        case AutoTarget::Insert:
+        case AutoTarget::Instrument:
+          setTrackParam(i, l.target == AutoTarget::Instrument ? -1 : l.slot, l.param,
+                        static_cast<float>(l.lane.valueAt(ppqTrack, l.staticValue)));
+          break;
+      }
+    }
+  }
+  const size_t nb = std::min(buses_.size(), a->buses.size());
+  for (size_t b = 0; b < nb; ++b) {
+    SubMixProcessor& bus = *buses_[b];
+    const double ppq = tempo_.frameToPpq(ctx.timelineFrame - static_cast<int64_t>(busMaxIn_[b]));
+    for (const AutoLane& l : a->buses[b]) {
+      switch (l.target) {
+        case AutoTarget::Volume: bus.setAutoVolume(dbToGain(l.lane.valueAt(ppq, 0.0))); break;
+        case AutoTarget::Pan: bus.setAutoPan(static_cast<float>(std::clamp(l.lane.valueAt(ppq, 0.0), -1.0, 1.0))); break;
+        case AutoTarget::Mute: bus.setAutoMute(l.lane.valueAt(ppq, 0.0) >= 0.5); break;
+        case AutoTarget::Send:
+          if (l.slot >= 0 && static_cast<size_t>(l.slot) < busSends_[b].size()) {
+            Send& s = *sends_[busSends_[b][static_cast<size_t>(l.slot)]];
+            s.autoLevel = dbToGain(l.lane.valueAt(ppq, 0.0));
+            s.hasAuto = true;
+          }
+          break;
+        case AutoTarget::Insert: setBusParam(b, l.slot, l.param, static_cast<float>(l.lane.valueAt(ppq, l.staticValue))); break;
+        case AutoTarget::Instrument: break;
+      }
+    }
+  }
+  automating_ = true;
+}
+
+void Graph::endAutomation() noexcept {
+  for (auto& t : tracks_) t->clearAutomation();
+  for (auto& b : buses_) b->clearAutomation();
+  for (auto& s : sends_) s->hasAuto = false;
+  // automated parameters go back to their static (document) values
+  if (const AutomationData* a = automation_) {
+    for (size_t i = 0; i < std::min(tracks_.size(), a->tracks.size()); ++i)
+      for (const AutoLane& l : a->tracks[i])
+        if (l.target == AutoTarget::Insert || l.target == AutoTarget::Instrument)
+          setTrackParam(i, l.target == AutoTarget::Instrument ? -1 : l.slot, l.param, l.staticValue);
+    for (size_t b = 0; b < std::min(buses_.size(), a->buses.size()); ++b)
+      for (const AutoLane& l : a->buses[b])
+        if (l.target == AutoTarget::Insert) setBusParam(b, l.slot, l.param, l.staticValue);
+  }
+  automating_ = false;
+}
+
 void Graph::sumInto(int32_t dest, float* const* src, uint32_t ch, uint32_t frames) noexcept {
   if (dest < 0) master_->addInput(src, ch, frames);
   else buses_[static_cast<size_t>(dest)]->addInput(src, ch, frames);
+}
+
+void Graph::runSend(Send& s, const float* const* src, uint32_t srcCh, float faderVolume, float pan, bool audible, uint32_t frames) noexcept {
+  const float level = s.hasAuto ? s.autoLevel : s.level;
+  const float vol = audible ? level * (s.pre ? 1.0f : faderVolume) : 0.0f;
+  const uint32_t ch = static_cast<uint32_t>(s.ptrs.size());
+  applyFaderPan(src, srcCh, s.ptrs.data(), ch, frames, vol, s.pre ? 0.0f : pan, s.cur, &s.init);
+  s.comp.process(s.ptrs.data(), ch, frames);
+  sumInto(s.dest, s.ptrs.data(), ch, frames);
 }
 
 void Graph::process(const ProcessContext& ctx, float* const* out, uint32_t outChannels, bool lowLatencyMonitoring,
@@ -516,6 +778,9 @@ void Graph::process(const ProcessContext& ctx, float* const* out, uint32_t outCh
   if (!ctx.timelineExplicit) c2.timelineFrame = ctx.outputFrame + static_cast<int64_t>(latency_);
   c2.midi = nullptr;
   c2.midiCount = 0;
+
+  if (ctx.playing) applyAutomation(c2);
+  else if (automating_) endAutomation();
 
   for (auto& b : buses_) b->clearInput(n);
   master_->clearInput(n);
@@ -533,15 +798,18 @@ void Graph::process(const ProcessContext& ctx, float* const* out, uint32_t outCh
       for (uint32_t c = 0; c < stemChannels_[i]; ++c) std::memcpy(stemPtrs_[i][c], src[c], sizeof(float) * n);
       stemDelay_[i].process(stemPtrs_[i].data(), stemChannels_[i], n);
     }
+    for (uint32_t si : trackSends_[i]) runSend(*sends_[si], t.preFader(), t.channels(), t.effectiveVolume(), t.effectivePan(), t.audible(), n);
     trackComp_[i].process(to, ch, n);
     sumInto(trackDest_[i], to, ch, n);
   }
   // buses
   for (uint32_t b : busOrder_) {
+    SubMixProcessor& bus = *buses_[b];
     float* const* bo = busOutPtrs_[b].data();
     const uint32_t ch = static_cast<uint32_t>(busOutPtrs_[b].size());
-    buses_[b]->process(c2, bo, ch);
+    bus.process(c2, bo, ch);
     meterBlock(meters_, busMeter_[b], bo, ch, n);
+    for (uint32_t si : busSends_[b]) runSend(*sends_[si], bus.preFader(), bus.channels(), bus.effectiveVolume(), bus.effectivePan(), bus.audible(), n);
     busComp_[b].process(bo, ch, n);
     sumInto(busDest_[b], bo, ch, n);
   }
@@ -580,8 +848,8 @@ void Graph::processFastLane(const ProcessContext& ctx, float* const* out, uint32
     const uint32_t oc = std::min<uint32_t>(outChannels, static_cast<uint32_t>(fastPtrs_.size()) - ch);
     // Same fader/pan law, mute/solo and master volume as the main path (no level jump when the
     // fast lane is toggled); the gain ramps per track across blocks like the main fader.
-    const float vol = t.audible() ? t.volume() : 0.0f;
-    applyFaderPan(fb, ch, fo, oc, n, vol, t.pan(), &fastGain_[i * kMaxChannels], &fastGainInit_[i]);
+    const float vol = t.audible() ? t.effectiveVolume() : 0.0f;
+    applyFaderPan(fb, ch, fo, oc, n, vol, t.effectivePan(), &fastGain_[i * kMaxChannels], &fastGainInit_[i]);
     const float mv = masterVolume_;
     for (uint32_t c = 0; c < oc; ++c)
       for (uint32_t k = 0; k < n; ++k) out[c][k] += fo[c][k] * mv;

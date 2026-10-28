@@ -18,9 +18,30 @@
 //   File.ExportDawProject path / File.ImportDawProject path (new document)
 //   Transport.Play / Stop / Record (toggles) / Rewind / ToggleLoop / ToggleMetronome
 //   Edit.Undo / Edit.Redo                        + every engine/edit command (Edit.*, Navigate.*)
-//   Track.AddAudio name? channels? / Track.AddInstrument name?    -> result "node"
+//   Track.AddAudio name? channels? / Track.AddInstrument name? instrument?:<spec> (default
+//                    builtin|synth|) / Track.AddDrums name? (builtin|drums|) / Track.AddBus name? /
+//                    Track.AddFx name?           -> result "node"; the new track becomes the selected one
+//   Track.Select track / Track.Info track?       info: kind, instrument, inserts, sends, lanes, clips, meter peak
+//   Track.Remove track? / Track.Rename track? name / Track.SetColor track? color:0xRRGGBBAA
+//   Track.SetOutput track? bus:<bus|fx track|master> / Track.Move track? index
 //   Track.ToggleArm track? / Track.SetInput track? channel:int
+//   Track.SetInstrument track? spec / Track.SetInstrumentParam track? param:int value merge?:bool
+//   Track.AddInsert track? spec index? (-> "slot") / Track.RemoveInsert track? slot /
+//   Track.MoveInsert track? slot to / Track.SetInsertParam track? slot param value merge? /
+//   Track.BypassInsert track? slot bypass?:bool (toggles; bypassed lines start with '!')
+//   Track.AddSend track? bus level?:dB pre?:bool (-> "send") / Track.SetSendLevel track? send level merge? /
+//   Track.RemoveSend track? send
 //   Track.InsertPlugin track? plugin:"<format>:<id>" params?:"<id>=<value>;..."
+//   Automation.SetLane track? target points:"ppq:value ..." / Automation.AddPoint track? target ppq value /
+//   Automation.RemoveLane track? target          targets: volume pan mute send.<n> insert.<slot>.<p> instrument.<p>
+//                                                (edoc::kSetAutomation; one undo step each)
+//   Clip.CreateMidi track? start? length? name?  -> "node", selects the clip
+//   Clip.SetNotes clip? notes:"pos,len,pitch,vel;..." ('/' also separates notes) / Clip.Rename clip? name /
+//   Clip.SetColor clip? color                    clip? = GUID, default the first selected clip
+//   Song.SetTempo bpm position? / Song.SetSignature num den position?
+//   Transport.Locate ppq / Transport.SetLoop start end enabled?:bool / Transport.Wait ms (pumps idle)
+//   Midi.ListInputs (-> "count", "inputs") / Midi.OpenInputs / Midi.Inject bytes:"90,60,100" (status
+//                    byte hex, data decimal, "0x" forces hex; several messages allowed)
 //   Plugins.Rescan full?:bool                    (async; IPluginRegistry::isScanning)
 //   Browser.IndexFolder folder / Browser.Search text? tags? kind? limit?  -> result "count", "first"
 //   Script.Evaluate source / Script.LoadPackage path
@@ -41,7 +62,12 @@
 //   Account.Status / Account.SignIn / Account.SignOut   ICloudAccount (cloud-client; optional)
 //   Video.Probe path                             IVideoEngine -> "width", "height", "duration_ns", "backend"
 //   <any script command>                         from the scripting catalog (object://scripting)
-// `track?` = args "track" (guid) or "track_index" (int); default: the last track.
+// `track?` = args "track" (GUID, GUID text, track name or index) or "track_index" (int); default:
+// the selected track (edit.track journal, Navigate.SetEditState), else the last track. The
+// selected track is also the engine's live MIDI target (AudioEngine::setLiveMidiTarget).
+// Live MIDI: every input of the MIDI drivers is opened at startup in the window
+// (Devices.Midi.Enabled; batch modes only with Devices.Midi.LiveInputHeadless or Midi.OpenInputs)
+// and forwarded to AudioEngine::pushLiveMidi; port hot-plug re-scans on driver notification.
 #pragma once
 
 #include <memory>

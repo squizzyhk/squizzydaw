@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 
@@ -144,6 +145,22 @@ void trackProps(const TrackRec& t, IAttributes* d) {
   d->setString("timebase", t.timebase.c_str());
   d->setBool("chordTrack", t.chordTrack ? SQ_TRUE : SQ_FALSE);
   d->setBool("followChords", t.followChords ? SQ_TRUE : SQ_FALSE);
+  // Read-only text view of the automation lanes for consumers of IDocument (engine/audio parses
+  // it with parseAutomation): one lane per line "<param> <ppq>:<value> ..." (automation.hpp).
+  {
+    std::string lanes;
+    char buf[64];
+    for (const auto& [param, pts] : t.automation) {
+      if (param.empty()) continue;
+      lanes += param;
+      for (const AutoPoint& pt : pts) {
+        std::snprintf(buf, sizeof buf, " %.10g:%.10g", pt.pos, pt.value);
+        lanes += buf;
+      }
+      lanes += '\n';
+    }
+    d->setString("automation", lanes.c_str());
+  }
   putUser(t.user, d);
 }
 void clipProps(const ClipRec& c, IAttributes* d) {
@@ -233,7 +250,7 @@ sq_result setTrackProp(TrackRec& t, const std::string& k, IAttributes* s, const 
   }
   if (k == "chordTrack") return boolean(s, vk, t.chordTrack);
   if (k == "followChords") return boolean(s, vk, t.followChords);
-  if (k == "kind" || k == "parent") return SQ_E_ACCESS;
+  if (k == "kind" || k == "parent" || k == "automation") return SQ_E_ACCESS;  // automation: edoc::kSetAutomation
   if (isUserKey(k)) return setUser(t.user, k, s, vk);
   return SQ_E_NOTFOUND;
 }

@@ -24,6 +24,8 @@ EngineCore::~EngineCore() {
   lingering_.clear();
   Graph* g = nullptr;
   while (retire_.pop(g)) delete g;
+  AutomationData* a = nullptr;
+  while (autoRetire_.pop(a)) delete a;
   delete pending_.exchange(nullptr);
   delete cur_;
   cur_ = nullptr;
@@ -50,6 +52,8 @@ void EngineCore::setGraph(std::unique_ptr<Graph> g) {
 void EngineCore::collectGarbage() {
   Graph* g = nullptr;
   while (retire_.pop(g)) delete g;
+  AutomationData* a = nullptr;
+  while (autoRetire_.pop(a)) delete a;
   if (!lingering_.empty()) {
     const bool idle = !running_.load();
     const uint64_t now = epoch_.load(std::memory_order_acquire);
@@ -69,6 +73,56 @@ bool EngineCore::post(const Command& c) {
     return true;
   }
   return cmds_.push(c);
+}
+
+bool EngineCore::pushLiveMidi(const uint8_t* bytes, uint32_t size) noexcept {
+  if (!bytes || size == 0) return true;
+  bool ok = true;
+  while (liveLock_.test_and_set(std::memory_order_acquire)) {
+  }
+  uint8_t status = 0;
+  uint32_t i = 0;
+  while (i < size) {
+    const uint8_t b = bytes[i];
+    if (b >= 0xF8) {  // realtime: skip
+      ++i;
+      continue;
+    }
+    if (b >= 0xF0) {  // sysex / system common: skip up to the next status byte
+      status = 0;
+      ++i;
+      while (i < size && bytes[i] < 0x80) ++i;
+      continue;
+    }
+    if (b & 0x80) {
+      status = b;
+      ++i;
+    }
+    if (!status) {  // data byte without a status
+      ++i;
+      continue;
+    }
+    const uint32_t dataLen = ((status & 0xF0u) == 0xC0 || (status & 0xF0u) == 0xD0) ? 1u : 2u;
+    if (i + dataLen > size) break;  // incomplete message
+    LiveMidiEvent e{{status, bytes[i], dataLen > 1 ? bytes[i + 1] : uint8_t{0}}, static_cast<uint8_t>(1 + dataLen)};
+    i += dataLen;
+    if (!live_.push(e)) {
+      liveDropped_.fetch_add(1, std::memory_order_relaxed);
+      ok = false;
+    }
+  }
+  liveLock_.clear(std::memory_order_release);
+  return ok;
+}
+
+size_t EngineCore::drainCapturedMidi(std::vector<CapturedMidi>& out) {
+  size_t n = 0;
+  CapturedMidi c;
+  while (capture_.pop(c)) {
+    out.push_back(c);
+    ++n;
+  }
+  return n;
 }
 
 void EngineCore::setDeviceLatency(uint32_t inFrames, uint32_t outFrames) noexcept { recordComp_.store(inFrames + outFrames); }
@@ -186,18 +240,40 @@ void EngineCore::apply(const Command& c) noexcept {
       looping_ = c.value != 0.0 && c.b > c.a;
       break;
     case CmdType::Metronome: metronome_ = c.value != 0.0; break;
-    case CmdType::Record: recording_ = c.value != 0.0; break;
+    case CmdType::Record:
+      recording_ = c.value != 0.0;
+      if (recording_) recStartFrame_.store(pos_, std::memory_order_relaxed);
+      break;
+    case CmdType::MidiCapture: midiCapture_ = c.value != 0.0; break;
+    case CmdType::SetAutomation: {
+      auto* data = static_cast<AutomationData*>(c.ptr);
+      AutomationData* old = data;
+      if (cur_ && c.generation == cur_->generation()) old = cur_->swapAutomation(data);
+      if (old && !autoRetire_.push(old)) {
+        // Cannot happen (the control thread drains the queue before every post); never free here.
+      }
+      break;
+    }
     case CmdType::LowLatency: lowLatency_ = c.value != 0.0; break;
     case CmdType::MasterVolume:
       if (cur_) cur_->setMasterVolume(static_cast<float>(c.value));
       break;
     default: {
-      if (!cur_ || c.generation != cur_->generation() || c.index < 0) break;
+      if (!cur_ || c.generation != cur_->generation()) break;
+      if (c.type == CmdType::MasterParam) {
+        cur_->setMasterParam(static_cast<int32_t>(c.a), static_cast<uint32_t>(c.b), static_cast<float>(c.value));
+        break;
+      }
+      if (c.index < 0) break;
       const size_t i = static_cast<size_t>(c.index);
-      if (c.type == CmdType::BusVolume || c.type == CmdType::BusMute) {
+      if (c.type == CmdType::BusVolume || c.type == CmdType::BusMute || c.type == CmdType::BusPan || c.type == CmdType::BusParam ||
+          c.type == CmdType::BusSendLevel) {
         if (i >= cur_->busCount()) break;
         if (c.type == CmdType::BusVolume) cur_->bus(i).setVolume(static_cast<float>(c.value));
-        else cur_->bus(i).setMute(c.value != 0.0);
+        else if (c.type == CmdType::BusMute) cur_->bus(i).setMute(c.value != 0.0);
+        else if (c.type == CmdType::BusPan) cur_->bus(i).setPan(static_cast<float>(c.value));
+        else if (c.type == CmdType::BusParam) cur_->setBusParam(i, static_cast<int32_t>(c.a), static_cast<uint32_t>(c.b), static_cast<float>(c.value));
+        else cur_->setBusSendLevel(i, static_cast<size_t>(c.a), static_cast<float>(c.value));
         break;
       }
       if (i >= cur_->trackCount()) break;
@@ -211,6 +287,9 @@ void EngineCore::apply(const Command& c) noexcept {
           cur_->updateSolo();
           break;
         case CmdType::TrackMonitor: t.setMonitor(c.value != 0.0); break;
+        case CmdType::TrackLiveMidi: t.setLiveMidi(c.value != 0.0); break;
+        case CmdType::TrackParam: cur_->setTrackParam(i, static_cast<int32_t>(c.a), static_cast<uint32_t>(c.b), static_cast<float>(c.value)); break;
+        case CmdType::TrackSendLevel: cur_->setTrackSendLevel(i, static_cast<size_t>(c.a), static_cast<float>(c.value)); break;
         default: break;
       }
       break;
@@ -221,6 +300,9 @@ void EngineCore::apply(const Command& c) noexcept {
 sq_result EngineCore::onStart(const sq_stream_format*, const sq_stream_format* output, const sq_latency_info* latency) {
   if (output) sampleRate_ = output->sample_rate;
   if (latency) recordComp_.store(latency->input_frames + latency->output_frames);
+  LiveMidiEvent stale;
+  while (live_.pop(stale)) {
+  }  // the audio thread is not running yet: we are the only consumer
   collectGarbage();
   installPending();
   running_.store(true);
@@ -250,6 +332,16 @@ void EngineCore::process(const sq_audio_io* io) {
     publish();
     epoch_.fetch_add(1, std::memory_order_acq_rel);
     return;
+  }
+  {
+    LiveMidiEvent e;
+    while (live_.pop(e)) {
+      cur_->routeLiveMidi(e.bytes, e.size);
+      if (recording_ && playing_ && midiCapture_) {
+        CapturedMidi cm{pos_, {e.bytes[0], e.bytes[1], e.bytes[2]}, e.size};
+        capture_.push(cm);  // full: dropped (the control thread drains it in idle())
+      }
+    }
   }
   const sq_audio_block* in = io->input;
   const uint32_t inCh = in ? std::min<uint32_t>(in->channel_count, kMaxChannels) : 0;
@@ -441,6 +533,10 @@ sq_result AudioEngine::compileAndInstall() {
     auto a = armOverride_.find(t.id);
     if (a != armOverride_.end()) t.armed = a->second;
   }
+  for (size_t i = 0; i < d.tracks.size(); ++i) {
+    d.tracks[i].liveMidi = wantsLiveMidi(d.tracks[i]);
+    if (i < desc_.tracks.size()) desc_.tracks[i].liveMidi = d.tracks[i].liveMidi;
+  }
   for (auto& b : d.buses) b.meterSlot = meterSlotFor(b.id);
   d.masterMeterSlot = 0;
   GraphConfig cfg;
@@ -453,7 +549,11 @@ sq_result AudioEngine::compileAndInstall() {
   std::unique_ptr<Graph> g = Graph::compile(d, cfg, &err);
   if (!g) {
     // invalid bus routing (e.g. a cycle from the document): fall back to routing buses to master
-    for (auto& b : d.buses) b.output = -1;
+    // without bus-to-bus sends
+    for (auto& b : d.buses) {
+      b.output = -1;
+      b.sends.clear();
+    }
     g = Graph::compile(d, cfg, &err);
   }
   if (!g) return SQ_E_FAIL;
@@ -487,13 +587,15 @@ sq_result AudioEngine::rebuildFromDocument(bool allowMixOnly) {
   if (doc_) {
     GraphDesc d;
     DocBuildResult info;
-    const sq_result r = buildGraphDesc(doc_.get(), reg_, media_, device_ ? sampleRate_ : 0.0, &d, &info, &inserts_);
+    const sq_result r = buildGraphDesc(doc_.get(), reg_, media_, device_ ? sampleRate_ : 0.0, &d, &info, &inserts_, &instruments_);
     if (SQ_FAILED(r)) return r;
     // Same structure as the installed graph: apply the edit as mixer commands (no recompile, no
     // new plugin instances, no reset of delay lines / fader ramps / plugin state).
     if (allowMixOnly && haveDesc_ && !structureKey_.empty() && info.structureKey == structureKey_ && applyMixChanges(d)) {
       buildWarnings_ = std::move(info.warnings);
+      for (size_t i = 0; i < d.tracks.size() && i < desc_.tracks.size(); ++i) d.tracks[i].liveMidi = desc_.tracks[i].liveMidi;
       desc_ = std::move(d);
+      updateLiveTargets(true);  // arm state may have changed
       return SQ_OK;
     }
     buildWarnings_ = std::move(info.warnings);
@@ -507,48 +609,180 @@ sq_result AudioEngine::rebuildFromDocument(bool allowMixOnly) {
   return compileAndInstall();
 }
 
-// Posts the mixer differences between desc_ (what the installed graph was built from, plus the
-// commands already applied) and `next` (same structure key). false = not expressible as commands
-// (or the command queue is full): the caller recompiles instead.
+namespace {
+bool sameLanes(const std::vector<AutoLane>& a, const std::vector<AutoLane>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    const AutoLane& x = a[i];
+    const AutoLane& y = b[i];
+    if (x.target != y.target || x.slot != y.slot || x.param != y.param || x.staticValue != y.staticValue ||
+        x.lane.target != y.lane.target || x.lane.points != y.lane.points)
+      return false;
+  }
+  return true;
+}
+bool sameAutomation(const AutomationData* a, const AutomationData* b) {
+  static const AutomationData kEmpty;
+  if (!a) a = &kEmpty;
+  if (!b) b = &kEmpty;
+  auto strips = [](const std::vector<std::vector<AutoLane>>& x, const std::vector<std::vector<AutoLane>>& y) {
+    const size_t n = std::max(x.size(), y.size());
+    static const std::vector<AutoLane> none;
+    for (size_t i = 0; i < n; ++i)
+      if (!sameLanes(i < x.size() ? x[i] : none, i < y.size() ? y[i] : none)) return false;
+    return true;
+  };
+  return strips(a->tracks, b->tracks) && strips(a->buses, b->buses);
+}
+// Parameter differences of one processor (old -> next spec values). false = not expressible
+// (a value went back to an unknown default).
+bool paramDiff(const ParamList& oldP, const ParamList& newP, const ProcessorProto& nextProto, std::vector<std::pair<uint32_t, double>>* out) {
+  for (const auto& [id, v] : newP) {
+    bool same = false;
+    for (const auto& [oid, ov] : oldP)
+      if (oid == id) same = ov == v;
+    if (!same) out->emplace_back(id, v);
+  }
+  for (const auto& [oid, ov] : oldP) {
+    bool present = false;
+    for (const auto& [id, v] : newP) present = present || id == oid;
+    if (present) continue;
+    if (!nextProto || oid >= nextProto->parameterCount()) return false;
+    out->emplace_back(oid, static_cast<double>(nextProto->parameter(oid)));
+  }
+  return true;
+}
+}  // namespace
+
+// Posts the differences between desc_ (what the installed graph was built from, plus the commands
+// already applied) and `next` (same structure key): mixer values, insert/instrument parameters,
+// send levels, live-MIDI routing and automation. false = not expressible as commands (or the
+// command queue is full): the caller recompiles instead.
 bool AudioEngine::applyMixChanges(const GraphDesc& next) {
   if (next.tracks.size() != desc_.tracks.size() || next.buses.size() != desc_.buses.size()) return false;
-  for (size_t b = 0; b < next.buses.size(); ++b)
-    if (next.buses[b].pan != desc_.buses[b].pan) return false;  // no RT bus-pan command
+  if (next.masterInserts.size() != desc_.masterInserts.size()) return false;
   std::vector<Command> cmds;
   const uint64_t gen = core_->currentGeneration();
-  auto add = [&](CmdType type, size_t index, double value) {
+  auto add = [&](CmdType type, int64_t index, double value, int64_t a = 0, int64_t b = 0) {
     Command c;
     c.type = type;
     c.index = static_cast<int32_t>(index);
     c.generation = gen;
     c.value = value;
+    c.a = a;
+    c.b = b;
     cmds.push_back(c);
+  };
+  auto params = [&](CmdType type, int64_t index, const std::vector<ParamList>& oldL, const std::vector<ParamList>& newL,
+                    const std::vector<ProcessorProto>& protos) {
+    if (oldL.size() != newL.size()) return false;
+    for (size_t k = 0; k < newL.size(); ++k) {
+      std::vector<std::pair<uint32_t, double>> diff;
+      if (!paramDiff(oldL[k], newL[k], k < protos.size() ? protos[k] : nullptr, &diff)) return false;
+      for (const auto& [id, v] : diff) add(type, index, v, static_cast<int64_t>(k), id);
+    }
+    return true;
   };
   for (size_t i = 0; i < next.tracks.size(); ++i) {
     const TrackDesc& o = desc_.tracks[i];
     const TrackDesc& n = next.tracks[i];
-    if (!(o.id == n.id)) return false;
-    if (o.volume != n.volume) add(CmdType::TrackVolume, i, n.volume);
-    if (o.pan != n.pan) add(CmdType::TrackPan, i, n.pan);
-    if (o.mute != n.mute) add(CmdType::TrackMute, i, n.mute ? 1.0 : 0.0);
-    if (o.solo != n.solo) add(CmdType::TrackSolo, i, n.solo ? 1.0 : 0.0);
+    if (!(o.id == n.id) || o.sends.size() != n.sends.size()) return false;
+    if (o.volume != n.volume) add(CmdType::TrackVolume, static_cast<int64_t>(i), n.volume);
+    if (o.pan != n.pan) add(CmdType::TrackPan, static_cast<int64_t>(i), n.pan);
+    if (o.mute != n.mute) add(CmdType::TrackMute, static_cast<int64_t>(i), n.mute ? 1.0 : 0.0);
+    if (o.solo != n.solo) add(CmdType::TrackSolo, static_cast<int64_t>(i), n.solo ? 1.0 : 0.0);
     if (monitorOverride_.find(n.id) == monitorOverride_.end() && o.monitor != n.monitor)
-      add(CmdType::TrackMonitor, i, n.monitor ? 1.0 : 0.0);
+      add(CmdType::TrackMonitor, static_cast<int64_t>(i), n.monitor ? 1.0 : 0.0);
+    if (!params(CmdType::TrackParam, static_cast<int64_t>(i), o.insertParams, n.insertParams, n.inserts)) return false;
+    if (n.instrument) {
+      std::vector<std::pair<uint32_t, double>> diff;
+      if (!paramDiff(o.instrumentParams, n.instrumentParams, n.instrument, &diff)) return false;
+      for (const auto& [id, v] : diff) add(CmdType::TrackParam, static_cast<int64_t>(i), v, -1, id);
+    }
+    for (size_t k = 0; k < n.sends.size(); ++k)
+      if (o.sends[k].level != n.sends[k].level) add(CmdType::TrackSendLevel, static_cast<int64_t>(i), n.sends[k].level, static_cast<int64_t>(k));
   }
   for (size_t b = 0; b < next.buses.size(); ++b) {
-    if (!(desc_.buses[b].id == next.buses[b].id)) return false;
-    if (desc_.buses[b].volume != next.buses[b].volume) add(CmdType::BusVolume, b, next.buses[b].volume);
-    if (desc_.buses[b].mute != next.buses[b].mute) add(CmdType::BusMute, b, next.buses[b].mute ? 1.0 : 0.0);
+    const BusDesc& o = desc_.buses[b];
+    const BusDesc& n = next.buses[b];
+    if (!(o.id == n.id) || o.sends.size() != n.sends.size()) return false;
+    if (o.volume != n.volume) add(CmdType::BusVolume, static_cast<int64_t>(b), n.volume);
+    if (o.mute != n.mute) add(CmdType::BusMute, static_cast<int64_t>(b), n.mute ? 1.0 : 0.0);
+    if (o.pan != n.pan) add(CmdType::BusPan, static_cast<int64_t>(b), n.pan);
+    if (!params(CmdType::BusParam, static_cast<int64_t>(b), o.insertParams, n.insertParams, n.inserts)) return false;
+    for (size_t k = 0; k < n.sends.size(); ++k)
+      if (o.sends[k].level != n.sends[k].level) add(CmdType::BusSendLevel, static_cast<int64_t>(b), n.sends[k].level, static_cast<int64_t>(k));
   }
+  if (!params(CmdType::MasterParam, -1, desc_.masterInsertParams, next.masterInsertParams, next.masterInserts)) return false;
   if (desc_.masterVolume != next.masterVolume) {
     Command c;
     c.type = CmdType::MasterVolume;
     c.value = next.masterVolume;
     cmds.push_back(c);
   }
+  const bool autoChanged = !sameAutomation(desc_.automation.get(), next.automation.get());
+  if (cmds.size() + (autoChanged ? 1 : 0) + next.tracks.size() >= 900) return false;  // a burst: recompile instead
   for (const Command& c : cmds)
     if (!core_->post(c)) return false;  // queue full: a recompile installs the new values anyway
+  if (autoChanged) {
+    core_->collectGarbage();  // keeps the automation retire queue drained (it never overflows)
+    Command c;
+    c.type = CmdType::SetAutomation;
+    c.generation = gen;
+    c.ptr = next.automation ? new AutomationData(*next.automation) : new AutomationData();
+    if (!core_->post(c)) {
+      delete static_cast<AutomationData*>(c.ptr);
+      return false;
+    }
+  }
   return true;
+}
+
+bool AudioEngine::wantsLiveMidi(const TrackDesc& t) const {
+  if (!t.instrument) return false;
+  bool anyArmed = false;
+  for (const TrackDesc& x : desc_.tracks) {
+    if (!x.instrument) continue;
+    bool armed = x.armed;
+    auto a = armOverride_.find(x.id);
+    if (a != armOverride_.end()) armed = a->second;
+    anyArmed = anyArmed || armed;
+  }
+  if (anyArmed) {
+    bool armed = t.armed;
+    auto a = armOverride_.find(t.id);
+    if (a != armOverride_.end()) armed = a->second;
+    return armed;
+  }
+  return !sq_guid_is_null(&liveTarget_) && t.id == liveTarget_;
+}
+
+void AudioEngine::updateLiveTargets(bool post) {
+  const uint64_t gen = core_->currentGeneration();
+  for (size_t i = 0; i < desc_.tracks.size(); ++i) {
+    const bool want = wantsLiveMidi(desc_.tracks[i]);
+    if (want == desc_.tracks[i].liveMidi) continue;
+    desc_.tracks[i].liveMidi = want;
+    if (!post) continue;
+    Command c;
+    c.type = CmdType::TrackLiveMidi;
+    c.index = static_cast<int32_t>(i);
+    c.generation = gen;
+    c.value = want ? 1.0 : 0.0;
+    core_->post(c);
+  }
+}
+
+void AudioEngine::setLiveMidiTarget(const sq_guid& trackId) {
+  liveTarget_ = trackId;
+  updateLiveTargets(true);
+}
+
+std::vector<sq_guid> AudioEngine::liveMidiTracks() const {
+  std::vector<sq_guid> out;
+  for (const TrackDesc& t : desc_.tracks)
+    if (t.liveMidi) out.push_back(t.id);
+  return out;
 }
 
 sq_result AudioEngine::setGraphDesc(GraphDesc desc) {
@@ -850,6 +1084,7 @@ sq_result AudioEngine::setTrackArmed(const sq_guid& id, bool armed) {
   const int32_t i = trackIndex(id);
   if (i < 0) return SQ_E_NOTFOUND;
   desc_.tracks[static_cast<size_t>(i)].armed = armed;
+  updateLiveTargets(true);
   return SQ_OK;
 }
 
@@ -954,13 +1189,20 @@ sq_result AudioEngine::getTransportState(sq_transport_state* out) {
 // ---- recording ----
 sq_result AudioEngine::beginRecording() {
   auto session = std::make_unique<RecordSession>();
+  midiRecTracks_.clear();
+  capturedMidi_.clear();
   const std::string dir = mediaFolder();
   std::string ext = settings_ ? sq::getString(settings_, "Media.RecordFormat", "wav") : "wav";
   for (auto& t : desc_.tracks) {
     bool armed = t.armed;
     auto a = armOverride_.find(t.id);
     if (a != armOverride_.end()) armed = a->second;
-    if (!armed || t.inputChannels.empty()) continue;
+    if (!armed) continue;
+    if (t.instrument) {  // instrument tracks record the live MIDI, not the device input
+      midiRecTracks_.push_back(t.id);
+      continue;
+    }
+    if (t.inputChannels.empty()) continue;
     const std::string path = uniquePath(dir, sanitize(t.name) + "_take", ext);
     sq::Ptr<IAudioFileWriter> w;
     sq_result r = openRenderWriter(reg_, path, ext, sampleRate_, t.channels, SQ_SAMPLE_F32, nullptr, &w);
@@ -968,9 +1210,15 @@ sq_result AudioEngine::beginRecording() {
     const size_t ring = static_cast<size_t>(sampleRate_ * 4.0);
     session->addStream(std::make_unique<RecordStream>(t.id, t.channels, t.inputChannels, std::move(w), path, ring));
   }
-  if (session->streamCount() == 0) return SQ_S_FALSE;
-  core_->startRecording(std::move(session));
+  if (session->streamCount() == 0 && midiRecTracks_.empty()) return SQ_S_FALSE;
+  if (session->streamCount() > 0) core_->startRecording(std::move(session));
   recordingActive_ = true;
+  std::vector<CapturedMidi> drop;
+  core_->drainCapturedMidi(drop);  // events of an earlier capture that arrived late
+  Command m;
+  m.type = CmdType::MidiCapture;
+  m.value = midiRecTracks_.empty() ? 0.0 : 1.0;
+  core_->post(m);
   Command c;
   c.type = CmdType::Record;
   c.value = 1.0;
@@ -981,14 +1229,93 @@ sq_result AudioEngine::beginRecording() {
 sq_result AudioEngine::endRecording() {
   if (!recordingActive_) return SQ_S_FALSE;
   recordingActive_ = false;
+  midiRecEnd_ = core_->transport().frame;
   Command c;
   c.type = CmdType::Record;
   c.value = 0.0;
   core_->post(c);
   std::vector<RecordedTake> takes;
-  if (!core_->stopRecording(&takes)) return SQ_S_FALSE;
+  const bool audio = core_->stopRecording(&takes);
+  if (!audio) core_->waitForCallback(250);  // the live events before the stop have been captured
+  Command m;
+  m.type = CmdType::MidiCapture;
+  m.value = 0.0;
+  core_->post(m);
+  core_->drainCapturedMidi(capturedMidi_);
+  midiRecStart_ = core_->recordStartFrame();
+  lastMidi_ = capturedMidi_;
+  capturedMidi_.clear();
   lastTakes_ = std::move(takes);
-  return commitTakes(lastTakes_);
+  if (!audio && midiRecTracks_.empty()) return SQ_S_FALSE;
+  const sq_result r = commitTakes(lastTakes_);
+  midiRecTracks_.clear();
+  return r;
+}
+
+// One MIDI clip per armed instrument track from the captured live events: from the record start
+// to the record stop (or the last event), notes paired into note events with lengths.
+void AudioEngine::appendMidiClips(IEditor* ed, bool* any) {
+  *any = false;
+  if (midiRecTracks_.empty() || lastMidi_.empty()) return;
+  int64_t start = midiRecStart_ >= 0 ? midiRecStart_ : lastMidi_.front().frame;
+  int64_t end = midiRecEnd_;
+  for (const CapturedMidi& e : lastMidi_) {
+    start = std::min(start, e.frame);
+    end = std::max(end, e.frame + 1);
+  }
+  if (start < 0) start = 0;
+  const double s = frameToPpq(start);
+  double len = frameToPpq(end) - s;
+  if (!(len > 0)) len = 1.0;
+  constexpr double kMinLen = 1.0 / 256.0;
+  std::vector<sq_clip_event> events;
+  std::vector<bool> used(lastMidi_.size(), false);
+  for (size_t i = 0; i < lastMidi_.size(); ++i) {
+    const CapturedMidi& e = lastMidi_[i];
+    const uint8_t st = e.bytes[0] & 0xF0u;
+    sq_clip_event ce{};
+    ce.struct_size = sizeof ce;
+    ce.position = std::max(0.0, frameToPpq(e.frame) - s);
+    ce.bytes[0] = e.bytes[0];
+    ce.bytes[1] = e.bytes[1];
+    ce.bytes[2] = e.bytes[2];
+    ce.size = e.size;
+    if (st == 0x80 || (st == 0x90 && e.bytes[2] == 0)) continue;  // consumed by its note-on (or orphaned)
+    if (st == 0x90) {
+      double offPpq = s + len;
+      for (size_t k = i + 1; k < lastMidi_.size(); ++k) {
+        const CapturedMidi& o = lastMidi_[k];
+        const uint8_t ost = o.bytes[0] & 0xF0u;
+        if (used[k] || (o.bytes[0] & 0x0Fu) != (e.bytes[0] & 0x0Fu) || o.bytes[1] != e.bytes[1]) continue;
+        if (ost == 0x80 || (ost == 0x90 && o.bytes[2] == 0)) {
+          used[k] = true;
+          offPpq = frameToPpq(o.frame);
+          break;
+        }
+      }
+      ce.length = std::max(kMinLen, offPpq - s - ce.position);
+      if (ce.position + ce.length > len) len = ce.position + ce.length;
+    }
+    events.push_back(ce);
+  }
+  if (events.empty()) return;
+  for (const sq_guid& track : midiRecTracks_) {
+    auto p = sq::makeAttributes();
+    sq_guid t = track;
+    p->setGuid("track", &t);
+    p->setInt("kind", SQ_CLIP_MIDI);
+    p->setDouble("start", s);
+    p->setDouble("length", len);
+    p->setString("name", "Recorded MIDI");
+    auto res = sq::makeAttributes();
+    if (SQ_FAILED(ed->execute(&doc::kAddClip, p.get(), res.get()))) continue;
+    sq_guid clip{};
+    if (SQ_FAILED(res->getGuid("node", &clip))) continue;
+    auto q = sq::makeAttributes();
+    q->setGuid("clip", &clip);
+    q->setBlob("events", events.data(), static_cast<uint32_t>(events.size() * sizeof(sq_clip_event)));
+    if (SQ_SUCCEEDED(ed->execute(&doc::kSetClipEvents, q.get(), nullptr))) *any = true;
+  }
 }
 
 sq_result AudioEngine::commitTakes(const std::vector<RecordedTake>& takes) {
@@ -997,8 +1324,11 @@ sq_result AudioEngine::commitTakes(const std::vector<RecordedTake>& takes) {
   if (SQ_FAILED(doc_->getEditor(ed.put())) || !ed) return SQ_E_FAIL;
   bool any = false;
   for (auto& t : takes) any = any || (t.result == SQ_OK && t.frames > 0);
+  any = any || (!midiRecTracks_.empty() && !lastMidi_.empty());
   if (!any) return SQ_S_FALSE;
   ed->beginTransaction("Record");
+  bool midiAny = false;
+  appendMidiClips(ed.get(), &midiAny);
   const double sr = sampleRate_ > 0 ? sampleRate_ : 48000.0;
   for (auto& t : takes) {
     if (t.result != SQ_OK || t.frames <= 0) continue;
@@ -1288,6 +1618,7 @@ void AudioEngine::checkDevice() {
 void AudioEngine::idle() {
   checkDevice();
   core_->collectGarbage();
+  if (recordingActive_) core_->drainCapturedMidi(capturedMidi_);
   reapOfflineGraphs(false, 0);
   for (size_t i = 0; i < mainThreadTasks_.size();) {
     RenderTask& t = *mainThreadTasks_[i];

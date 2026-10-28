@@ -139,6 +139,35 @@ GraphDesc richScene(int variant) {
   in.inputChannels = {1};
   in.armed = true;
   d.tracks.push_back(in);
+  // instrument track: one synth fed by sequenced + live MIDI, pre-fader send into the bus
+  TrackDesc k;
+  k.id = fakes::newGuid();
+  k.name = "k";
+  k.channels = 2;
+  k.instrument = std::make_shared<SineSynth>();
+  k.midi = ev;
+  k.liveMidi = true;
+  k.armed = true;  // MIDI capture while recording
+  k.sends.push_back(SendDesc{0, 0.5f, true});
+  d.tracks.push_back(k);
+  // automation: track volume/pan/mute, a send level, an insert parameter, a bus lane
+  auto au = std::make_shared<AutomationData>();
+  au->tracks.resize(d.tracks.size());
+  au->buses.resize(1);
+  auto lane = [](AutoTarget t, int32_t slot, const char* target) {
+    AutoLane l;
+    l.target = t;
+    l.slot = slot;
+    l.lane.target = target;
+    l.lane.points = {{0.0, 0.0}, {2.0, -12.0}, {4.0, -3.0}};
+    return l;
+  };
+  au->tracks[0].push_back(lane(AutoTarget::Volume, -1, "volume"));
+  au->tracks[0].push_back(lane(AutoTarget::Insert, 0, "insert.0.0"));
+  au->tracks[3].push_back(lane(AutoTarget::Send, 0, "send.0"));
+  au->tracks[3].push_back(lane(AutoTarget::Mute, -1, "mute"));
+  au->buses[0].push_back(lane(AutoTarget::Pan, -1, "pan"));
+  d.automation = au;
   return d;
 }
 
@@ -197,6 +226,8 @@ SQ_TEST("rtsafety: no allocation on the audio thread across engine features") {
       case 4: REQUIRE_OK(eng->setGraphDesc(richScene(i))); break;  // lock-free graph swap
       default: eng->locate(static_cast<double>(i % 4)); break;
     }
+    const uint8_t note[6] = {0x90, static_cast<uint8_t>(60 + i % 12), 100, 0x80, static_cast<uint8_t>(60 + (i + 11) % 12), 0};
+    eng->pushLiveMidi(note, 6);  // live MIDI routed + captured on the audio thread
     sq_meter_value mv[8];
     uint32_t cnt = 0;
     eng->getMeter(nullptr, mv, 8, &cnt);

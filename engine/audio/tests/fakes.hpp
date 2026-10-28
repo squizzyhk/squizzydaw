@@ -194,9 +194,11 @@ class NodeBase : public sq::Object<D, I> {
   sq_result SQ_CALL getChild(uint32_t, sq::INode**) override { return SQ_E_NOTFOUND; }
   sq_result SQ_CALL getProperties(sq::IAttributes* dst) override {
     for (auto& kv : intProps) dst->setInt(kv.first.c_str(), kv.second);
+    for (auto& kv : strProps) dst->setString(kv.first.c_str(), kv.second.c_str());
     return SQ_OK;
   }
   std::map<std::string, int64_t> intProps;
+  std::map<std::string, std::string> strProps;  // e.g. user.inserts, user.instrument, automation
 
   static sq_result str(const std::string& s, char* buf, uint32_t bufSize, uint32_t* needed) {
     const uint32_t need = static_cast<uint32_t>(s.size() + 1);
@@ -279,6 +281,8 @@ struct ActionLog {
   sq_guid node{};
   double a = 0, b = 0;
   std::string source;
+  std::vector<sq_clip_event> events;  // "events" (kSetClipEvents)
+  int64_t kind = 0;                   // "add": clip kind
 };
 
 class MDoc;
@@ -290,13 +294,13 @@ class MEditor final : public sq::Object<MEditor, sq::IEditor> {
   int depth = 0;
   sq_result SQ_CALL beginTransaction(const char*) override {
     ++depth;
-    log.push_back({"begin"});
+    log.push_back(ActionLog{"begin", {}, 0, 0, {}, {}, 0});
     return SQ_OK;
   }
   sq_result SQ_CALL commitTransaction() override;
   sq_result SQ_CALL cancelTransaction() override {
     --depth;
-    log.push_back({"cancel"});
+    log.push_back(ActionLog{"cancel", {}, 0, 0, {}, {}, 0});
     return SQ_OK;
   }
   sq_bool SQ_CALL inTransaction() override { return depth > 0; }
@@ -318,9 +322,21 @@ class MEditor final : public sq::Object<MEditor, sq::IEditor> {
       p->getGuid("track", &l.node);
       l.a = p->getDouble("start", 0);
       l.b = p->getDouble("length", 0);
+      l.kind = p->getInt("kind", 0);
       char buf[1024];
       uint32_t need = 0;
       if (p->getString("source", buf, sizeof buf, &need) == SQ_OK) l.source = buf;
+      if (result) {
+        sq_guid g = newGuid();
+        result->setGuid("node", &g);
+      }
+    } else if (*id == sq::doc::kSetClipEvents) {
+      l.action = "events";
+      p->getGuid("clip", &l.node);
+      uint32_t need = 0;
+      p->getBlob("events", nullptr, 0, &need);
+      l.events.resize(need / sizeof(sq_clip_event));
+      if (need) p->getBlob("events", l.events.data(), need, &need);
     } else {
       return SQ_E_NOTIMPL;
     }
@@ -425,7 +441,7 @@ class MDoc final : public NodeBase<MDoc, sq::IDocument>, public sq::ISubject {
 
 inline sq_result MEditor::commitTransaction() {
   --depth;
-  log.push_back({"commit"});
+  log.push_back(ActionLog{"commit", {}, 0, 0, {}, {}, 0});
   if (depth == 0 && doc) doc->fireChanged();
   return SQ_OK;
 }

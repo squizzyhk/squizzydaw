@@ -19,6 +19,28 @@
 //   comes out of the graph is timeline-aligned whatever the plugin delay.
 //   The fast lane (low-latency monitoring) bypasses all of this: device input -> zero-latency
 //   inserts of the monitored track -> fader/pan -> device output, no compensation.
+//   SENDS are edges too: a send from a track (or bus) to bus B arrives with the arrival of its
+//   source (track: insert chain latency; bus: arrival(bus) incl. its chain), maxIn(B) is the max
+//   over B's output inputs AND send inputs, and every send edge gets its own compensation delay
+//   maxIn(B) - arrival(source). Send edges also order the buses (topological order over output +
+//   send edges); a cycle fails compile (the doc builder already drops cyclic sends).
+//
+// INSTRUMENTS
+//   A track with TrackDesc::instrument owns ONE synth instance. Its sequenced events
+//   (TrackDesc::midi, timeline frames, read at ctx.timelineFrame while playing) and the live MIDI
+//   routed to it (Graph::routeLiveMidi, tracks with liveMidi set) are merged per block and fed to
+//   that synth, which renders whether or not the transport plays (live play while stopped). On a
+//   transport stop / locate / loop wrap the track sends note-offs for the sequenced notes it
+//   started (no note chasing into a locate position yet).
+//
+// AUTOMATION (automation.hpp format, resolved per graph into AutomationData)
+//   While playing, Graph::process evaluates every lane at the ppq of the block (tracks: the source
+//   read position; buses: that minus their input arrival) and applies it before processing the
+//   strip: volume/pan/mute as overrides of the static mixer values (the fader ramp smooths them),
+//   send levels likewise, insert/instrument parameters through AudioProcessor::setParameter. When
+//   the transport stops the overrides are dropped (static values again) and automated parameters
+//   go back to AutoLane::staticValue. The live engine can swap a graph's automation without a
+//   recompile (Graph::swapAutomation, see engine.hpp); offline renders use the compiled copy.
 #pragma once
 
 #include <atomic>
@@ -28,6 +50,7 @@
 #include <vector>
 
 #include "sq/guid.h"
+#include "sq/engine/audio/automation.hpp"
 #include "sq/engine/audio/nodes.hpp"
 #include "sq/engine/audio/processor.hpp"
 
@@ -74,12 +97,48 @@ class TempoMapRt {
   double sr_ = 48000.0;
 };
 
+// Parameter values written in an insert / instrument spec: (index, plain value).
+using ParamList = std::vector<std::pair<uint32_t, double>>;
+
+struct SendDesc {
+  int32_t bus = -1;                    // destination bus index
+  float level = 1.0f;                  // linear
+  bool pre = false;                    // pre-fader (post-insert) instead of post-fader
+};
+
+// One resolved automation lane (see AUTOMATION above).
+enum class AutoTarget : uint8_t { Volume, Pan, Mute, Send, Insert, Instrument };
+struct AutoLane {
+  AutoTarget target = AutoTarget::Volume;
+  int32_t slot = -1;                   // Send: send index; Insert: chain index (bypassed/failed lines skipped)
+  uint32_t param = 0;                  // Insert / Instrument parameter index
+  float staticValue = 0.0f;            // Insert / Instrument: value restored when the transport stops
+  AutomationLane lane;                 // ppq points; volume/send in dB, pan -1..1, mute 0/1
+};
+struct AutomationData {
+  std::vector<std::vector<AutoLane>> tracks;  // indexed like GraphDesc::tracks (may be shorter)
+  std::vector<std::vector<AutoLane>> buses;   // indexed like GraphDesc::buses (may be shorter)
+  bool empty() const noexcept {
+    for (auto& t : tracks)
+      if (!t.empty()) return false;
+    for (auto& b : buses)
+      if (!b.empty()) return false;
+    return true;
+  }
+};
+
 struct TrackDesc {
   sq_guid id{};
   std::string name;
   uint32_t channels = 2;               // internal channel count of the track
   std::vector<SourceProto> sources;    // summed
   std::vector<ProcessorProto> inserts; // insert chain (serial)
+  std::vector<ParamList> insertParams; // per inserts[] entry: values written in its spec
+  ProcessorProto instrument;           // instrument track: its one synth (null = audio track)
+  ParamList instrumentParams;
+  std::vector<TimedMidi> midi;         // sequenced events for the instrument (timeline frames)
+  bool liveMidi = false;               // receives live MIDI (Graph::routeLiveMidi)
+  std::vector<SendDesc> sends;
   float volume = 1.0f;                 // linear
   float pan = 0.0f;                    // -1..1
   bool mute = false;
@@ -96,6 +155,8 @@ struct BusDesc {
   std::string name;
   uint32_t channels = 2;
   std::vector<ProcessorProto> inserts;
+  std::vector<ParamList> insertParams;
+  std::vector<SendDesc> sends;         // to other buses (cycles are rejected)
   float volume = 1.0f;
   float pan = 0.0f;
   bool mute = false;
@@ -108,11 +169,13 @@ struct GraphDesc {
   std::vector<TrackDesc> tracks;
   std::vector<BusDesc> buses;
   std::vector<ProcessorProto> masterInserts;
+  std::vector<ParamList> masterInsertParams;
   float masterVolume = 1.0f;
   int32_t masterMeterSlot = 0;
   std::vector<TempoSegment> tempo;     // empty = 120 bpm from frame 0
   uint32_t numerator = 4;
   uint32_t denominator = 4;
+  std::shared_ptr<const AutomationData> automation;  // null = none
 };
 
 struct GraphConfig {
@@ -126,10 +189,11 @@ struct GraphConfig {
 
 class Graph;
 
-// Track strip: sources -> (input monitor) -> inserts -> fader/pan. A processor variant whose
-// process() writes the strip output (destination channel count) into io.
+// Track strip: sources (+ instrument) -> (input monitor) -> inserts -> fader/pan. A processor
+// variant whose process() writes the strip output (destination channel count) into io.
 class TrackProcessor final : public AudioProcessor {
  public:
+  static constexpr uint32_t kLiveCapacity = 256;  // live MIDI events per block
   explicit TrackProcessor(const TrackDesc& d);
   Kind kind() const noexcept override { return Kind::Track; }
   ProcessorPtr clone() const override;
@@ -137,7 +201,7 @@ class TrackProcessor final : public AudioProcessor {
   void reset() noexcept override;
   void process(const ProcessContext& ctx, float* const* io, uint32_t channels) noexcept override;
   uint32_t latency() const noexcept override { return chain_.latency(); }
-  uint32_t tail() const noexcept override { return chain_.tail(); }
+  uint32_t tail() const noexcept override;
 
   // RT parameter setters (audio thread / owner thread of the graph).
   void setVolume(float v) noexcept { volume_ = v; }
@@ -147,30 +211,60 @@ class TrackProcessor final : public AudioProcessor {
   void setSoloSilenced(bool s) noexcept { soloSilenced_ = s; }
   void setMonitor(bool m) noexcept { monitor_ = m; }
   void setMonitorInMain(bool m) noexcept { monitorInMain_ = m; }
+  void setLiveMidi(bool on) noexcept { liveMidi_ = on; }
+  // Automation overrides (RT): replace the static values while set.
+  void setAutoVolume(float v) noexcept { autoVolume_ = v, hasAutoVolume_ = true; }
+  void setAutoPan(float p) noexcept { autoPan_ = p, hasAutoPan_ = true; }
+  void setAutoMute(bool m) noexcept { autoMute_ = m, hasAutoMute_ = true; }
+  void clearAutomation() noexcept { hasAutoVolume_ = hasAutoPan_ = hasAutoMute_ = false; }
   float volume() const noexcept { return volume_; }
   float pan() const noexcept { return pan_; }
+  float effectiveVolume() const noexcept { return hasAutoVolume_ ? autoVolume_ : volume_; }
+  float effectivePan() const noexcept { return hasAutoPan_ ? autoPan_ : pan_; }
   bool solo() const noexcept { return solo_; }
   bool monitor() const noexcept { return monitor_; }
-  // False when muted or silenced by another track's solo (applies to the fast lane too).
-  bool audible() const noexcept { return !mute_ && !soloSilenced_; }
+  bool liveMidi() const noexcept { return liveMidi_; }
+  // False when muted (static or automated) or silenced by another track's solo (applies to the
+  // fast lane and to sends too).
+  bool audible() const noexcept { return !(hasAutoMute_ ? autoMute_ : mute_) && !soloSilenced_; }
   const TrackDesc& desc() const noexcept { return desc_; }
   uint32_t channels() const noexcept { return desc_.channels; }
   // Post-insert, pre-fader buffer of the last process() call.
   float* const* preFader() const noexcept { return bufPtrs_.data(); }
   int64_t contentEnd() const noexcept;
+  // Insert chain entry (chain index) / the instrument; null when absent.
+  AudioProcessor* insert(size_t i) const noexcept { return i < chain_.size() ? chain_.at(i) : nullptr; }
+  size_t insertCount() const noexcept { return chain_.size(); }
+  AudioProcessor* instrument() const noexcept { return instrument_.get(); }
+  // RT: queue one live event for the next process() (dropped when the block buffer is full or
+  // the track has no instrument).
+  bool pushLiveMidi(const uint8_t* bytes, uint8_t size) noexcept;
 
  private:
+  void renderInstrument(const ProcessContext& ctx) noexcept;
   TrackDesc desc_;
   std::vector<SourcePtr> sources_;
   ProcessorChain chain_;
+  ProcessorPtr instrument_;
   std::vector<float> buf_;
   std::vector<float*> bufPtrs_;
   uint32_t maxFrames_ = 0;
   uint32_t outChannels_ = 2;
   float volume_ = 1.0f, pan_ = 0.0f;
   bool mute_ = false, solo_ = false, soloSilenced_ = false, monitor_ = false, monitorInMain_ = true;
+  bool liveMidi_ = false;
+  float autoVolume_ = 1.0f, autoPan_ = 0.0f;
+  bool autoMute_ = false, hasAutoVolume_ = false, hasAutoPan_ = false, hasAutoMute_ = false;
   float curGain_[kMaxChannels] = {};
   bool gainInit_ = false;
+  // instrument event state (RT)
+  std::vector<sq_midi_event> blockEvents_;
+  sq_midi_event live_[kLiveCapacity] = {};
+  uint32_t liveCount_ = 0;
+  size_t cursor_ = 0;
+  int64_t expectNext_ = INT64_MIN;
+  bool seqPlaying_ = false;
+  uint8_t seqNotes_[16][128] = {};  // sequenced notes currently on (note-offs on stop / jump)
 };
 
 // Sub-mix / bus: (summed inputs) -> inserts -> fader/pan. The graph sums inputs into input().
@@ -190,9 +284,19 @@ class SubMixProcessor final : public AudioProcessor {
   void setVolume(float v) noexcept { volume_ = v; }
   void setPan(float p) noexcept { pan_ = p; }
   void setMute(bool m) noexcept { mute_ = m; }
+  void setAutoVolume(float v) noexcept { autoVolume_ = v, hasAutoVolume_ = true; }
+  void setAutoPan(float p) noexcept { autoPan_ = p, hasAutoPan_ = true; }
+  void setAutoMute(bool m) noexcept { autoMute_ = m, hasAutoMute_ = true; }
+  void clearAutomation() noexcept { hasAutoVolume_ = hasAutoPan_ = hasAutoMute_ = false; }
   float volume() const noexcept { return volume_; }
+  float effectiveVolume() const noexcept { return hasAutoVolume_ ? autoVolume_ : volume_; }
+  float effectivePan() const noexcept { return hasAutoPan_ ? autoPan_ : pan_; }
+  bool audible() const noexcept { return !(hasAutoMute_ ? autoMute_ : mute_); }
   uint32_t channels() const noexcept { return channels_; }
   void setMix64(bool on) noexcept { mix64_ = on; }
+  // Post-insert, pre-fader buffer of the last process() call (bus sends).
+  float* const* preFader() const noexcept { return workPtrs_.data(); }
+  AudioProcessor* insert(size_t i) const noexcept { return i < chain_.size() ? chain_.at(i) : nullptr; }
 
  private:
   uint32_t channels_;
@@ -201,6 +305,8 @@ class SubMixProcessor final : public AudioProcessor {
   float volume_, pan_;
   bool mute_;
   bool mix64_ = false;
+  float autoVolume_ = 1.0f, autoPan_ = 0.0f;
+  bool autoMute_ = false, hasAutoVolume_ = false, hasAutoPan_ = false, hasAutoMute_ = false;
   std::vector<float> sumF_;
   std::vector<double> sumD_;
   std::vector<float> work_;
@@ -253,6 +359,7 @@ class Graph {
   TrackProcessor& track(size_t i) noexcept { return *tracks_[i]; }
   size_t busCount() const noexcept { return buses_.size(); }
   SubMixProcessor& bus(size_t i) noexcept { return *buses_[i]; }
+  SubMixProcessor& master() noexcept { return *master_; }
   int32_t findTrack(const sq_guid& id) const noexcept;
   int32_t findBus(const sq_guid& id) const noexcept;
   void setMasterVolume(float v) noexcept { masterVolume_ = v; }
@@ -267,6 +374,26 @@ class Graph {
   uint32_t outputChannels() const noexcept { return outChannels_; }
   Metronome& metronome() noexcept { return metronome_; }
 
+  // ---- live parameters (RT / owner thread) ----
+  // slot = insert chain index; slot -1 on a track = its instrument. Also reaches the fast lane's
+  // copy of a zero-latency insert.
+  void setTrackParam(size_t track, int32_t slot, uint32_t param, float value) noexcept;
+  void setBusParam(size_t bus, int32_t slot, uint32_t param, float value) noexcept;
+  void setMasterParam(int32_t slot, uint32_t param, float value) noexcept;
+  void setTrackSendLevel(size_t track, size_t send, float level) noexcept;
+  void setBusSendLevel(size_t bus, size_t send, float level) noexcept;
+  size_t trackSendCount(size_t track) const noexcept { return track < trackSends_.size() ? trackSends_[track].size() : 0; }
+  // Compensation delay of a track's send edge (PDC bookkeeping, tests).
+  uint32_t sendCompensation(size_t track, size_t send) const noexcept;
+  // Live MIDI to every track whose liveMidi flag is set (RT).
+  void routeLiveMidi(const uint8_t* bytes, uint8_t size) noexcept;
+
+  // ---- automation ----
+  // RT: installs `data` as this graph's automation (owned; deleted by ~Graph on the control
+  // thread) and returns the previously installed external data (caller retires it), or null.
+  AutomationData* swapAutomation(AutomationData* data) noexcept;
+  const AutomationData* automation() const noexcept { return automation_; }
+
   // ---- stem taps (GraphConfig::stemTaps) ----
   uint32_t stemChannels(size_t track) const noexcept { return stemChannels_[track]; }
   // Timeline-aligned tap of the last process() block.
@@ -278,6 +405,25 @@ class Graph {
   Graph() = default;
   void sumInto(int32_t dest, float* const* src, uint32_t ch, uint32_t frames) noexcept;
   void processFastLane(const ProcessContext& ctx, float* const* out, uint32_t outChannels) noexcept;
+  void applyAutomation(const ProcessContext& ctx) noexcept;
+  void endAutomation() noexcept;
+
+  // One send edge (track or bus -> bus).
+  struct Send {
+    bool fromBus = false;
+    uint32_t source = 0;
+    int32_t dest = 0;
+    bool pre = false;
+    float level = 1.0f;
+    float autoLevel = 1.0f;
+    bool hasAuto = false;
+    DelayLine comp;
+    std::vector<float> buf;
+    std::vector<float*> ptrs;
+    float cur[kMaxChannels] = {};
+    bool init = false;
+  };
+  void runSend(Send& s, const float* const* src, uint32_t srcCh, float faderVolume, float pan, bool audible, uint32_t frames) noexcept;
 
   double sr_ = 48000.0;
   uint32_t maxBlock_ = 512;
@@ -324,6 +470,20 @@ class Graph {
   std::vector<std::vector<float>> stemBuf_;
   std::vector<std::vector<float*>> stemPtrs_;
   std::vector<DelayLine> stemDelay_;
+
+  // fast lane slot map: per track, chain index -> fast chain index (-1 = latent, not in the lane)
+  std::vector<std::vector<int32_t>> fastSlot_;
+
+  // sends
+  std::vector<std::unique_ptr<Send>> sends_;
+  std::vector<std::vector<uint32_t>> trackSends_, busSends_;  // indices into sends_
+  std::vector<uint32_t> busMaxIn_;
+
+  // automation
+  std::shared_ptr<const AutomationData> automationKeep_;  // compiled from the desc
+  AutomationData* extAutomation_ = nullptr;               // swapped in live (owned)
+  const AutomationData* automation_ = nullptr;
+  bool automating_ = false;
 
   TempoMapRt tempo_;
   uint32_t numerator_ = 4, denominator_ = 4;
