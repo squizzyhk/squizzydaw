@@ -48,11 +48,12 @@ struct Strip {
   std::vector<std::string> sends;    // "<guid> <db> [pre]"
   std::string instrument;
   // hit rects (DIPs), filled by paint
-  Rect box, name, fader, faderTrack, pan, mute, solo, arm, mon, out, peak, addInsert, addSend;
+  Rect box, name, fader, faderTrack, pan, mute, solo, arm, mon, out, peak, addInsert, addSend, more;
   std::vector<Rect> slots, sendKnobs;
+  std::vector<int> slotIdx;  // insert index shown in each slot rect (the list can be scrolled)
 };
 
-enum class Part { None, Strip, Name, Fader, Pan, Mute, Solo, Arm, Mon, Out, Peak, Slot, AddInsert, Send, AddSend };
+enum class Part { None, Strip, Name, Fader, Pan, Mute, Solo, Arm, Mon, Out, Peak, Slot, AddInsert, Send, AddSend, More };
 
 class Mixer final : public Widget {
  public:
@@ -70,10 +71,14 @@ class Mixer final : public Widget {
     const float total = static_cast<float>(strips_.size() - (haveMaster_ ? 1 : 0)) * (kStripW + 4);
     scroll_ = std::clamp(scroll_, 0.0f, std::max(0.0f, total - viewW));
     float x = f.x + 6 - scroll_;
+    int wantRows = 1;
+    for (auto& s : strips_) wantRows = std::max(wantRows, static_cast<int>(s.inserts.size()) + 1);
+    const float stripH = f.h - 12;
+    const Layout lay = computeLayout(stripH, wantRows);
     c.pushClip(Rect{f.x, f.y, viewW + 8, f.h});
     for (auto& s : strips_) {
       if (s.master) continue;
-      paintStrip(c, p, s, Rect{x, f.y + 6, kStripW, f.h - 12}, s.t.id == sel);
+      paintStrip(c, p, s, Rect{x, f.y + 6, kStripW, stripH}, s.t.id == sel, lay);
       x += kStripW + 4;
     }
     c.popClip();
@@ -84,7 +89,7 @@ class Mixer final : public Widget {
     }
     c.fillRect(Rect{masterX - 6, f.y, 1, f.h}, p.border);
     for (auto& s : strips_)
-      if (s.master) paintStrip(c, p, s, Rect{masterX, f.y + 6, kStripW, f.h - 12}, false);
+      if (s.master) paintStrip(c, p, s, Rect{masterX, f.y + 6, kStripW, stripH}, false, lay);
     c.popClip();
   }
 
@@ -104,6 +109,11 @@ class Mixer final : public Widget {
           if (part == Part::Fader) setVolume(*s, std::clamp(s->t.info.volume_db + (e.wheel > 0 ? 0.5 : -0.5), static_cast<double>(kMinDb), 6.0), true);
           else if (part == Part::Pan) ctx_.setProperty(s->t.id, "pan", std::clamp(s->t.info.pan + e.wheel * 0.05, -1.0, 1.0), true);
           else setSend(*s, idx, std::clamp(sendDb(*s, idx) + e.wheel * 0.5, -72.0, 6.0), true);
+          return true;
+        }
+        if (s && (part == Part::Slot || part == Part::More) && s->more.w > 0) {  // scroll the insert list
+          insScroll_[s->t.id] += e.wheel > 0 ? -1 : 1;
+          ctx_.invalidate();
           return true;
         }
         scroll_ -= e.wheel * 60.0f;
@@ -237,112 +247,201 @@ class Mixer final : public Widget {
     return sendLevel(s.sends[static_cast<size_t>(idx)]);
   }
 
-  void paintStrip(Canvas& c, const Palette& p, Strip& s, const Rect& r, bool selected) {
+  // Vertical layout shared by every strip so faders line up. Sections are dropped in priority order
+  // when the panel is short (buttons > fader > output > inserts > pan/sends > source line) and the
+  // spare height is shared between the insert list and the fader.
+  struct Layout {
+    bool buttons = false, fader = false, out = false, pan = false, src = false;
+    int rows = 0;  // insert-list rows (0 = no insert section)
+    float faderH = 0;
+  };
+  static constexpr float kHeaderH = 28, kButtonsH = 26, kOutH = 22, kReadoutH = 16, kPeakH = 16, kPanH = 40, kSrcH = 18;
+  static constexpr float kSlotH = 17, kRowH = kSlotH + 2, kInsPad = 4, kFaderMin = 40;
+
+  static Layout computeLayout(float h, int wantRows) {
+    Layout L;
+    float avail = h - kHeaderH;
+    auto take = [&avail](float need) {
+      if (avail < need) return false;
+      avail -= need;
+      return true;
+    };
+    L.buttons = take(kButtonsH);
+    if (!L.buttons) return L;
+    L.fader = take(kPeakH + kFaderMin + kReadoutH);
+    if (L.fader) L.faderH = kFaderMin;
+    L.out = take(kOutH);
+    if (take(kRowH + kInsPad)) L.rows = 1;
+    L.pan = take(kPanH);
+    L.src = take(kSrcH);
+    const int want = std::clamp(wantRows, 1, 10);
+    auto growRows = [&](int upTo) {
+      while (L.rows > 0 && L.rows < upTo && take(kRowH)) ++L.rows;
+    };
+    growRows(std::min(want, 4));
+    if (L.fader) {
+      const float g = std::min(avail, 120.0f);
+      L.faderH += g;
+      avail -= g;
+    }
+    growRows(want);
+    if (L.fader) L.faderH += avail;
+    return L;
+  }
+
+  // One dB -> height mapping for the fader, its scale and the meters (the fader law).
+  static float dbY(const Rect& track, double db) {
+    return track.y + track.h * (1.0f - static_cast<float>(dbToFader(db)));
+  }
+  static double linToDb(float lin) { return lin > 0.0f ? 20.0 * std::log10(static_cast<double>(lin)) : -144.0; }
+
+  static void meterBar(Canvas& c, const Palette& p, const Rect& r, float level, float hold) {
+    c.fillRect(r, p.border);
+    if (r.h <= 0) return;
+    const float ly = dbY(r, linToDb(level));
+    if (ly < r.bottom()) {
+      const float yWarn = dbY(r, -6.0), yZero = dbY(r, 0.0);
+      c.fillRect(Rect{r.x, ly, r.w, r.bottom() - ly}, p.meterLow);
+      if (ly < yWarn) c.fillRect(Rect{r.x, ly, r.w, yWarn - ly}, p.meterMid);
+      if (ly < yZero) c.fillRect(Rect{r.x, ly, r.w, yZero - ly}, p.meterHigh);
+    }
+    if (hold > 0) c.fillRect(Rect{r.x, dbY(r, linToDb(hold)), r.w, 1.5f}, hold >= 1.0f ? p.meterHigh : p.text);
+  }
+
+  void paintStrip(Canvas& c, const Palette& p, Strip& s, const Rect& r, bool selected, const Layout& L) {
     s.box = r;
+    s.slots.clear();
+    s.slotIdx.clear();
+    s.sendKnobs.clear();
+    s.fader = s.faderTrack = s.pan = s.mute = s.solo = s.arm = s.mon = s.out = s.peak = s.addInsert = s.addSend = s.more = Rect{};
+    if (r.h <= 0) return;
+    c.pushClip(r);
     const Color col = s.master ? p.accent : ctx_.trackColor(s.t);
-    c.fillRoundRect(r, 5, selected ? draw::mix(p.panel2, col, 0.12f) : p.panel2);
-    if (selected) c.strokeRoundRect(r, 5, col.withAlpha(0.7f), 1);
+    c.fillRoundRect(r, 5, selected ? draw::mix(p.panel2, col, 0.07f) : p.panel2);
+    if (selected) c.strokeRoundRect(r, 5, col.withAlpha(0.8f), 1);
     c.fillRoundRect(Rect{r.x, r.y, r.w, 4}, 2, col);
+    // Labels and outlines of live controls: never the "disabled" faint colour.
+    const Color label = p.dim;
+    const Color outline = draw::mix(p.dim, p.panel2, 0.45f);
     float y = r.y + 8;
     s.name = Rect{r.x + 4, y, r.w - 8, 18};
     c.drawTextBold(s.master ? "Master" : s.t.name, s.name, p.text, 11.5f, TextAlign::Center);
     y += 20;
     // source line
-    std::string src;
-    if (s.master) src = "Main Out";
-    else if (s.bus) src = "Bus";
-    else if (s.t.info.kind == SQ_TRACK_INSTRUMENT) src = s.instrument.empty() ? "Synth" : deviceName(s.instrument);
-    else src = "Audio In";
-    c.drawText(src, Rect{r.x + 4, y, r.w - 8, 14}, s.t.info.kind == SQ_TRACK_INSTRUMENT ? p.accent2 : p.dim, 10, TextAlign::Center);
-    y += 18;
-    // inserts
-    s.slots.clear();
-    const float slotH = 17;
-    const size_t maxSlots = static_cast<size_t>(std::clamp((r.h - 330.0f) / (slotH + 2), 1.0f, 8.0f));
-    for (size_t i = 0; i < s.inserts.size() && i < maxSlots; ++i) {
-      Rect sr{r.x + 5, y, r.w - 10, slotH};
-      const bool bypass = !s.inserts[i].empty() && s.inserts[i][0] == '!';
-      const bool hot = hotPart_ == Part::Slot && hotStrip_ == s.t.id && hotIdx_ == static_cast<int>(i);
-      c.fillRoundRect(sr, 3, hot ? p.panel3 : p.bg);
-      c.fillRect(Rect{sr.x + 3, sr.y + 5, 6, 6}, bypass ? p.faint : p.meterLow);
-      c.drawText(deviceName(s.inserts[i]), Rect{sr.x + 13, sr.y, sr.w - 15, sr.h}, bypass ? p.faint : p.text, 10.5f);
-      s.slots.push_back(sr);
-      y += slotH + 2;
+    if (L.src) {
+      std::string src;
+      if (s.master) src = "Main Out";
+      else if (s.bus) src = "Bus";
+      else if (s.t.info.kind == SQ_TRACK_INSTRUMENT) src = s.instrument.empty() ? "Synth" : deviceName(s.instrument);
+      else src = "Audio In";
+      const Color srcCol = s.t.info.kind == SQ_TRACK_INSTRUMENT ? draw::mix(p.accent2, p.text, 0.35f) : label;
+      c.drawText(src, Rect{r.x + 4, y, r.w - 8, 14}, srcCol, 10, TextAlign::Center);
+      y += kSrcH;
     }
-    s.addInsert = Rect{r.x + 5, y, r.w - 10, slotH};
-    const bool hotAdd = hotPart_ == Part::AddInsert && hotStrip_ == s.t.id;
-    c.strokeRoundRect(s.addInsert, 3, hotAdd ? p.accent : p.panel3, 1);
-    c.drawText("+ FX", s.addInsert, hotAdd ? p.text : p.faint, 10.5f, TextAlign::Center);
-    y += slotH + 6;
-    // pan (left) + sends (right) in one row
-    s.pan = Rect{r.x + 6, y, 28, 28};
-    draw::knob(c, p, s.pan, (s.t.info.pan + 1.0) / 2.0, true, col);
-    char buf[32];
-    if (std::fabs(s.t.info.pan) < 0.005) std::snprintf(buf, sizeof buf, "C");
-    else std::snprintf(buf, sizeof buf, "%s%d", s.t.info.pan < 0 ? "L" : "R", static_cast<int>(std::lround(std::fabs(s.t.info.pan) * 100)));
-    c.drawText(buf, Rect{s.pan.x - 4, y + 28, 36, 11}, p.faint, 9, TextAlign::Center);
-    s.sendKnobs.clear();
-    s.addSend = Rect{};
-    if (!s.master) {
-      float sx = r.x + 40;
-      for (size_t i = 0; i < s.sends.size() && i < 2; ++i) {
-        Rect kr{sx, y + 3, 22, 22};
-        draw::knob(c, p, kr, dbToFader(sendLevel(s.sends[i])), false, p.solo);
-        s.sendKnobs.push_back(kr);
-        sx += 24;
+    // inserts: all of them when they fit, otherwise a scrollable window plus a "+N more" row
+    if (L.rows > 0) {
+      const int n = static_cast<int>(s.inserts.size());
+      const bool overflow = n + 1 > L.rows;
+      const int vis = overflow ? L.rows - 1 : n;
+      int& off = insScroll_[s.t.id];
+      off = overflow ? std::clamp(off, 0, n - vis) : 0;
+      for (int i = 0; i < vis; ++i) {
+        const int ii = off + i;
+        Rect sr{r.x + 5, y, r.w - 10, kSlotH};
+        const std::string& spec = s.inserts[static_cast<size_t>(ii)];
+        const bool bypass = !spec.empty() && spec[0] == '!';
+        const bool hot = hotPart_ == Part::Slot && hotStrip_ == s.t.id && hotIdx_ == ii;
+        c.fillRoundRect(sr, 3, hot ? p.panel3 : p.bg);
+        c.fillRect(Rect{sr.x + 3, sr.y + 5, 6, 6}, bypass ? p.faint : p.meterLow);
+        c.drawText(deviceName(spec), Rect{sr.x + 13, sr.y, sr.w - 15, sr.h}, bypass ? label : p.text, 10.5f);
+        s.slots.push_back(sr);
+        s.slotIdx.push_back(ii);
+        y += kRowH;
       }
-      if (s.sends.size() < 2) {
-        s.addSend = Rect{sx, y + 6, 22, 16};
-        const bool hs = hotPart_ == Part::AddSend && hotStrip_ == s.t.id;
-        c.strokeRoundRect(s.addSend, 3, hs ? p.accent : p.panel3, 1);
-        c.drawText("S+", s.addSend, hs ? p.text : p.faint, 9, TextAlign::Center);
-      }
-    }
-    y += 40;
-    // buttons
-    const float bw = (r.w - 12 - 6) / 4;
-    auto btn = [&](Rect& out, float bx, const char* label, bool on, Color onCol, Part part) {
-      out = Rect{bx, r.bottom() - 26, bw, 20};
-      const bool hot = hotPart_ == part && hotStrip_ == s.t.id;
-      c.fillRoundRect(out, 3, on ? onCol : hot ? p.panel3 : p.bg);
-      c.drawText(label, out, on ? Color::rgb(0x111214) : p.dim, 10.5f, TextAlign::Center);
-    };
-    const uint32_t fl = s.t.info.flags;
-    float bx = r.x + 6;
-    btn(s.mute, bx, "M", (fl & SQ_TRACK_MUTE) != 0, p.mute, Part::Mute);
-    bx += bw + 2;
-    if (!s.master) {
-      btn(s.solo, bx, "S", (fl & SQ_TRACK_SOLO) != 0, p.solo, Part::Solo);
-      bx += bw + 2;
-      if (!s.bus) {
-        btn(s.arm, bx, "R", (fl & SQ_TRACK_ARMED) != 0, p.rec, Part::Arm);
-        bx += bw + 2;
-        btn(s.mon, bx, "I", (fl & SQ_TRACK_MONITOR) != 0, p.accent, Part::Mon);
+      char mb[32];
+      if (overflow) {
+        s.more = Rect{r.x + 5, y, r.w - 10 - 24, kSlotH};
+        s.addInsert = Rect{s.more.right() + 2, y, 22, kSlotH};
+        const bool hm = hotPart_ == Part::More && hotStrip_ == s.t.id;
+        c.fillRoundRect(s.more, 3, hm ? p.panel3 : p.bg);
+        if (vis == 0) std::snprintf(mb, sizeof mb, "%d FX", n);
+        else if (off == 0) std::snprintf(mb, sizeof mb, "+%d more", n - vis);
+        else std::snprintf(mb, sizeof mb, "%d-%d of %d", off + 1, off + vis, n);
+        c.drawText(mb, s.more, hm ? p.text : label, 10, TextAlign::Center);
       } else {
-        s.arm = s.mon = Rect{};
+        s.addInsert = Rect{r.x + 5, y, r.w - 10, kSlotH};
       }
-    } else {
-      s.solo = s.arm = s.mon = Rect{};
+      const bool hotAdd = hotPart_ == Part::AddInsert && hotStrip_ == s.t.id;
+      c.strokeRoundRect(s.addInsert, 3, hotAdd ? p.accent : outline, 1);
+      c.drawText(overflow ? "+" : "+ FX", s.addInsert, hotAdd ? p.text : label, 10.5f, TextAlign::Center);
+      y += kRowH + kInsPad;
     }
-    // output selector
-    if (!s.master) {
-      s.out = Rect{r.x + 5, r.bottom() - 48, r.w - 10, 18};
-      std::string outName = "Master";
-      if (!sq_guid_is_null(&s.t.info.output))
-        for (auto& o : strips_)
-          if (o.t.id == s.t.info.output) outName = o.t.name;
-      const bool ho = hotPart_ == Part::Out && hotStrip_ == s.t.id;
-      c.fillRoundRect(s.out, 3, ho ? p.panel3 : p.bg);
-      c.drawText("\xE2\x86\x92 " + outName, Rect{s.out.x + 5, s.out.y, s.out.w - 8, s.out.h}, p.dim, 10);
-    } else {
-      s.out = Rect{};
+    char buf[32];
+    // pan (left) + sends (right) in one row
+    if (L.pan) {
+      s.pan = Rect{r.x + 6, y, 28, 28};
+      draw::knob(c, p, s.pan, (s.t.info.pan + 1.0) / 2.0, true, col);
+      if (std::fabs(s.t.info.pan) < 0.005) std::snprintf(buf, sizeof buf, "C");
+      else std::snprintf(buf, sizeof buf, "%s%d", s.t.info.pan < 0 ? "L" : "R", static_cast<int>(std::lround(std::fabs(s.t.info.pan) * 100)));
+      c.drawText(buf, Rect{s.pan.x - 4, y + 28, 36, 11}, label, 9, TextAlign::Center);
+      if (!s.master) {
+        float sx = r.x + 40;
+        for (size_t i = 0; i < s.sends.size() && i < 2; ++i) {
+          Rect kr{sx, y + 3, 22, 22};
+          draw::knob(c, p, kr, dbToFader(sendLevel(s.sends[i])), false, p.solo);
+          s.sendKnobs.push_back(kr);
+          sx += 24;
+        }
+        if (s.sends.size() < 2) {
+          s.addSend = Rect{sx, y + 6, 22, 16};
+          const bool hs = hotPart_ == Part::AddSend && hotStrip_ == s.t.id;
+          c.strokeRoundRect(s.addSend, 3, hs ? p.accent : outline, 1);
+          c.drawText("S+", s.addSend, hs ? p.text : label, 9, TextAlign::Center);
+        }
+      }
     }
-    // fader + meter
-    const float fy = y, fh = (s.master ? r.bottom() - 30 : s.out.y - 4) - fy - 16;
-    s.peak = Rect{r.x + 4, fy, r.w - 8, 14};
+    // bottom-anchored rows: buttons, then the output selector above them
+    float bottom = r.bottom();
+    if (L.buttons) {
+      const float bw = (r.w - 12 - 6) / 4;
+      auto btn = [&](Rect& dst, float bx, const char* lbl, bool on, Color onCol, Part part) {
+        dst = Rect{bx, r.bottom() - 26, bw, 20};
+        const bool hot = hotPart_ == part && hotStrip_ == s.t.id;
+        c.fillRoundRect(dst, 3, on ? onCol : hot ? p.panel3 : p.bg);
+        c.drawText(lbl, dst, on ? Color::rgb(0x111214) : label, 10.5f, TextAlign::Center);
+      };
+      const uint32_t fl = s.t.info.flags;
+      float bx = r.x + 6;
+      btn(s.mute, bx, "M", (fl & SQ_TRACK_MUTE) != 0, p.mute, Part::Mute);
+      bx += bw + 2;
+      if (!s.master) {
+        btn(s.solo, bx, "S", (fl & SQ_TRACK_SOLO) != 0, p.solo, Part::Solo);
+        bx += bw + 2;
+        if (!s.bus) {
+          btn(s.arm, bx, "R", (fl & SQ_TRACK_ARMED) != 0, p.rec, Part::Arm);
+          bx += bw + 2;
+          btn(s.mon, bx, "I", (fl & SQ_TRACK_MONITOR) != 0, p.accent, Part::Mon);
+        }
+      }
+      bottom -= kButtonsH;
+    }
+    if (L.out) {
+      if (!s.master) {
+        s.out = Rect{r.x + 5, bottom - kOutH, r.w - 10, 18};
+        std::string outName = "Master";
+        if (!sq_guid_is_null(&s.t.info.output))
+          for (auto& o : strips_)
+            if (o.t.id == s.t.info.output) outName = o.t.name;
+        const bool ho = hotPart_ == Part::Out && hotStrip_ == s.t.id;
+        c.fillRoundRect(s.out, 3, ho ? p.panel3 : p.bg);
+        c.drawText("\xE2\x86\x92 " + outName, Rect{s.out.x + 5, s.out.y, s.out.w - 8, s.out.h}, label, 10);
+      }
+      bottom -= kOutH;
+    }
+    // meter state (kept up to date even when the fader section is hidden)
     float pk[2] = {0, 0};
-    const uint32_t n = ctx_.meter(s.master ? sq_guid{} : s.t.id, pk, nullptr, 2);
-    if (n == 1) pk[1] = pk[0];
+    const uint32_t nch = ctx_.meter(s.master ? sq_guid{} : s.t.id, pk, nullptr, 2);
+    if (nch == 1) pk[1] = pk[0];
     auto& m = meters_[s.master ? sq_guid{} : s.t.id];
     const auto now = std::chrono::steady_clock::now();
     const float dt = static_cast<float>(std::chrono::duration<double>(now - m.last).count());
@@ -355,33 +454,50 @@ class Mixer final : public Widget {
       }
       m.peakMax = std::max(m.peakMax, pk[ch]);
     }
-    if (m.peakMax > 0) std::snprintf(buf, sizeof buf, "%.1f", 20.0f * std::log10(std::max(m.peakMax, 1e-6f)));
-    else std::snprintf(buf, sizeof buf, "-inf");
-    c.drawText(buf, s.peak, m.peakMax >= 1.0f ? p.meterHigh : p.faint, 10, TextAlign::Center);
-    const float top = fy + 16;
-    s.fader = Rect{r.x + 4, top, r.w / 2 + 4, fh};
-    s.faderTrack = Rect{r.x + 18, top + 6, 4, fh - 12};
-    // dB scale
-    for (double db : {6.0, 0.0, -6.0, -12.0, -24.0, -48.0}) {
-      const float yy = s.faderTrack.y + s.faderTrack.h * (1.0f - static_cast<float>(dbToFader(db)));
-      c.fillRect(Rect{s.faderTrack.right() + 12, yy, 3, 1}, p.faint);
-      std::snprintf(buf, sizeof buf, "%d", static_cast<int>(db));
-      c.drawText(buf, Rect{s.faderTrack.right() + 16, yy - 6, 26, 12}, p.faint, 8.5f, TextAlign::Center);
+    if (L.fader) {
+      // peak readout | fader + scale + meters | volume readout, stacked above the bottom rows
+      const float fh = L.faderH;
+      const float top = bottom - kReadoutH - fh;
+      s.peak = Rect{r.x + 4, top - kPeakH, r.w - 8, 14};
+      if (m.peakMax > 0) std::snprintf(buf, sizeof buf, "%.1f", 20.0f * std::log10(std::max(m.peakMax, 1e-6f)));
+      else std::snprintf(buf, sizeof buf, "-inf");
+      c.drawText(buf, s.peak, m.peakMax >= 1.0f ? p.meterHigh : label, 10, TextAlign::Center);
+      s.fader = Rect{r.x + 4, top, r.w / 2 + 4, fh};
+      s.faderTrack = Rect{r.x + 18, top + 8, 4, fh - 16};
+      const Rect& tr = s.faderTrack;
+      // dB scale (labels thinned out when the fader is short)
+      float used[6];
+      int nUsed = 0;
+      for (double db : {0.0, -24.0, -12.0, 6.0, -6.0, -48.0}) {  // most important labels first
+        const float yy = dbY(tr, db);
+        c.fillRect(Rect{tr.right() + 12, yy, 3, 1}, outline);
+        bool clash = false;
+        for (int k = 0; k < nUsed; ++k) clash = clash || std::fabs(used[k] - yy) < 11.0f;
+        if (clash) continue;
+        used[nUsed++] = yy;
+        std::snprintf(buf, sizeof buf, "%d", static_cast<int>(db));
+        c.drawText(buf, Rect{tr.right() + 16, yy - 6, 26, 12}, label, 8.5f, TextAlign::Center);
+      }
+      c.fillRoundRect(tr, 2, p.bg);
+      const float ky = dbY(tr, s.t.info.volume_db);
+      c.fillRoundRect(Rect{tr.x, ky, tr.w, tr.bottom() - ky}, 2, col.withAlpha(0.6f));
+      const bool hf = (hotPart_ == Part::Fader && hotStrip_ == s.t.id) || (drag_ == Part::Fader && dragStrip_ == s.t.id);
+      // cap: must contrast with the strip in both themes
+      const Color capFill = hf ? p.text : p.dark ? draw::lighten(p.panel3, 0.25f) : draw::mix(p.panel2, p.dim, 0.55f);
+      const Rect cap{tr.x - 9, ky - 7, tr.w + 18, 14};
+      c.fillRoundRect(cap, 3, capFill);
+      c.strokeRoundRect(cap, 3, p.dark ? p.border : p.dim, 1);
+      c.fillRect(Rect{tr.x - 7, ky - 0.5f, tr.w + 14, 1}, hf ? p.panel2 : p.dark ? p.bg : p.text);
+      // stereo meter: same vertical extent and dB law as the fader scale
+      const Rect mr{r.right() - 22, tr.y, 6, tr.h};
+      meterBar(c, p, mr, m.level[0], m.hold[0]);
+      meterBar(c, p, Rect{mr.right() + 2, mr.y, 6, mr.h}, m.level[1], m.hold[1]);
+      // volume readout, in its own row between the fader and the output selector
+      if (s.t.info.volume_db <= -144.0) std::snprintf(buf, sizeof buf, "-inf");
+      else std::snprintf(buf, sizeof buf, "%+.1f", s.t.info.volume_db);
+      c.drawText(buf, Rect{r.x, bottom - kReadoutH, r.w, 14}, p.dim, 10, TextAlign::Center);
     }
-    c.fillRoundRect(s.faderTrack, 2, p.bg);
-    const float ky = s.faderTrack.y + s.faderTrack.h * (1.0f - static_cast<float>(dbToFader(s.t.info.volume_db)));
-    c.fillRoundRect(Rect{s.faderTrack.x, ky, s.faderTrack.w, s.faderTrack.bottom() - ky}, 2, col.withAlpha(0.6f));
-    const bool hf = (hotPart_ == Part::Fader && hotStrip_ == s.t.id) || (drag_ == Part::Fader && dragStrip_ == s.t.id);
-    c.fillRoundRect(Rect{s.faderTrack.x - 9, ky - 7, s.faderTrack.w + 18, 14}, 3, hf ? p.text : draw::lighten(p.panel3, 0.25f));
-    c.fillRect(Rect{s.faderTrack.x - 7, ky - 0.5f, s.faderTrack.w + 14, 1}, p.bg);
-    // stereo meter
-    const Rect mr{r.right() - 22, top + 6, 6, fh - 12};
-    draw::meter(c, p, mr, m.level[0], m.hold[0]);
-    draw::meter(c, p, Rect{mr.right() + 2, mr.y, 6, mr.h}, m.level[1], m.hold[1]);
-    // volume readout
-    if (s.t.info.volume_db <= -144.0) std::snprintf(buf, sizeof buf, "-inf");
-    else std::snprintf(buf, sizeof buf, "%+.1f", s.t.info.volume_db);
-    c.drawText(buf, Rect{r.x, top + fh - 2, r.w, 14}, p.dim, 10, TextAlign::Center);
+    c.popClip();
   }
 
   Part hit(float x, float y, Strip** out, int* idx) {
@@ -392,9 +508,10 @@ class Mixer final : public Widget {
       *out = &s;
       for (size_t i = 0; i < s.slots.size(); ++i)
         if (s.slots[i].contains(x, y)) {
-          *idx = static_cast<int>(i);
+          *idx = i < s.slotIdx.size() ? s.slotIdx[i] : static_cast<int>(i);
           return Part::Slot;
         }
+      if (s.more.contains(x, y)) return Part::More;
       for (size_t i = 0; i < s.sendKnobs.size(); ++i)
         if (s.sendKnobs[i].contains(x, y)) {
           *idx = static_cast<int>(i);
@@ -468,6 +585,19 @@ class Mixer final : public Widget {
         ctx_.showBottomPanel(BottomPanel::Devices);
         (void)idx;
         break;
+      case Part::More: {
+        // page through the insert list (wraps); with no room for any slot, show the device chain
+        const int vis = static_cast<int>(s.slots.size());
+        if (vis == 0) {
+          ctx_.selectTrack(s.t.id);
+          ctx_.showBottomPanel(BottomPanel::Devices);
+          break;
+        }
+        int& off = insScroll_[s.t.id];
+        off = off + vis >= static_cast<int>(s.inserts.size()) ? 0 : off + vis;
+        ctx_.invalidate();
+        break;
+      }
       case Part::AddInsert: ctx_.showMenu(buildInsertMenu(ctx_, s.t.id), Point{at.x, at.y}); break;
       case Part::AddSend: sendMenu(s, at); break;
       case Part::Out: outputMenu(s, at); break;
@@ -645,6 +775,7 @@ class Mixer final : public Widget {
   float dragY_ = 0;
   double dragStart_ = 0;
   std::map<sq_guid, MeterState> meters_;
+  std::map<sq_guid, int> insScroll_;  // first visible insert per strip when the list overflows
 };
 
 }  // namespace
