@@ -439,7 +439,12 @@ sq_result doSetProperty(Editing& ed, IAttributes* p, IAttributes*) {
     r = setMarkerProp(n, key, p, "value");
     if (r == SQ_OK && !(n == *m)) ed.putMarker(n);
   }
-  if (r == SQ_OK && p->getBool("merge", SQ_FALSE)) ed.setMergeKey("prop:" + guidStr(node) + ":" + key);
+  // merge=true coalesces with the previous step of the same property; an optional merge_tag
+  // (one per UI gesture) keeps separate gestures on the same property in separate steps.
+  if (r == SQ_OK && p->getBool("merge", SQ_FALSE)) {
+    const std::string tag = p->getType("merge_tag") == SQ_VALUE_STRING ? getAttrString(p, "merge_tag") : std::string();
+    ed.setMergeKey("prop:" + guidStr(node) + ":" + key + (tag.empty() ? std::string() : "#" + tag));
+  }
   return r;
 }
 

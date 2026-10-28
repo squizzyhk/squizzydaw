@@ -1,11 +1,13 @@
 // Squizzy Studio GUI - device rack: the selected track's instrument and insert chain as cards with
 // one control per parameter (knobs for continuous values, buttons for toggles, pop-up menus for
 // choices). Edits rewrite the track's spec strings ("user.instrument" / "user.inserts", grammar in
-// engine/audio/include/sq/engine/audio/builtin.hpp); continuous drags merge into one undo step and
+// engine/audio/include/sq/engine/audio/builtin.hpp); each drag gesture is one undo step and
 // the engine applies parameter-only changes without rebuilding its graph.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <string>
 
 #include "gui_panels.hpp"
 #include "sq/engine/audio/builtin.hpp"
@@ -99,6 +101,8 @@ class DeviceRack final : public Widget {
     c.drawTextBold(trackName_, Rect{f.x + 44, f.y + 6, 300, 18}, p.text, 12.5f);
     float x = f.x + 44 - scroll_;
     const float top = f.y + 30, h = f.h - 38;
+    // cards scroll under the label strip: clip them to the content area right of it
+    c.pushClip(contentRect());
     for (auto& card : cards_) {
       x = paintCard(c, p, card, x, top, h) + 10;
       if (&card != &cards_.back() || true) {
@@ -110,6 +114,7 @@ class DeviceRack final : public Widget {
     c.strokeRoundRect(addBtn_, 6, hotAdd_ ? p.accent : p.panel3, 1);
     c.drawText("+ Add Effect", addBtn_, hotAdd_ ? p.text : p.faint, 12, TextAlign::Center);
     contentW_ = x + 96 + scroll_ - (f.x + 44);
+    c.popClip();
     const float viewW = f.w - 52;
     if (contentW_ > viewW) {
       const float th = std::max(30.0f, viewW * viewW / contentW_);
@@ -134,13 +139,14 @@ class DeviceRack final : public Widget {
     const int part = hit(e.x, e.y, &ci, &pi);
     switch (e.action) {
       case MouseAction::Hover:
-        hotAdd_ = addBtn_.contains(e.x, e.y);
+        hotAdd_ = addBtn_.contains(e.x, e.y) && contentRect().contains(e.x, e.y);
         tipCard_ = pi >= 0 ? ci : -1;
         tipParam_ = pi;
         hotCard_ = ci;
         hotPart_ = part;
         return true;
       case MouseAction::Leave:
+        wheelCard_ = wheelParam_ = -1;
         tipCard_ = tipParam_ = -1;
         hotAdd_ = false;
         return false;
@@ -149,13 +155,19 @@ class DeviceRack final : public Widget {
           Card& cd = cards_[static_cast<size_t>(ci)];
           const auto& info = cd.info->params[static_cast<size_t>(pi)];
           const double step = (info.kind == ea::ParamKind::Continuous) ? 0.02 : 1.0 / std::max(1.0, static_cast<double>(info.max - info.min));
-          setParam(cd, pi, fromNorm(info, toNorm(info, cd.values[static_cast<size_t>(pi)]) + (e.wheel > 0 ? step : -step)), true);
+          // consecutive wheel steps on one control are one undo step; anything else starts a new one
+          if (wheelCard_ != ci || wheelParam_ != pi) ++gesture_;
+          if (setParam(cd, pi, fromNorm(info, toNorm(info, cd.values[static_cast<size_t>(pi)]) + (e.wheel > 0 ? step : -step)), true)) {
+            wheelCard_ = ci;
+            wheelParam_ = pi;
+          }
           return true;
         }
         scroll_ = std::clamp(scroll_ - e.wheel * 60.0f, 0.0f, std::max(0.0f, contentW_ - (frame().w - 52)));
         return true;
       case MouseAction::Down:
-        if (addBtn_.contains(e.x, e.y)) {
+        wheelCard_ = wheelParam_ = -1;
+        if (addBtn_.contains(e.x, e.y) && contentRect().contains(e.x, e.y)) {
           ctx_.showMenu(buildInsertMenu(ctx_, track_), Point{e.x, e.y});
           return true;
         }
@@ -168,6 +180,7 @@ class DeviceRack final : public Widget {
         dragParam_ = pi;
         dragY_ = e.y;
         dragMoved_ = false;
+        ++gesture_;  // every press starts a new undo step
         if (pi >= 0) {
           Card& cd = cards_[static_cast<size_t>(ci)];
           dragNorm_ = toNorm(cd.info->params[static_cast<size_t>(pi)], cd.values[static_cast<size_t>(pi)]);
@@ -307,7 +320,8 @@ class DeviceRack final : public Widget {
       const auto& pi = cd.info->params[i];
       const double v = cd.values[i];
       const Color ac = cd.bypass ? p.faint : accent;
-      c.drawText(pi.name, Rect{cell.x, cell.y, cell.w, 13}, p.dim, 9.5f, TextAlign::Center);
+      // inset so neighbouring labels keep a gap (long names are ellipsized per cell)
+      c.drawText(pi.name, Rect{cell.x + 3, cell.y, cell.w - 6, 13}, p.dim, 9.5f, TextAlign::Center);
       if (pi.kind == ea::ParamKind::Toggle) {
         Rect b{cell.x + 10, cell.y + 22, cell.w - 20, 20};
         c.fillRoundRect(b, 4, v >= 0.5 ? ac : p.bg);
@@ -320,14 +334,21 @@ class DeviceRack final : public Widget {
       } else {
         const bool bip = pi.min < 0 && pi.max > 0 && std::fabs(pi.min + pi.max) < 1e-6f;
         draw::knob(c, p, Rect{cell.x + cell.w / 2 - 18, cell.y + 14, 36, 36}, toNorm(pi, v), bip, ac);
-        c.drawText(formatValue(pi, v), Rect{cell.x, cell.y + 50, cell.w, 13}, p.text, 9.5f, TextAlign::Center);
+        c.drawText(formatValue(pi, v), Rect{cell.x + 2, cell.y + 50, cell.w - 4, 13}, p.text, 9.5f, TextAlign::Center);
       }
     }
     return x + w;
   }
 
+  // The scrollable card area (right of the track label strip).
+  Rect contentRect() const {
+    const Rect& f = frame();
+    return Rect{f.x + 44, f.y, std::max(0.0f, f.w - 44), f.h};
+  }
+
   int hit(float x, float y, int* ci, int* pi) {
     *ci = *pi = -1;
+    if (!contentRect().contains(x, y)) return kNone;
     for (size_t i = 0; i < cards_.size(); ++i) {
       const Card& cd = cards_[i];
       if (!cd.box.contains(x, y)) continue;
@@ -358,27 +379,43 @@ class DeviceRack final : public Widget {
     return (cd.bypass ? "!" : "") + ea::formatSpec(sp);
   }
 
+  // merge=true: part of the running gesture (gesture_): its changes are one undo step, and a new
+  // gesture never merges into the previous one (merge_tag), even on the same device.
+  void writeProp(const char* key, const std::string& value, bool merge) {
+    auto a = sq::makeAttributes();
+    a->setGuid("node", &track_);
+    a->setString("key", key);
+    a->setString("value", value.c_str());
+    if (merge) {
+      a->setBool("merge", SQ_TRUE);
+      a->setString("merge_tag", ("rack" + std::to_string(gesture_)).c_str());
+    }
+    ctx_.exec(sq::doc::kSetProperty, a.get());
+  }
+
   void writeCard(Card& cd, bool merge) {
     if (cd.instrument) {
-      ctx_.setPropertyString(track_, "user.instrument", specLine(cd), merge);
+      writeProp("user.instrument", specLine(cd), merge);
     } else {
       std::string all;
       for (const auto& o : cards_)
         if (!o.instrument) all += (&o == &cd ? specLine(cd) : o.line) + "\n";
-      ctx_.setPropertyString(track_, "user.inserts", all, merge);
+      writeProp("user.inserts", all, merge);
     }
     cd.line = specLine(cd);
   }
 
-  void setParam(Card& cd, int idx, double v, bool merge) {
-    if (!cd.info || idx < 0 || idx >= static_cast<int>(cd.values.size())) return;
+  // Returns true when the value changed (and was written).
+  bool setParam(Card& cd, int idx, double v, bool merge) {
+    if (!cd.info || idx < 0 || idx >= static_cast<int>(cd.values.size())) return false;
     const auto& pi = cd.info->params[static_cast<size_t>(idx)];
     v = std::clamp(v, static_cast<double>(pi.min), static_cast<double>(pi.max));
     if (pi.kind != ea::ParamKind::Continuous) v = std::round(v);
-    if (v == cd.values[static_cast<size_t>(idx)]) return;
+    if (v == cd.values[static_cast<size_t>(idx)]) return false;
     cd.values[static_cast<size_t>(idx)] = v;
     writeCard(cd, merge);
     ctx_.invalidate();
+    return true;
   }
 
   void writeInserts(const std::vector<std::string>& lines) {
@@ -492,6 +529,8 @@ class DeviceRack final : public Widget {
   float dragY_ = 0;
   double dragNorm_ = 0;
   bool dragMoved_ = false;
+  uint64_t gesture_ = 0;  // mouse gesture counter (undo merge tag)
+  int wheelCard_ = -1, wheelParam_ = -1;  // control of the running wheel gesture
 };
 
 }  // namespace
