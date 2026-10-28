@@ -2267,12 +2267,26 @@ struct Shell::Impl {
       double s = ts.loop_start, e = ts.loop_end;
       bool on = (ts.flags & SQ_TRANSPORT_LOOPING) != 0;
       const bool saved = readLoop(activeImpl(), &s, &e, &on);  // main-thread truth (the snapshot lags a block)
+      sq_engine_status st{};
+      st.struct_size = sizeof st;
+      audio->getStatus(&st);
+      const bool running = (st.flags & SQ_ENGINE_RUNNING) != 0, playing = (ts.flags & SQ_TRANSPORT_PLAYING) != 0;
       if (res) {
         res->setDouble("loop_start", s);
         res->setDouble("loop_end", e);
         res->setBool("looping", on ? SQ_TRUE : SQ_FALSE);
+        res->setBool("playing", playing ? SQ_TRUE : SQ_FALSE);
+        res->setDouble("position", ts.position);
+        res->setDouble("seconds", ts.seconds);
+        res->setBool("engine_running", running ? SQ_TRUE : SQ_FALSE);
+        res->setInt("xruns", static_cast<int64_t>(st.xruns));
       }
-      return setMessage(SQ_OK, "loop " + fmtNum(s) + ".." + fmtNum(e) + (on ? " on" : " off") + (saved ? " (song)" : ""));
+      char rate[64] = "";
+      if (running) std::snprintf(rate, sizeof rate, " %.0f Hz/%u", st.sample_rate, st.block_frames);
+      return setMessage(SQ_OK, std::string(playing ? "playing" : "stopped") + " at " + fmtNum(ts.seconds) + " s, engine " +
+                                   (running ? std::string("running on '") + st.device_id + "'" + rate + ", xruns " + std::to_string(st.xruns)
+                                            : std::string("stopped")) +
+                                   ", loop " + fmtNum(s) + ".." + fmtNum(e) + (on ? " on" : " off") + (saved ? " (song)" : ""));
     });
     add("Clip", "AddAudio", "Add Audio Clip", [this](IAttributes* a, IAttributes* res) {
       auto t = track(a);

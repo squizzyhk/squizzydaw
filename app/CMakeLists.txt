@@ -255,18 +255,18 @@ if(SQ_BUILD_TESTS)
       "File.ExportAudio path=${_persist}/proj/Media/tail.wav" "ok - exported .*\\(tail [0-9]*\\.?[0-9]*[1-9][0-9]* s, auto\\)"
       "File.ExportAudio path=${_persist}/cut.wav tail=0" "ok - exported .*\\(tail 0 s\\)"
       "Transport.SetLoop start=4 end=12" "ok"
-      "Transport.Info" "ok - loop 4\\.\\.12 on \\(song\\)"
+      "Transport.Info" "ok - .*loop 4\\.\\.12 on \\(song\\)"
       "Track.AddAudio name=Vox" "ok"
       "Clip.AddAudio path=${_persist}/proj/Media/tail.wav" "ok - audio clip"
       "Clip.AddAudio path=${_persist}/proj/Media/never_recorded.wav start=8" "ok - audio clip .*\\(file missing\\)"
       "File.Save path=${_persist}/proj/song.song" "ok - saved"
       File.Close "ok"
       File.New "ok"
-      "Transport.Info" "ok - loop 0\\.\\.0 off"
+      "Transport.Info" "ok - .*loop 0\\.\\.0 off"
       "File.Open path=${_persist}/proj/song.song" "ok - opened .* WARNING: 1 missing media file\\(s\\): never_recorded\\.wav"
-      "Transport.Info" "ok - loop 4\\.\\.12 on \\(song\\)"
+      "Transport.Info" "ok - .*loop 4\\.\\.12 on \\(song\\)"
       Transport.ToggleLoop "ok"
-      "Transport.Info" "ok - loop 4\\.\\.12 off \\(song\\)"
+      "Transport.Info" "ok - .*loop 4\\.\\.12 off \\(song\\)"
       "File.ExportAudio path=${_persist}/missing.wav" "ok - exported .* WARNING: 1 missing media file\\(s\\) rendered as silence: never_recorded\\.wav")
     # Takes recorded / bounced into an untitled song live in the temp media folder: the first save
     # copies them into "<song name> Media" next to the song (TMPDIR / TMP / TEMP point at a test

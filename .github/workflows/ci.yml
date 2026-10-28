@@ -80,6 +80,17 @@ jobs:
           "window smoke exit code: $($p.ExitCode)"
           exit $p.ExitCode
 
+      - name: HiDPI renders (Windows, 150% and 200%)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        working-directory: package/SquizzyStudio
+        run: |
+          foreach ($sc in '1.5', '2') {
+            ./SquizzyStudio.exe --audio-driver none --run File.New --run "Track.AddDrums name=Drums" --run "Track.AddInstrument name=Keys" --screenshot "../windows-screenshot-$sc.png" --size 1920x1080 --scale $sc
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if (!(Test-Path "../windows-screenshot-$sc.png")) { Write-Error "no screenshot at scale $sc"; exit 1 }
+          }
+
       - name: Upload Windows package
         if: always() && runner.os == 'Windows'
         uses: actions/upload-artifact@v4
@@ -87,7 +98,7 @@ jobs:
           name: SquizzyStudio-windows-x64
           path: |
             package/SquizzyStudio/
-            package/windows-screenshot.png
+            package/windows-screenshot*.png
             package/windows-mixdown.wav
           if-no-files-found: error
 
