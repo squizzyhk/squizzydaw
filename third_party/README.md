@@ -4,7 +4,7 @@ M0 uses **no** third-party code. The test framework (`tests/framework/sqtest.hpp
 
 When you need a dependency:
 
-1. **One subdirectory per library**: `third_party/<name>/` with a `VERSION` file. Keep it unmodified upstream source. If you must patch it, put the patches in `third_party/<name>/PATCHES.md` and explain each one. The root CMakeLists adds every `third_party/*/CMakeLists.txt` with `EXCLUDE_FROM_ALL`, so a library compiles only when something links it.
+1. **One subdirectory per library**: `third_party/<name>/` with a `VERSION.txt` file (not `VERSION`: on case-insensitive file systems it shadows the C++ `<version>` header). Keep it unmodified upstream source. If you must patch it, put the patches in `third_party/<name>/PATCHES.md` and explain each one. The root CMakeLists adds every `third_party/*/CMakeLists.txt` with `EXCLUDE_FROM_ALL`, so a library compiles only when something links it.
 2. **License file required.** Copy the upstream `LICENSE`/`COPYING` into that folder, and add a row to the table below in the same change.
 3. **Permissive licenses only for vendored source**: MIT, BSD-2/3, Apache-2.0, zlib, ISC, Boost. LGPL components (mpg123, LAME, an ffmpeg LGPL build) are never vendored as source into our targets. They are loaded dynamically by their own service DLL (plan §3.2). GPL/commercial items (VST3 proprietary path, élastique, Link) each sit behind their own service module and are added only after a license decision.
 4. **Small only.** The dev disk is tight. No Skia, Chromium or full ffmpeg source trees in the repo. Large SDKs are fetched at configure time into `build/_deps` (CMake `FetchContent` with a pinned hash) or come from the system, behind an `option(SQ_WITH_<NAME>)` that defaults OFF until CI has the dependency cached.

@@ -133,11 +133,26 @@ sq_result sq_pipe_listen(const char* name, sq_pipe_server** out) {
 sq_result sq_pipe_accept(sq_pipe_server* s, int32_t timeout_ms, sq_pipe** out) {
   if (!s || !out) return SQ_E_INVALIDARG;
   *out = nullptr;
-  int w = waitFd(s->fd, POLLIN, timeout_ms);
-  if (w == 0) return SQ_E_TIMEOUT;
-  if (w < 0) return SQ_E_IO;
-  int c = accept(s->fd, nullptr, nullptr);
-  if (c < 0) return SQ_E_IO;
+  const uint64_t deadline = timeout_ms < 0 ? UINT64_MAX : nowMs() + static_cast<uint64_t>(timeout_ms);
+  int c = -1;
+  for (;;) {
+    const uint64_t now = nowMs();
+    const int32_t left = timeout_ms < 0 ? -1 : static_cast<int32_t>(deadline > now ? deadline - now : 0);
+    int w = waitFd(s->fd, POLLIN, left);
+    if (w == 0) return SQ_E_TIMEOUT;
+    if (w < 0) return SQ_E_IO;
+    c = accept(s->fd, nullptr, nullptr);
+    if (c < 0) return SQ_E_IO;
+    // Skip connections their peer already closed without sending anything: the liveness probe of
+    // a second sq_pipe_listen on the same name connects and hangs up immediately.
+    char peek;
+    ssize_t n = recv(c, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0) {
+      close(c);
+      continue;
+    }
+    break;
+  }
   fcntl(c, F_SETFD, FD_CLOEXEC);
   auto* p = new (std::nothrow) sq_pipe();
   if (!p) {

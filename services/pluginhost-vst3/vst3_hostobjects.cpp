@@ -1,3 +1,8 @@
+#ifdef _MSC_VER
+// VST3 interface methods take a parameter named `iid`, which newer MSVC flags as hiding the
+// interface's static `iid` member (C4458). The names come from the SDK signatures.
+#pragma warning(disable : 4458)
+#endif
 #include "vst3_hostobjects.hpp"
 
 #include <pluginterfaces/base/ipluginbase.h>
