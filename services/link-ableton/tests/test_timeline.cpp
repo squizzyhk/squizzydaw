@@ -1,5 +1,6 @@
 // link-ableton: local timeline math, the wait-free publisher, and RT properties of capture().
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <new>
@@ -145,6 +146,9 @@ SQ_TEST("tempo: readers never observe a torn timeline while a writer hammers it"
     t.timeOrigin = static_cast<uint64_t>(t.bpm);
     pub.write(t);
   }
+  // On a loaded machine the readers may barely have run while the writer hammered: let them read
+  // the settled value for a moment (bounded) so the counts below measure the publisher, not the OS.
+  for (int spin = 0; spin < 2000 && reads.load() < 1000; ++spin) std::this_thread::sleep_for(std::chrono::milliseconds(1));
   stop.store(true);
   for (auto& th : readers) th.join();
   CHECK_EQ(torn.load(), 0L);
