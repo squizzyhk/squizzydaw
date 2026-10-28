@@ -785,7 +785,7 @@ class ClipEditor final : public Widget, public CharInput, public EditTarget {
     const float zw = 24 + 2 + 24 + 2 + 34;
     const float limit = f.right() - zw - 10 - 8;
     std::array<float, kGCount> gw{};
-    auto measure = [&]() {
+    auto measureGroups = [&]() {
       float sum = 0;
       dry_ = true;
       for (int g = 0; g < kGCount; ++g) {
@@ -797,10 +797,10 @@ class ClipEditor final : public Widget, public CharInput, public EditTarget {
     };
     compact_ = false;
     float nameW = std::clamp(nameFull, 70.0f, 200.0f);
-    if (midi && f.x + 20 + nameW + 4 + measure() > limit) {
+    if (midi && f.x + 20 + nameW + 4 + measureGroups() > limit) {
       compact_ = true;
       nameW = std::clamp(nameFull, 60.0f, 110.0f);
-      measure();
+      measureGroups();
     }
     // clip + track
     float x = f.x + 10;
