@@ -23,6 +23,19 @@ enum Piece : int { Kick, Snare, Clap, Rim, Chh, Ohh, TomL, TomM, TomH, Crash, Ri
 constexpr float kPan[kPieces] = {0.0f, 0.0f, 0.05f, -0.1f, 0.25f, 0.25f, 0.35f, 0.0f, -0.35f, -0.3f, 0.35f};
 constexpr uint32_t kLevelParam[kPieces] = {kKickLevel, kSnareLevel, kClapLevel, kRimLevel, kChhLevel, kOhhLevel,
                                            kTomLevel,  kTomLevel,   kTomLevel,  kCrashLevel, kRideLevel};
+// Kit output trim: every piece is voiced to peak near full scale on its own, so the summed kit is
+// scaled down to leave headroom (kick + snare + hat at full velocity peaks around -3 dBFS) ...
+constexpr float kOutTrim = 0.36f;
+// ... and the kit bus has a soft knee above kKnee that approaches (never reaches) kCeiling, so
+// even every piece hit at once does not go over 0 dBFS, whatever the master level.
+constexpr float kKnee = 0.7f, kCeiling = 0.97f;
+inline float kitKnee(float x) noexcept {
+  const float a = std::fabs(x);
+  if (a <= kKnee) return x;
+  const float y = kKnee + (kCeiling - kKnee) * std::tanh((a - kKnee) / (kCeiling - kKnee));
+  return x < 0.0f ? -y : y;
+}
+
 // Inharmonic ratios of the six square oscillators feeding hats and cymbals.
 constexpr float kMetal[6] = {1.0f, 1.4471f, 1.6170f, 1.9265f, 2.5028f, 2.6637f};
 
@@ -96,6 +109,7 @@ class Drums final : public SynthDevice {
 
   void render(float* const* io, uint32_t nch, uint32_t n) noexcept override {
     master_.begin(master_.target, n);
+    float busL[kSubBlock] = {}, busR[kSubBlock] = {};  // n <= kSubBlock (Device sub-blocks)
     for (int pc = 0; pc < kPieces; ++pc) {
       Voice& v = v_[pc];
       const float lvlTarget = p(kLevelParam[pc]);
@@ -114,8 +128,9 @@ class Drums final : public SynthDevice {
         v.last = y;
         y += v.declick;
         v.declick *= declickCoef_;
-        y *= m.next();
-        addStereo(io, nch, i, y * gl, y * gr);
+        y *= m.next() * kOutTrim;
+        busL[i] += y * gl;
+        busR[i] += y * gr;
       }
       v.lvl = lvlTarget;
       v.declick = dsp::flush(v.declick);
@@ -126,6 +141,7 @@ class Drums final : public SynthDevice {
       v.f1.flushDenormals();
       v.f2.flushDenormals();
     }
+    for (uint32_t i = 0; i < n; ++i) addStereo(io, nch, i, kitKnee(busL[i]), kitKnee(busR[i]));
     master_.end();
   }
 

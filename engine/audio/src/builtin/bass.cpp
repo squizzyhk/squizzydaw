@@ -106,7 +106,7 @@ class Bass final : public SynthDevice {
     ca_.set(s, fc, 1.41421356);
     cb_.set(s, fc, dsp::SvfCoefs::dampFromRes(p(kReso) * 0.97f));
     const float drive = 1.0f + 6.0f * p(kDrive);
-    const float out = 0.5f * (0.6f + 0.4f * vel_) * 1.6f / (1.0f + p(kDrive));
+    const float out = 0.65f * (0.6f + 0.4f * vel_) * 1.6f / (1.0f + p(kDrive));
     for (uint32_t i = 0; i < n; ++i) {
       float x = 0.0f;
       if (wave == 0 || wave == 2) x += osc_.tick(dsp::Wave::Saw, dt, 0.5f, rng_);
