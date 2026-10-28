@@ -90,6 +90,7 @@ void ArrangeView::paint(Canvas& c) {
     if (ts.position > scroll_ + span * 0.97 || ts.position < scroll_) scroll_ = std::max(0.0, ts.position - span * 0.03);
   }
   wasPlaying_ = playing;
+  trackRecording();
 
   c.pushClip(f);
   c.fillRect(f, p.trackBg);
@@ -306,6 +307,7 @@ void ArrangeView::paintRuler(Canvas& c) {
     if (beatPx >= 7) {
       for (uint32_t b = 1; b < num; ++b) {
         const float bx = xOf(pos + beat * b);
+        if (bx < r.x - 60 || bx > r.right()) continue;
         c.fillRect(Rect{bx, mid - 4, 1, 4}, p.faint);
         if (beatPx >= 46) {
           char buf[48];
@@ -314,7 +316,27 @@ void ArrangeView::paintRuler(Canvas& c) {
         }
       }
     }
-    (void)bar;
+    // sub-beat ticks (and bar.beat.tick labels) when zoomed in far enough
+    const double sub = subdivision(beat, 12.0);
+    if (sub < beat - 1e-12) {
+      const double labelSub = subdivision(beat, 76.0);
+      const double s0 = std::max(pos, pos + std::floor((from - pos) / sub) * sub);
+      for (double s = s0 + sub; s < std::min(pos + bar, to) - 1e-9; s += sub) {
+        const double inBeat = std::fmod(s - pos, beat);
+        if (inBeat < 1e-9 || beat - inBeat < 1e-9) continue;
+        const float sx = xOf(s);
+        const double li = std::fmod(inBeat, labelSub);
+        const bool lab = labelSub < beat - 1e-12 && (li < 1e-9 || labelSub - li < 1e-9);
+        c.fillRect(Rect{sx, lab ? mid - 4 : mid - 2, 1, lab ? 4.0f : 2.0f}, p.faint.withAlpha(lab ? 1.0f : 0.7f));
+        if (lab) {
+          const auto beatNo = static_cast<unsigned>(std::floor((s - pos) / beat + 1e-9)) + 1u;
+          const int tick = std::clamp(static_cast<int>(std::lround(inBeat / beat * 960.0)), 0, 959);
+          char buf[48];
+          std::snprintf(buf, sizeof buf, "%lld.%u.%03d", static_cast<long long>(idx + 1), beatNo, tick);
+          c.drawText(buf, Rect{sx + 3, r.y + 3, 70, mid - r.y - 3}, p.faint, 10);
+        }
+      }
+    }
   });
   // edit cursor + playhead heads
   const float cx = xOf(es_.cursor);
@@ -392,10 +414,15 @@ void ArrangeView::paintGrid(Canvas& c, const Rect& L) {
     if (beat * ppx_ >= 14) {
       for (uint32_t b = 1; b < num; ++b) c.fillRect(Rect{xOf(pos + beat * b), L.y, 1, L.h}, p.grid);
     }
-    // grid subdivisions (when the grid is finer than a beat and visible)
-    if (g < beat - 1e-9 && g * ppx_ >= 9) {
+    // grid subdivisions: the snap grid when it is finer than a beat, and at high zoom at least an
+    // adaptive power-of-two subdivision so the lanes never go blank between beats
+    double sg = g < beat - 1e-9 && g * ppx_ >= 9 ? g : beat;
+    const double adaptive = subdivision(beat, 24.0);
+    if (adaptive < sg - 1e-12 && beat * ppx_ >= 96) sg = adaptive;
+    if (sg < beat - 1e-9) {
       const Color sub = draw::mix(p.trackBg, p.grid, 0.55f);
-      for (double s = pos + g; s < pos + bar - 1e-9; s += g) {
+      const double s0 = std::max(pos, pos + std::floor((from - pos) / sg) * sg);
+      for (double s = s0 + sg; s < std::min(pos + bar, to + sg) - 1e-9; s += sg) {
         const double inBeat = std::fmod(s - pos, beat);
         if (inBeat < 1e-6 || beat - inBeat < 1e-6) continue;
         c.fillRect(Rect{xOf(s), L.y, 1, L.h}, sub);
@@ -439,9 +466,51 @@ void ArrangeView::paintLane(Canvas& c, int idx) {
     const bool dim = moving && sel && !dragCopy_;
     paintClip(c, l, ce, clipRect(l, ce), sel, dim);
   }
+  paintRecordRegion(c, l);
   c.popClip();
   if (l.showAuto)
     for (size_t ai = 0; ai < l.autos.size(); ++ai) paintAutoLane(c, l, static_cast<int>(ai));
+}
+
+// Remembers where the running take started: the stopped position when recording starts from
+// stop, else the position at which recording was first seen (punch-in on the fly).
+void ArrangeView::trackRecording() {
+  const auto ts = ctx_.transport();
+  const bool rec = (ts.flags & SQ_TRANSPORT_RECORDING) != 0;
+  const bool playing = (ts.flags & SQ_TRANSPORT_PLAYING) != 0;
+  if (rec && !wasRecording_) recStart_ = lastPlaying_ ? ts.position : std::min(lastPos_, ts.position);
+  wasRecording_ = rec;
+  lastPlaying_ = playing || rec;
+  lastPos_ = ts.position;
+}
+
+// Finest power-of-two subdivision of a beat whose spacing is at least minPx (beat itself: none).
+double ArrangeView::subdivision(double beat, double minPx) const {
+  double s = beat;
+  while (s / 2 * ppx_ >= minPx && s > beat / 256) s /= 2;
+  return s;
+}
+
+// The take being recorded on an armed track: a growing red region from the record start (or the
+// punch-in) to the playhead.
+void ArrangeView::paintRecordRegion(Canvas& c, const Lane& l) {
+  if (!wasRecording_ || !(l.t.info.flags & SQ_TRACK_ARMED) || !(l.audio() || l.instrument())) return;
+  const Palette& p = ctx_.palette();
+  const auto ts = ctx_.transport();
+  double a = recStart_, b = ts.position;
+  if ((ts.flags & SQ_TRANSPORT_PUNCH) && punchOut_ > punchIn_) {
+    a = std::max(a, punchIn_);
+    b = std::min(b, punchOut_);
+  }
+  if (b <= a) return;
+  const float x0 = xOf(a), x1 = std::max(xOf(b), x0 + 2);
+  const Rect r{x0, laneTop(l) + 2, x1 - x0, l.h - 5};
+  c.fillRoundRect(r, std::min(4.0f, r.w / 2), p.rec.withAlpha(0.28f));
+  c.strokeRoundRect(r, std::min(4.0f, r.w / 2), p.rec, 1.2f);
+  if (r.h >= 30 && r.w > 40) {
+    c.fillRect(Rect{r.x + 1, r.y + 1, r.w - 2, 15}, p.rec.withAlpha(0.55f));
+    c.drawText("Recording", Rect{r.x + 6, r.y + 1, r.w - 10, 15}, onColor(p.rec), 10.5f);
+  }
 }
 
 void ArrangeView::paintClip(Canvas& c, const Lane& l, const ClipEntry& ce, const Rect& r, bool sel, bool ghost) {
@@ -618,7 +687,7 @@ void ArrangeView::paintAutoLane(Canvas& c, const Lane& l, int ai) {
   AutoLane view = a;
   if (editing) view.points = dragPoints_;
   // reference line (0 dB / center)
-  const AutoRange rg = autoRange(a.target, view.points);
+  const AutoRange rg = autoRange(a.target, view.points, a.param);
   if (a.target == "volume") {
     const float y0 = autoValueY(view, r, 0.0);
     c.fillRect(Rect{r.x, y0, r.w, 1}, p.grid);
@@ -627,7 +696,7 @@ void ArrangeView::paintAutoLane(Canvas& c, const Lane& l, int ai) {
   }
   const Color col = l.color;
   if (pts.empty()) {
-    const double def = a.target == "volume" ? l.t.info.volume_db : a.target == "pan" ? l.t.info.pan : rg.lo;
+    const double def = a.target == "volume" ? l.t.info.volume_db : a.target == "pan" ? l.t.info.pan : a.param ? static_cast<double>(a.param->def) : rg.lo;
     const float y = autoValueY(view, r, def);
     c.fillRect(Rect{r.x, y - 0.5f, r.w, 1.5f}, col.withAlpha(0.4f));
     c.drawText("Click to add automation points", Rect{r.x + 10, r.bottom() - 17, 300, 14}, p.faint, 10.5f);
@@ -657,7 +726,7 @@ void ArrangeView::paintAutoLane(Canvas& c, const Lane& l, int ai) {
       c.fillEllipse(Rect{x - rad, y - rad, 2 * rad, 2 * rad}, hot ? p.text : draw::lighten(col, 0.35f));
       c.strokeEllipse(Rect{x - rad, y - rad, 2 * rad, 2 * rad}, p.border, 1);
       if (hot) {
-        const std::string v = formatAutoValue(a.target, pts[i].second);
+        const std::string v = formatAutoValue(a.target, pts[i].second, a.param);
         const float tw = c.measureText(v, 10.5f) + 10;
         const float ty = y - 22 < r.y ? y + 8 : y - 22;
         c.fillRoundRect(Rect{x + 6, ty, tw, 16}, 3, p.panel3);
@@ -681,23 +750,24 @@ void ArrangeView::paintAutoHeader(Canvas& c, const Lane& l, int ai) {
   const Rect sel{r.x + 24, r.y + 7, std::min(r.w - 34, 150.0f), 20};
   c.fillRoundRect(sel, 4, hot ? p.panel3 : p.panel2);
   c.strokeRoundRect(sel, 4, p.border, 1);
-  c.drawText(autoLabel(a.target), Rect{sel.x + 8, sel.y, sel.w - 24, sel.h}, a.stored ? p.text : p.dim, 11.5f);
+  c.drawText(a.label.empty() ? autoLabel(a.target) : a.label, Rect{sel.x + 8, sel.y, sel.w - 24, sel.h}, a.stored ? p.text : p.dim, 11.5f);
   draw::triangle(c, Rect{sel.right() - 14, sel.y + sel.h / 2 - 2, 7, 4}, 2, p.dim);
   // value at the playhead
   const double pos = ctx_.transport().position;
-  const double def = a.target == "volume" ? l.t.info.volume_db : a.target == "pan" ? l.t.info.pan : 0.0;
+  const double def = a.target == "volume" ? l.t.info.volume_db : a.target == "pan" ? l.t.info.pan : a.param ? static_cast<double>(a.param->def) : 0.0;
   double v = def;
   if (!a.points.empty()) {
     v = a.points.front().second;
     for (size_t i = 0; i < a.points.size(); ++i) {
       if (a.points[i].first <= pos) v = a.points[i].second;
-      if (i + 1 < a.points.size() && a.points[i].first <= pos && a.points[i + 1].first > pos && a.target != "mute") {
+      if (i + 1 < a.points.size() && a.points[i].first <= pos && a.points[i + 1].first > pos && a.target != "mute" &&
+          !(a.param && a.param->kind != engine::audio::ParamKind::Continuous)) {
         const double t = (pos - a.points[i].first) / (a.points[i + 1].first - a.points[i].first);
         v = a.points[i].second + (a.points[i + 1].second - a.points[i].second) * t;
       }
     }
   }
-  c.drawText(formatAutoValue(a.target, v), Rect{r.x + 24, r.y + 32, r.w - 34, 16}, p.dim, 11);
+  c.drawText(formatAutoValue(a.target, v, a.param), Rect{r.x + 24, r.y + 32, r.w - 34, 16}, p.dim, 11);
   c.drawText(std::to_string(a.points.size()) + " pts", Rect{r.x + 24, r.y + 32, r.w - 40, 16}, p.faint, 10.5f, TextAlign::Right);
 }
 

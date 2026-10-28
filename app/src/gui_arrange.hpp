@@ -32,6 +32,7 @@
 #include "gui_context.hpp"
 #include "gui_panels.hpp"
 #include "gui_waveform.hpp"
+#include "sq/engine/audio/builtin.hpp"
 
 namespace sq::app::gui::arrange {
 
@@ -53,6 +54,10 @@ struct AutoLane {
   std::string target;                             // automation.hpp target ("volume", "pan", ...)
   std::vector<std::pair<double, double>> points;  // (ppq, plain value)
   bool stored = false;                            // exists in the document
+  // instrument.<p> / insert.<slot>.<p> of a built-in device: its parameter (static catalog entry)
+  // and a display label ("Synth: Cutoff"); null / empty for track targets and unknown devices.
+  const engine::audio::ParamInfo* param = nullptr;
+  std::string label;
   float y = 0, h = 0;                             // content coordinates
 };
 
@@ -79,10 +84,22 @@ struct AutoRange {
   double lo = 0, hi = 1;
   bool stepped = false;
   const char* unit = "";
+  bool log = false;  // logarithmic display (frequencies, times)
 };
-AutoRange autoRange(const std::string& target, const std::vector<std::pair<double, double>>& pts);
+// pi: the device parameter of an instrument./insert. target (AutoLane::param), null otherwise.
+AutoRange autoRange(const std::string& target, const std::vector<std::pair<double, double>>& pts,
+                    const engine::audio::ParamInfo* pi = nullptr);
 std::string autoLabel(const std::string& target);
-std::string formatAutoValue(const std::string& target, double v);
+std::string formatAutoValue(const std::string& target, double v, const engine::audio::ParamInfo* pi = nullptr);
+
+// A copied clip (Edit > Copy): everything needed to recreate it, independent of the document.
+struct ClipCopy {
+  sq_clip_info info{};
+  std::string name, source;
+  std::vector<sq_clip_event> events;
+  int laneOffset = 0;  // track offset from the topmost copied clip's track
+  sq_guid track{};     // source track (fallback when no track is selected)
+};
 
 enum class Drag {
   None,
@@ -155,7 +172,7 @@ struct ToolButton {
   int id = 0;
 };
 
-class ArrangeView final : public Widget, public CharInput {
+class ArrangeView final : public Widget, public CharInput, public EditTarget {
  public:
   explicit ArrangeView(GuiContext& ctx);
   ~ArrangeView() override;
@@ -164,6 +181,7 @@ class ArrangeView final : public Widget, public CharInput {
   bool onMouse(const WidgetMouse& e) override;
   bool onKey(Key k, unsigned mods) override;
   bool onChar(uint32_t ch, unsigned mods) override;
+  bool editCommand(std::string_view cmd) override;
   bool focusable() const override { return true; }
 
   bool dropFile(float x, float y, const std::string& path);
@@ -192,6 +210,12 @@ class ArrangeView final : public Widget, public CharInput {
   std::map<sq_guid, bool> autoShown_;
   std::map<sq_guid, std::vector<std::string>> autoExtra_;  // UI-only lanes (no points yet)
   std::map<sq_guid, float> meterHold_;
+  double punchIn_ = 0, punchOut_ = 0;  // punch range marker (punchOut_ <= punchIn_: none)
+  // live recording region: transport position when recording started (GUI-observed)
+  bool wasRecording_ = false;
+  bool lastPlaying_ = false;
+  double lastPos_ = 0, recStart_ = 0;
+  void trackRecording();
 
   void refresh();
   void rebuild();
@@ -249,6 +273,15 @@ class ArrangeView final : public Widget, public CharInput {
   void forEachBar(double from, double to, Fn&& fn) const;
 
   // ---- automation ----
+  // Resolves an instrument./insert. target of a track to its built-in parameter + label.
+  void resolveAutoParam(const TrackView& t, AutoLane* a);
+  // The built-in devices of a track: slot -1 = instrument, else insert slot (bypassed lines count).
+  struct DeviceSlot {
+    int slot = -1;
+    const engine::audio::DeviceInfo* info = nullptr;
+  };
+  std::vector<DeviceSlot> trackDevices(const TrackView& t);
+  static std::string deviceShortName(const engine::audio::DeviceInfo& d);
   void setAutomation(const sq_guid& track, const std::string& target, const std::vector<std::pair<double, double>>& pts);
   float autoValueY(const AutoLane& a, const Rect& r, double v) const;
   double autoValueAt(const AutoLane& a, const Rect& r, float y) const;
@@ -256,6 +289,11 @@ class ArrangeView final : public Widget, public CharInput {
 
   // ---- edits (gui_arrange.cpp) ----
   sq_guid copyClip(const ClipEntry& c, const sq_guid& track, double start);
+  ClipCopy snapshot(const ClipEntry& c);
+  sq_guid addClipCopy(const ClipCopy& cc, const sq_guid& track, double start);
+  bool copySelection();
+  bool pasteClipboard();
+  std::vector<ClipCopy> clipboard_;  // sorted by start; the first one starts the copied range
   void commitMove(double delta, int laneDelta, bool copy);
   void splitAt(const ClipEntry& c, double at);
   void createMidiClip(const Lane& l, double at);
@@ -327,6 +365,9 @@ class ArrangeView final : public Widget, public CharInput {
   void paintMarkers(Canvas& c);
   void paintGrid(Canvas& c, const Rect& r);
   void paintLane(Canvas& c, int idx);
+  void paintRecordRegion(Canvas& c, const Lane& l);
+  // Finest power-of-two subdivision of a beat whose spacing is >= minPx (== beat: none).
+  double subdivision(double beat, double minPx) const;
   void paintHeader(Canvas& c, int idx);
   void paintClip(Canvas& c, const Lane& l, const ClipEntry& ce, const Rect& r, bool sel, bool ghost);
   void paintWaveform(Canvas& c, const ClipEntry& ce, const Rect& body, Color col);

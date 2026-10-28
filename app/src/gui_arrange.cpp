@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 
@@ -81,12 +82,31 @@ std::vector<engine::audio::AutomationLane> readAutomation(GuiContext& ctx, const
   return out;
 }
 
+std::vector<std::string> splitSpecLines(const std::string& text) {
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    const size_t nl = text.find('\n', pos);
+    std::string l = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+    pos = nl == std::string::npos ? text.size() : nl + 1;
+    while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+    if (!l.empty()) out.push_back(l);
+  }
+  return out;
+}
+
 const char* kColorNames[] = {"Teal", "Violet", "Amber", "Blue", "Coral", "Sage", "Magenta", "Olive", "Red", "Gray"};
 
 }  // namespace
 
 // ---- automation targets ---------------------------------------------------------------------------
-AutoRange autoRange(const std::string& tgt, const std::vector<std::pair<double, double>>& pts) {
+AutoRange autoRange(const std::string& tgt, const std::vector<std::pair<double, double>>& pts, const engine::audio::ParamInfo* pi) {
+  if (pi && pi->max > pi->min) {
+    AutoRange r{static_cast<double>(pi->min), static_cast<double>(pi->max), pi->kind != engine::audio::ParamKind::Continuous,
+                pi->unit.c_str(), false};
+    r.log = pi->logScale && pi->min > 0;
+    return r;
+  }
   if (tgt == "volume" || tgt.compare(0, 5, "send.") == 0) return AutoRange{-60.0, 6.0, false, "dB"};
   if (tgt == "pan") return AutoRange{-1.0, 1.0, false, ""};
   if (tgt == "mute") return AutoRange{0.0, 1.0, true, ""};
@@ -111,8 +131,24 @@ std::string autoLabel(const std::string& tgt) {
   return tgt;
 }
 
-std::string formatAutoValue(const std::string& tgt, double v) {
+std::string formatAutoValue(const std::string& tgt, double v, const engine::audio::ParamInfo* pi) {
   char buf[48];
+  if (pi) {
+    namespace ea = engine::audio;
+    if (pi->kind == ea::ParamKind::Choice && !pi->choices.empty()) {
+      const auto i = static_cast<size_t>(std::clamp(static_cast<long>(std::lround(v)), 0L, static_cast<long>(pi->choices.size()) - 1));
+      return pi->choices[i];
+    }
+    if (pi->kind == ea::ParamKind::Toggle) return v >= 0.5 ? "On" : "Off";
+    const char* sep = pi->unit.empty() ? "" : " ";
+    if (pi->kind == ea::ParamKind::Integer) std::snprintf(buf, sizeof buf, "%ld%s%s", static_cast<long>(std::lround(v)), sep, pi->unit.c_str());
+    else if (pi->unit == "Hz" && v >= 1000) std::snprintf(buf, sizeof buf, "%.2f kHz", v / 1000.0);
+    else if (pi->unit == "ms" && v >= 1000) std::snprintf(buf, sizeof buf, "%.2f s", v / 1000.0);
+    else if (std::fabs(v) >= 100) std::snprintf(buf, sizeof buf, "%.0f%s%s", v, sep, pi->unit.c_str());
+    else if (std::fabs(v) >= 10) std::snprintf(buf, sizeof buf, "%.1f%s%s", v, sep, pi->unit.c_str());
+    else std::snprintf(buf, sizeof buf, "%.2f%s%s", v, sep, pi->unit.c_str());
+    return buf;
+  }
   if (tgt == "volume" || tgt.compare(0, 5, "send.") == 0) {
     if (v <= -59.95) return "-inf dB";
     std::snprintf(buf, sizeof buf, "%+.1f dB", v);
@@ -147,6 +183,7 @@ void ArrangeView::rebuild() {
   sigs_.clear();
   tempo_ = nullptr;
   songEnd_ = 0;
+  punchIn_ = punchOut_ = 0;
   auto d = ctx_.doc();
   if (d) {
     d->getTempoMap(tempo_.put());
@@ -155,6 +192,10 @@ void ArrangeView::rebuild() {
       MarkerView mv;
       mv.m.struct_size = sizeof mv.m;
       if (d->getMarker(i, &mv.m) != SQ_OK) continue;
+      if (mv.m.flags & SQ_DOCMARKER_PUNCH) {
+        punchIn_ = mv.m.position;
+        punchOut_ = mv.m.position + mv.m.length;
+      }
       if (mv.m.flags & (SQ_DOCMARKER_LOOP | SQ_DOCMARKER_PUNCH)) continue;
       markers_.push_back(mv);
     }
@@ -222,6 +263,7 @@ void ArrangeView::rebuild() {
         l.autos.push_back(std::move(a));
         extra.push_back("volume");
       }
+      for (auto& a : l.autos) resolveAutoParam(t, &a);
     }
     l.t = std::move(t);
     lanes_.push_back(std::move(l));
@@ -436,6 +478,56 @@ double ArrangeView::secAt(double ppq) const { return tempo_ ? tempo_->ppqToSecon
 double ArrangeView::ppqAtSec(double sec) const { return tempo_ ? tempo_->secondsToPpq(sec) : sec * 2.0; }
 
 // ---- automation -------------------------------------------------------------------------------------
+std::string ArrangeView::deviceShortName(const engine::audio::DeviceInfo& dev) {
+  std::string n = dev.name;
+  if (n.compare(0, 8, "Squizzy ") == 0 && n.size() > 8) n = n.substr(8);
+  return n;
+}
+
+std::vector<ArrangeView::DeviceSlot> ArrangeView::trackDevices(const TrackView& t) {
+  namespace ea = engine::audio;
+  std::vector<DeviceSlot> out;
+  auto builtinOf = [](const std::string& line) -> const ea::DeviceInfo* {
+    ea::SpecParts sp;
+    if (!ea::parseSpec(ea::specWithoutBypass(line), &sp) || sp.format != "builtin") return nullptr;
+    return ea::findBuiltin(sp.id);
+  };
+  if (t.info.kind == SQ_TRACK_INSTRUMENT) {
+    std::string spec = ctx_.trackString(t.id, "user.instrument");
+    if (spec.empty()) spec = ea::kDefaultInstrument;
+    out.push_back(DeviceSlot{-1, builtinOf(spec)});
+  }
+  const auto lines = splitSpecLines(ctx_.trackString(t.id, "user.inserts"));
+  for (size_t i = 0; i < lines.size(); ++i) out.push_back(DeviceSlot{static_cast<int>(i), builtinOf(lines[i])});
+  return out;
+}
+
+void ArrangeView::resolveAutoParam(const TrackView& t, AutoLane* a) {
+  a->param = nullptr;
+  a->label.clear();
+  int slot = -2;
+  size_t pidx = 0;
+  const std::string& tg = a->target;
+  if (tg.compare(0, 11, "instrument.") == 0) {
+    slot = -1;
+    pidx = static_cast<size_t>(std::strtoul(tg.c_str() + 11, nullptr, 10));
+  } else if (tg.compare(0, 7, "insert.") == 0) {
+    const size_t dot = tg.find('.', 7);
+    if (dot == std::string::npos) return;
+    slot = std::atoi(tg.c_str() + 7);
+    pidx = static_cast<size_t>(std::strtoul(tg.c_str() + dot + 1, nullptr, 10));
+  } else {
+    return;
+  }
+  for (const auto& ds : trackDevices(t)) {
+    if (ds.slot != slot || !ds.info) continue;
+    if (pidx >= ds.info->params.size()) return;
+    a->param = &ds.info->params[pidx];
+    a->label = (slot >= 0 ? "FX" + std::to_string(slot + 1) + " " : std::string()) + deviceShortName(*ds.info) + ": " + a->param->name;
+    return;
+  }
+}
+
 void ArrangeView::setAutomation(const sq_guid& track, const std::string& tgt, const std::vector<std::pair<double, double>>& pts) {
   std::vector<double> raw;
   raw.reserve(pts.size() * 2);
@@ -459,30 +551,44 @@ Rect ArrangeView::autoLaneRect(const Lane& l, const AutoLane& a) const {
 }
 
 float ArrangeView::autoValueY(const AutoLane& a, const Rect& r, double v) const {
-  const AutoRange rg = autoRange(a.target, a.points);
-  const double t = rg.hi > rg.lo ? std::clamp((v - rg.lo) / (rg.hi - rg.lo), 0.0, 1.0) : 0.5;
+  const AutoRange rg = autoRange(a.target, a.points, a.param);
+  double t = 0.5;
+  if (rg.log) t = std::clamp(std::log(std::max(v, rg.lo) / rg.lo) / std::log(rg.hi / rg.lo), 0.0, 1.0);
+  else if (rg.hi > rg.lo) t = std::clamp((v - rg.lo) / (rg.hi - rg.lo), 0.0, 1.0);
   return r.bottom() - 6 - static_cast<float>(t) * (r.h - 12);
 }
 
 double ArrangeView::autoValueAt(const AutoLane& a, const Rect& r, float y) const {
-  const AutoRange rg = autoRange(a.target, a.points);
+  const AutoRange rg = autoRange(a.target, a.points, a.param);
   const double t = std::clamp(static_cast<double>(r.bottom() - 6 - y) / std::max(1.0, static_cast<double>(r.h - 12)), 0.0, 1.0);
-  double v = rg.lo + t * (rg.hi - rg.lo);
+  double v = rg.log ? rg.lo * std::pow(rg.hi / rg.lo, t) : rg.lo + t * (rg.hi - rg.lo);
   if (rg.stepped) v = std::round(v);
   return v;
 }
 
 // ---- edits ------------------------------------------------------------------------------------------
-sq_guid ArrangeView::copyClip(const ClipEntry& c, const sq_guid& track, double start) {
-  const auto& ci = c.v.info;
+ClipCopy ArrangeView::snapshot(const ClipEntry& c) {
+  ClipCopy cc;
+  cc.info = c.v.info;
+  cc.name = c.v.name;
+  cc.source = c.v.source;
+  cc.track = c.v.track;
+  if (c.v.info.kind == SQ_CLIP_MIDI && c.v.info.event_count > 0) cc.events = ctx_.clipEvents(c.v.clip.get());
+  return cc;
+}
+
+sq_guid ArrangeView::copyClip(const ClipEntry& c, const sq_guid& track, double start) { return addClipCopy(snapshot(c), track, start); }
+
+sq_guid ArrangeView::addClipCopy(const ClipCopy& cc, const sq_guid& track, double start) {
+  const auto& ci = cc.info;
   auto p = sq::makeAttributes();
   p->setGuid("track", &track);
   p->setInt("kind", ci.kind);
   p->setDouble("start", std::max(0.0, start));
   p->setDouble("length", ci.length);
-  p->setString("name", c.v.name.c_str());
+  p->setString("name", cc.name.c_str());
   if (ci.kind == SQ_CLIP_AUDIO) {
-    p->setString("source", c.v.source.c_str());
+    p->setString("source", cc.source.c_str());
     p->setDouble("source_offset", ci.source_offset_seconds);
   }
   auto res = sq::makeAttributes();
@@ -501,14 +607,123 @@ sq_guid ArrangeView::copyClip(const ClipEntry& c, const sq_guid& track, double s
     cp->setInt("value", ci.color);
     ctx_.exec(sq::doc::kSetProperty, cp.get());
   }
-  if (ci.kind == SQ_CLIP_MIDI && ci.event_count > 0) {
-    auto evs = ctx_.clipEvents(c.v.clip.get());
+  if (ci.kind == SQ_CLIP_MIDI && !cc.events.empty()) {
     auto e = sq::makeAttributes();
     e->setGuid("clip", &id);
-    e->setBlob("events", evs.data(), static_cast<uint32_t>(evs.size() * sizeof(sq_clip_event)));
+    e->setBlob("events", cc.events.data(), static_cast<uint32_t>(cc.events.size() * sizeof(sq_clip_event)));
     ctx_.exec(sq::doc::kSetClipEvents, e.get());
   }
   return id;
+}
+
+// ---- clipboard --------------------------------------------------------------------------------------
+bool ArrangeView::copySelection() {
+  refresh();
+  std::vector<ClipCopy> out;
+  int topLane = -1;
+  std::vector<int> laneOf;
+  for (size_t i = 0; i < lanes_.size(); ++i)
+    for (const auto& c : lanes_[i].clips)
+      if (selected(c.v.id)) {
+        out.push_back(snapshot(c));
+        laneOf.push_back(static_cast<int>(i));
+        if (topLane < 0) topLane = static_cast<int>(i);
+      }
+  if (out.empty()) return false;
+  for (size_t k = 0; k < out.size(); ++k) out[k].laneOffset = laneOf[k] - topLane;
+  std::stable_sort(out.begin(), out.end(), [](const ClipCopy& a, const ClipCopy& b) { return a.info.start < b.info.start; });
+  clipboard_ = std::move(out);
+  return true;
+}
+
+bool ArrangeView::pasteClipboard() {
+  refresh();
+  if (clipboard_.empty() || lanes_.empty()) return false;
+  // destination: the edit cursor on the selected track (else the first copied clip's track)
+  int base = laneIndex(es_.track);
+  if (base < 0) base = laneIndex(clipboard_.front().track);
+  if (base < 0) base = 0;
+  double first = clipboard_.front().info.start, last = first;
+  for (const auto& cc : clipboard_) last = std::max(last, cc.info.start + cc.info.length);
+  const double at = std::max(0.0, es_.cursor);
+  std::vector<sq_guid> newSel;
+  int skipped = 0;
+  {
+    EditScope scope(ctx_, clipboard_.size() > 1 ? "Paste Clips" : "Paste Clip");
+    for (const auto& cc : clipboard_) {
+      // keep the relative track; a clip that does not fit that track (audio vs MIDI) goes to the
+      // next track below that takes it
+      int li = -1;
+      for (int k = std::clamp(base + cc.laneOffset, 0, static_cast<int>(lanes_.size()) - 1); k < static_cast<int>(lanes_.size()); ++k) {
+        const Lane& l = lanes_[static_cast<size_t>(k)];
+        if ((cc.info.kind == SQ_CLIP_AUDIO && l.audio()) || (cc.info.kind == SQ_CLIP_MIDI && l.instrument())) {
+          li = k;
+          break;
+        }
+      }
+      if (li < 0) {
+        ++skipped;
+        continue;
+      }
+      const sq_guid id = addClipCopy(cc, lanes_[static_cast<size_t>(li)].t.id, at + (cc.info.start - first));
+      if (!sq_guid_is_null(&id)) newSel.push_back(id);
+    }
+    if (newSel.empty()) scope.cancel();
+  }
+  if (newSel.empty()) {
+    ctx_.setStatus("nothing pasted: no track takes these clips");
+    return true;
+  }
+  ctx_.setSelection(newSel);
+  ctx_.setCursor(at + (last - first));  // repeated pastes line up
+  ensureVisible(at);
+  char buf[96];
+  std::snprintf(buf, sizeof buf, "pasted %zu clip%s%s", newSel.size(), newSel.size() == 1 ? "" : "s", skipped ? " (some did not fit a track)" : "");
+  ctx_.setStatus(buf);
+  return true;
+}
+
+bool ArrangeView::editCommand(std::string_view cmd) {
+  refresh();
+  if (cmd == "Copy" || cmd == "Cut") {
+    if (!copySelection()) {
+      ctx_.setStatus("no clips selected");
+      return true;
+    }
+    const size_t n = clipboard_.size();
+    if (cmd == "Cut") {
+      ctx_.run("Edit.Delete");
+      ctx_.setStatus("cut " + std::to_string(n) + (n == 1 ? " clip" : " clips"));
+    } else {
+      ctx_.setStatus("copied " + std::to_string(n) + (n == 1 ? " clip" : " clips"));
+    }
+    return true;
+  }
+  if (cmd == "Paste") {
+    if (!pasteClipboard()) ctx_.setStatus("clipboard is empty");
+    return true;
+  }
+  if (cmd == "Delete") {
+    ctx_.run("Edit.Delete");
+    return true;
+  }
+  if (cmd == "Duplicate") {
+    ctx_.run("Edit.Duplicate");
+    return true;
+  }
+  if (cmd == "SelectAll") {
+    ctx_.run("Navigate.SelectAll");
+    return true;
+  }
+  if (cmd == "SelectNone") {
+    ctx_.setSelection({});
+    return true;
+  }
+  if (cmd == "Quantize") {
+    ctx_.run("Edit.Quantize");
+    return true;
+  }
+  return false;
 }
 
 void ArrangeView::commitMove(double delta, int laneDelta, bool copy) {
@@ -904,6 +1119,18 @@ void ArrangeView::clipMenu(int lane, int clip, Point at) {
   };
   m.push_back(mute);
   m.push_back(MenuItem::sep());
+  auto editItem = [this](const char* label, const char* editCmd, const char* shortcut, bool on = true) {
+    MenuItem it;
+    it.label = label;
+    it.shortcut = shortcut;
+    it.enabled = on;
+    std::string ec = editCmd;
+    it.action = [this, ec] { editCommand(ec); };
+    return it;
+  };
+  m.push_back(editItem("Cut", "Cut", "Ctrl+X"));
+  m.push_back(editItem("Copy", "Copy", "Ctrl+C"));
+  m.push_back(editItem("Paste", "Paste", "Ctrl+V", !clipboard_.empty()));
   m.push_back(cmd("Duplicate", "Edit.Duplicate", "Ctrl+D"));
   m.push_back(cmd("Split at Cursor", "Edit.Split", "S"));
   m.push_back(cmd("Delete", "Edit.Delete", "Del"));
@@ -1058,6 +1285,16 @@ void ArrangeView::laneMenu(int lane, double ppq, Point at) {
   mk.label = "Insert Marker";
   mk.action = [this, pos] { addMarkerAt(pos); };
   m.push_back(mk);
+  MenuItem paste;
+  paste.label = "Paste Here";
+  paste.shortcut = "Ctrl+V";
+  paste.enabled = !clipboard_.empty();
+  paste.action = [this, pos] {
+    ctx_.setCursor(pos);
+    es_ = ctx_.editState();
+    pasteClipboard();
+  };
+  m.push_back(paste);
   MenuItem all;
   all.label = "Select All";
   all.shortcut = "Ctrl+A";
@@ -1161,11 +1398,11 @@ void ArrangeView::autoTargetMenu(int lane, int autoLane, Point at) {
     if (!sends.empty() && sends.back() != '\n') ++n;
     for (int i = 0; i < n; ++i) targets.push_back("send." + std::to_string(i));
   }
-  for (const auto& tg : targets) {
+  auto showItem = [this, &l, id](const std::string& tg, const std::string& label) {
     bool shown = false;
     for (const auto& a : l.autos) shown = shown || a.target == tg;
     MenuItem it;
-    it.label = "Show " + autoLabel(tg);
+    it.label = label;
     it.checked = shown;
     it.enabled = !shown;
     it.action = [this, id, tg] {
@@ -1174,7 +1411,38 @@ void ArrangeView::autoTargetMenu(int lane, int autoLane, Point at) {
       rebuild();
       ctx_.invalidate();
     };
-    m.push_back(it);
+    return it;
+  };
+  for (const auto& tg : targets) m.push_back(showItem(tg, "Show " + autoLabel(tg)));
+  // parameters of the instrument and the insert effects (built-in devices)
+  bool sepDone = false;
+  for (const auto& ds : trackDevices(l.t)) {
+    if (!ds.info || ds.info->params.empty()) continue;
+    if (!sepDone) {
+      m.push_back(MenuItem::sep());
+      sepDone = true;
+    }
+    MenuItem dev;
+    dev.label = ds.slot < 0 ? "Instrument: " + ds.info->name : "FX " + std::to_string(ds.slot + 1) + ": " + ds.info->name;
+    const std::string prefix = ds.slot < 0 ? std::string("instrument.") : "insert." + std::to_string(ds.slot) + ".";
+    const auto& params = ds.info->params;
+    auto paramItem = [&](size_t pi) {
+      const auto& par = params[pi];
+      return showItem(prefix + std::to_string(pi), par.unit.empty() ? par.name : par.name + " (" + par.unit + ")");
+    };
+    constexpr size_t kChunk = 12;  // long lists in groups so the menus fit small windows
+    if (params.size() <= kChunk + 4) {
+      for (size_t pi = 0; pi < params.size(); ++pi) dev.submenu.push_back(paramItem(pi));
+    } else {
+      for (size_t from = 0; from < params.size(); from += kChunk) {
+        const size_t to = std::min(params.size(), from + kChunk);
+        MenuItem grp;
+        grp.label = params[from].name + " \xE2\x80\xA6 " + params[to - 1].name;
+        for (size_t pi = from; pi < to; ++pi) grp.submenu.push_back(paramItem(pi));
+        dev.submenu.push_back(std::move(grp));
+      }
+    }
+    m.push_back(dev);
   }
   m.push_back(MenuItem::sep());
   MenuItem clear;
@@ -1235,7 +1503,7 @@ bool ArrangeView::onKey(Key k, unsigned mods) {
       }
       return false;
     case Key::Delete:
-    case Key::Backspace: ctx_.run("Edit.Delete"); return true;
+    case Key::Backspace: editCommand("Delete"); return true;
     case Key::Left:
     case Key::Right: {
       const bool right = k == Key::Right;
@@ -1266,11 +1534,17 @@ bool ArrangeView::onKey(Key k, unsigned mods) {
 
 bool ArrangeView::onChar(uint32_t ch, unsigned mods) {
   if (mods & kModCtrl) {
-    if (ch == 'D' - '@') {
-      ctx_.run("Edit.Duplicate");
-      return true;
+    // control codes (Ctrl+letter) or plain letters, depending on the window backend
+    const uint32_t lc = ch >= 1 && ch <= 26 ? ch + 'a' - 1 : (ch >= 'A' && ch <= 'Z' ? ch + 32 : ch);
+    if (mods & (kModShift | sq::ui::kModAlt)) return false;
+    switch (lc) {
+      case 'c': return editCommand("Copy");
+      case 'x': return editCommand("Cut");
+      case 'v': return editCommand("Paste");
+      case 'd': return editCommand("Duplicate");
+      case 'a': return editCommand("SelectAll");
+      default: return false;
     }
-    return false;
   }
   switch (ch) {
     case 'f':

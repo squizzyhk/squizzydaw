@@ -55,10 +55,13 @@ Hit ArrangeView::hitTest(float x, float y) const {
   }
   const Rect L = lanesRect();
   if (y < L.y || y >= L.bottom()) return h;
-  if (std::fabs(x - (f.x + headerW_)) <= 3) {
+  // header resize zone: on the header side of the border; the lane side only where no clip edge is
+  const float headerRight = f.x + headerW_;
+  if (x >= headerRight - 4 && x < headerRight) {
     h.kind = HitKind::HeaderBorder;
     return h;
   }
+  const bool borderLaneSide = x >= headerRight && x <= headerRight + 2;
   h.ppq = ppqAt(x);
   const float cy = y - L.y + scrollY_;
   const bool inHeader = x < f.x + headerW_;
@@ -84,6 +87,7 @@ Hit ArrangeView::hitTest(float x, float y) const {
             h.point = static_cast<int>(p);
           }
         }
+        if (h.kind == HitKind::AutoLane && borderLaneSide) h.kind = HitKind::HeaderBorder;
         return h;
       }
       return h;
@@ -121,7 +125,8 @@ Hit ArrangeView::hitTest(float x, float y) const {
       if (!Rect{r.x - 1, r.y, r.w + 2, r.h}.contains(x, y)) continue;
       h.clip = static_cast<int>(k);
       h.kind = HitKind::Clip;
-      const float edge = std::min(6.0f, std::max(2.0f, r.w / 4));
+      // narrow clips keep a move zone in the middle (very narrow ones: move only)
+      const float edge = r.w < 8 ? 0.0f : std::min(6.0f, std::max(2.0f, r.w / 4));
       if (ce.v.info.kind == SQ_CLIP_AUDIO && r.w > 24) {
         const float hy = r.y + (r.h >= 30 ? 15.0f : 0.0f);
         const float fi = std::clamp(fadeInX(ce), r.x + 4, r.right() - 4), fo = std::clamp(fadeOutX(ce), r.x + 4, r.right() - 4);
@@ -134,10 +139,11 @@ Hit ArrangeView::hitTest(float x, float y) const {
           return h;
         }
       }
-      if (x <= r.x + edge) h.kind = HitKind::ClipEdgeL;
-      else if (x >= r.right() - edge) h.kind = HitKind::ClipEdgeR;
+      if (edge > 0 && x <= r.x + edge) h.kind = HitKind::ClipEdgeL;
+      else if (edge > 0 && x >= r.right() - edge) h.kind = HitKind::ClipEdgeR;
       return h;
     }
+    if (borderLaneSide) h.kind = HitKind::HeaderBorder;
     return h;
   }
   h.kind = HitKind::BelowTracks;
@@ -461,7 +467,8 @@ void ArrangeView::updateDrag(const WidgetMouse& e) {
       autoScrollDuringDrag(e.x, e.y);
       const ClipEntry* ce = findClip(dragNode_);
       if (!ce) break;
-      const double minLen = std::min(ce->v.info.length, std::max(1.0 / 64.0, 3.0 / ppx_));
+      // at least ~10 px so a trimmed clip can still be grabbed (move zone between the edges)
+      const double minLen = std::min(ce->v.info.length, std::max(1.0 / 64.0, 10.0 / ppx_));
       const double start = ce->v.info.start, end = ce->end();
       const bool audio = ce->v.info.kind == SQ_CLIP_AUDIO;
       if (drag_ == Drag::TrimLeft) {
