@@ -172,6 +172,7 @@ class EngineCore final : public sq::Object<EngineCore, IAudioCallback> {
   bool capWrapped_ = false;
   uint64_t transportPass_ = 0;  // bumped on every loop wrap / locate (RT thread only)
   uint64_t loopWraps_ = 0;  // loop wraps only (a subset of transportPass_)
+  uint64_t wrapPass_ = UINT64_MAX;  // transportPass_ right after the last loop wrap (a locate moves on)
   uint64_t capPass_ = 0, capWraps_ = 0;
   double sampleRate_ = 48000.0;
   double cpuAvg_ = 0.0;

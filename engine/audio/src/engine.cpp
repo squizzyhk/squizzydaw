@@ -303,7 +303,7 @@ void EngineCore::captureLive(const LiveMidiEvent& e) noexcept {
   const bool loopOn = looping_ && len > 0;
   int64_t f = pos_ - static_cast<int64_t>(outLatency_.load(std::memory_order_relaxed));
   uint64_t pass = transportPass_, wraps = loopWraps_;
-  if (loopOn && capWrapped_ && f < loopStart_ && pos_ >= loopStart_ && pos_ < loopEnd_) {
+  if (loopOn && capWrapped_ && transportPass_ == wrapPass_ && f < loopStart_ && pos_ >= loopStart_ && pos_ < loopEnd_) {
     f += len;  // heard before the wrap
     --pass;
     --wraps;
@@ -526,6 +526,7 @@ void EngineCore::process(const sq_audio_io* io) {
         pos_ = loopStart_;
         ++transportPass_;
         ++loopWraps_;
+        wrapPass_ = transportPass_;
         if (recording_) capWrapped_ = true;
       }
     }

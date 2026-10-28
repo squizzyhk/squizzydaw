@@ -28,8 +28,11 @@ std::vector<std::string> splitLines(const std::string& s) {
     size_t nl = s.find('\n', pos);
     std::string l = s.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
     pos = nl == std::string::npos ? s.size() : nl + 1;
-    while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
-    if (!l.empty()) out.push_back(l);
+    // Same tokenizing as the Track.* commands, so card slots match their insert indices.
+    while (!l.empty() && (l.back() == '\r' || l.back() == ' ' || l.back() == '\t')) l.pop_back();
+    size_t b = 0;
+    while (b < l.size() && (l[b] == ' ' || l[b] == '\t')) ++b;
+    if (b < l.size()) out.push_back(l.substr(b));
   }
   return out;
 }
@@ -478,10 +481,19 @@ class DeviceRack final : public Widget {
       MenuItem dup;
       dup.label = "Duplicate";
       dup.action = [this, cd] {
-        insertCmd("Track.AddInsert", [&](IAttributes* a) {
-          a->setString("spec", cd.line.c_str());
-          a->setInt("index", cd.slot + 1);
-        });
+        auto a = sq::makeAttributes();
+        a->setGuid("track", &track_);
+        a->setString("spec", cd.line.c_str());
+        a->setInt("index", cd.slot + 1);
+        if (SQ_FAILED(ctx_.shell().execute("Track.AddInsert", a.get()))) {
+          // An unknown device's line is kept verbatim (AddInsert only takes valid specs).
+          auto v = insertLines();
+          v.insert(v.begin() + static_cast<std::ptrdiff_t>(std::min<size_t>(static_cast<size_t>(cd.slot) + 1, v.size())), cd.line);
+          std::string all;
+          for (const auto& l : v) all += l + "\n";
+          ctx_.setPropertyString(track_, "user.inserts", all);
+        }
+        ctx_.invalidate();
       };
       m.push_back(dup);
     }

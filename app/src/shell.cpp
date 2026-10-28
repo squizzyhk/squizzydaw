@@ -933,8 +933,9 @@ struct Shell::Impl {
   // Tail (seconds) the request needs until its output(s) decayed below -90 dBFS.
   sq_result measureAutoTail(const sq_render_request& base, double* tail) {
     *tail = 0;
-    const std::string probe = sq::joinPath(sq::joinPath(sq::specialDir(SQ_DIR_TEMP), "SquizzyStudio"),
-                                           "export-probe-" + std::to_string(sq_process_id()));
+    const std::string probeDir = sq::joinPath(sq::specialDir(SQ_DIR_TEMP), "SquizzyStudio");
+    sq_fs_create_dirs(probeDir.c_str());  // mixdown renders do not create their output folder
+    const std::string probe = sq::joinPath(probeDir, "export-probe-" + std::to_string(sq_process_id()));
     const bool stems = base.kind == SQ_RENDER_STEMS;
     const std::string probeOut = stems ? probe : probe + ".wav";
     sq_render_request rq = base;

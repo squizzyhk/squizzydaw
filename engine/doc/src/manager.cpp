@@ -15,7 +15,9 @@ namespace {
 std::string folderOf(const std::string& path) {
   const size_t s = path.find_last_of("/\\");
   if (s == std::string::npos) return ".";
-  return s == 0 ? path.substr(0, 1) : path.substr(0, s);
+  if (s == 0) return path.substr(0, 1);
+  if (s == 2 && path[1] == ':') return path.substr(0, 3);  // "C:\" (a bare "C:" is drive-relative)
+  return path.substr(0, s);
 }
 }  // namespace
 

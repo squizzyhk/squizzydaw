@@ -1,6 +1,7 @@
 // Squizzy Studio formats - DAWproject subset (see dawproject.hpp). Own implementation.
 #include "sq/formats/dawproject/dawproject.hpp"
 
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <exception>
@@ -151,6 +152,7 @@ const char* deviceElement(const std::string& format) {
   return "BuiltinDevice";
 }
 constexpr const char* kVendor = "Squizzy Studio";
+constexpr const char* kSpecComment = "squizzy:";  // device comment prefix carrying "<format>|<path>"
 
 // Writes one device; `automated` = parameter indices automation lanes refer to (they need an
 // element to target even when the spec keeps their default). Returns the parameter id per index.
@@ -163,18 +165,14 @@ std::map<uint32_t, std::string> writeDevice(XmlNode devices, const Spec& s, cons
   d.setAttr("deviceName", s.id);
   d.setAttr("loaded", "true");
   if (s.format == "builtin") d.setAttr("deviceVendor", kVendor);
-  // Extension attributes (ignored by other readers): the Squizzy spec fields.
-  d.setAttr("sqFormat", s.format);
-  if (!s.path.empty()) d.setAttr("sqPath", s.path);
-  XmlNode en = d.append("Enabled");
-  en.setAttr("id", devId + "-enabled");
-  en.setAttr("value", s.bypassed ? "false" : "true");
+  // The Squizzy spec fields ride in the schema's free-text comment ("squizzy:<format>|<path>").
+  d.setAttr("comment", std::string(kSpecComment) + s.format + "|" + s.path);
   std::map<uint32_t, double> values(s.params.begin(), s.params.end());
   std::set<uint32_t> all = automated;
   for (const auto& [i, v] : values) all.insert(i);
   std::map<uint32_t, std::string> ids;
-  if (all.empty()) return ids;
-  XmlNode params = d.append("Parameters");
+  // Project.xsd: device = Parameters?, Enabled?, State?
+  XmlNode params = all.empty() ? XmlNode{} : d.append("Parameters");
   for (uint32_t i : all) {
     XmlNode p = params.append("RealParameter");
     const std::string pid = devId + "-p" + std::to_string(i);
@@ -186,6 +184,9 @@ std::map<uint32_t, std::string> writeDevice(XmlNode devices, const Spec& s, cons
     if (it != values.end()) p.setAttr("value", fmt(it->second));
     ids[i] = pid;
   }
+  XmlNode en = d.append("Enabled");
+  en.setAttr("id", devId + "-enabled");
+  en.setAttr("value", s.bypassed ? "false" : "true");
   return ids;
 }
 
@@ -339,12 +340,12 @@ sq_result exportProject(IDocument* doc, const std::string& path, ExportReport* r
           ++rep.devices;
         }
       }
-      XmlNode vol = ch.append("Volume");
-      vol.setAttr("id", o.tid + "-volume");
-      vol.setAttr("name", "Volume");
-      vol.setAttr("unit", "decibel");
-      vol.setAttr("value", fmt(info.volume_db));
-      targetIds["volume"] = o.tid + "-volume";
+      // Project.xsd: channel = Devices?, Mute?, Pan?, Sends?, Volume?
+      XmlNode mute = ch.append("Mute");
+      mute.setAttr("id", o.tid + "-mute");
+      mute.setAttr("name", "Mute");
+      mute.setAttr("value", (info.flags & SQ_TRACK_MUTE) ? "true" : "false");
+      targetIds["mute"] = o.tid + "-mute";
       XmlNode pan = ch.append("Pan");
       pan.setAttr("id", o.tid + "-pan");
       pan.setAttr("name", "Pan");
@@ -353,11 +354,6 @@ sq_result exportProject(IDocument* doc, const std::string& path, ExportReport* r
       pan.setAttr("max", "1");
       pan.setAttr("value", fmt((info.pan + 1.0) / 2.0));
       targetIds["pan"] = o.tid + "-pan";
-      XmlNode mute = ch.append("Mute");
-      mute.setAttr("id", o.tid + "-mute");
-      mute.setAttr("name", "Mute");
-      mute.setAttr("value", (info.flags & SQ_TRACK_MUTE) ? "true" : "false");
-      targetIds["mute"] = o.tid + "-mute";
       // Sends: "<bus guid> <dB> [pre]" per line.
       const std::vector<std::string> sends = lines(sq::getAttrString(o.props.get(), "user.sends"));
       if (!sends.empty()) {
@@ -390,6 +386,12 @@ sq_result exportProject(IDocument* doc, const std::string& path, ExportReport* r
           ++rep.sends;
         }
       }
+      XmlNode vol = ch.append("Volume");
+      vol.setAttr("id", o.tid + "-volume");
+      vol.setAttr("name", "Volume");
+      vol.setAttr("unit", "decibel");
+      vol.setAttr("value", fmt(info.volume_db));
+      targetIds["volume"] = o.tid + "-volume";
     }
 
     XmlNode tl;
@@ -483,11 +485,12 @@ sq_result exportProject(IDocument* doc, const std::string& path, ExportReport* r
       ++rep.clips;
     }
   }
-  XmlNode markers = arrangement.append("Markers");
+  XmlNode markers;  // Project.xsd: Markers holds at least one Marker
   for (uint32_t m = 0; m < doc->getMarkerCount(); ++m) {
     sq_doc_marker mk{};
     mk.struct_size = sizeof mk;
     if (doc->getMarker(m, &mk) != SQ_OK) continue;
+    if (!markers) markers = arrangement.append("Markers");
     XmlNode x = markers.append("Marker");
     x.setAttr("time", fmt(mk.position));
     x.setAttr("name", mk.name);
@@ -718,8 +721,13 @@ sq_result importProjectImpl(const std::string& path, IDocument* doc, const std::
         Spec s;
         s.bypassed = dv.child("Enabled").attr("value") == "false";
         s.id = dv.attr("deviceID");
-        s.path = dv.attr("sqPath");
-        if (dv.hasAttr("sqFormat")) s.format = dv.attr("sqFormat");
+        s.path = dv.attr("sqPath");  // files written before the spec moved into the comment
+        const std::string cm = dv.attr("comment");
+        if (cm.rfind(kSpecComment, 0) == 0 && cm.find('|') != std::string::npos) {
+          const size_t bar = cm.find('|');
+          s.format = cm.substr(std::strlen(kSpecComment), bar - std::strlen(kSpecComment));
+          s.path = cm.substr(bar + 1);
+        } else if (dv.hasAttr("sqFormat")) s.format = dv.attr("sqFormat");
         else if (el == "Vst3Plugin") s.format = "vst3";
         else if (el == "ClapPlugin") s.format = "clap";
         else if (el == "Vst2Plugin") s.format = "vst2";
