@@ -17,6 +17,11 @@ struct Voice {
   double pos = 0.0;
   float vel = 0.0f;
   dsp::Adsr env;
+  // Declick: when a sounding voice is retriggered or stolen, its old playback keeps running here
+  // for a few ms and fades out while the new note's attack starts.
+  double ghostPos = 0.0;
+  float ghostAmp = 0.0f, ghostFade = 0.0f;
+  uint8_t ghostNote = 0;
 };
 
 class Sampler final : public SynthDevice {
@@ -27,6 +32,10 @@ class Sampler final : public SynthDevice {
 
  protected:
   std::unique_ptr<SynthDevice> fresh() const override { return std::make_unique<Sampler>(media_); }
+  bool onPrepare() override {
+    ghostStep_ = static_cast<float>(1.0 / std::max(1.0, 0.003 * sr()));
+    return true;
+  }
   void onReset() noexcept override {
     for (auto& v : v_) v = Voice{};
     bend_ = 0.0f;
@@ -44,6 +53,12 @@ class Sampler final : public SynthDevice {
       const uint8_t note = e.bytes[1] & 0x7F;
       const int i = allocateVoice(v_, kVoices, note, [](const Voice& v) { return v.env.level; });
       Voice& v = v_[i];
+      if (v.slot.active && v.env.level > 0.0f) {  // retriggered or stolen while sounding
+        v.ghostPos = v.pos;
+        v.ghostNote = v.slot.note;
+        v.ghostAmp = v.env.level * v.vel;
+        v.ghostFade = 1.0f;
+      }
       v.slot.active = v.slot.held = true;
       v.slot.sustained = false;
       v.slot.note = note;
@@ -51,7 +66,7 @@ class Sampler final : public SynthDevice {
       const float vs = p(kVelSens);
       v.vel = (1.0f - vs) + vs * static_cast<float>(e.bytes[2]) / 127.0f;
       v.pos = static_cast<double>(media_->frames - 1) * p(kStart) * 0.01;
-      if (v.env.level > 0.0f) v.env.level = 0.0f;  // restart (voice was stolen or retriggered)
+      v.env.level = 0.0f;  // restart; the old playback (if any) fades out as the ghost
       v.env.gateOn();
     } else if (isNoteOff(e)) {
       noteOffVoices(v_, kVoices, e.bytes[1] & 0x7F, sustain_, [](Voice& v) { v.env.gateOff(); });
@@ -84,40 +99,63 @@ class Sampler final : public SynthDevice {
       const double baseRate = m.sampleRate / sr();
       const bool keyTrack = on(kKeyTrack);
       const double tune = static_cast<double>(ci(kTranspose)) + p(kFine) * 0.01 + bend_;
+      // Advances `pos` past the end / around the loop; false when a one-shot ran out.
+      auto wrap = [&](double& pos) noexcept {
+        if (pos >= last) {
+          if (!looping) return false;
+          pos = ls + std::fmod(pos - ls, le - ls);
+        }
+        if (looping && pos >= le) pos -= (le - ls);
+        return true;
+      };
+      auto mixAt = [&](double pos, float amp, uint32_t i) noexcept {
+        const double fi = std::floor(pos);
+        const size_t i0 = static_cast<size_t>(fi);
+        const float fr = static_cast<float>(pos - fi);
+        const size_t i1 = i0 + 1 < static_cast<size_t>(m.frames) ? i0 + 1 : i0;
+        if (nch == 1 || m.channels == 1) {
+          float x = 0.0f;
+          for (uint32_t c = 0; c < m.channels; ++c) {
+            const float* d = m.data[c].data();
+            x += d[i0] + fr * (d[i1] - d[i0]);
+          }
+          x *= amp / static_cast<float>(m.channels);
+          for (uint32_t c = 0; c < nch; ++c) io[c][i] += x;
+        } else {
+          for (uint32_t c = 0; c < nch; ++c) {
+            const float* d = m.data[c % m.channels].data();
+            io[c][i] += (d[i0] + fr * (d[i1] - d[i0])) * amp;
+          }
+        }
+      };
+      auto rateOf = [&](uint8_t note) {
+        const double semis = (keyTrack ? static_cast<double>(note) - ci(kRoot) : 0.0) + tune;
+        return baseRate * std::exp2(semis / 12.0);
+      };
       for (auto& v : v_) {
-        if (!v.slot.active) continue;
-        const double semis = (keyTrack ? static_cast<double>(v.slot.note) - ci(kRoot) : 0.0) + tune;
-        const double rate = baseRate * std::exp2(semis / 12.0);
-        dsp::Ramp g = gain_;
-        for (uint32_t i = 0; i < n; ++i) {
-          if (v.pos >= last) {
-            if (looping) {
-              v.pos = ls + std::fmod(v.pos - ls, le - ls);
-            } else {
-              v.env.kill();
+        if (v.ghostFade > 0.0f) {
+          const double rate = rateOf(v.ghostNote);
+          dsp::Ramp g = gain_;
+          for (uint32_t i = 0; i < n && v.ghostFade > 0.0f; ++i) {
+            if (!wrap(v.ghostPos)) {
+              v.ghostFade = 0.0f;
               break;
             }
+            mixAt(v.ghostPos, v.ghostAmp * v.ghostFade * g.next(), i);
+            v.ghostPos += rate;
+            v.ghostFade -= ghostStep_;
           }
-          if (looping && v.pos >= le) v.pos -= (le - ls);
-          const double fi = std::floor(v.pos);
-          const size_t i0 = static_cast<size_t>(fi);
-          const float fr = static_cast<float>(v.pos - fi);
-          const size_t i1 = i0 + 1 < static_cast<size_t>(m.frames) ? i0 + 1 : i0;
-          const float amp = v.env.tick(envP_) * v.vel * g.next();
-          if (nch == 1 || m.channels == 1) {
-            float s = 0.0f;
-            for (uint32_t c = 0; c < m.channels; ++c) {
-              const float* d = m.data[c].data();
-              s += d[i0] + fr * (d[i1] - d[i0]);
-            }
-            s *= amp / static_cast<float>(m.channels);
-            for (uint32_t c = 0; c < nch; ++c) io[c][i] += s;
-          } else {
-            for (uint32_t c = 0; c < nch; ++c) {
-              const float* d = m.data[c % m.channels].data();
-              io[c][i] += (d[i0] + fr * (d[i1] - d[i0])) * amp;
-            }
+          if (v.ghostFade < 0.0f) v.ghostFade = 0.0f;
+        }
+        if (!v.slot.active) continue;
+        const double rate = rateOf(v.slot.note);
+        dsp::Ramp g = gain_;
+        for (uint32_t i = 0; i < n; ++i) {
+          if (!wrap(v.pos)) {
+            v.env.kill();
+            break;
           }
+          mixAt(v.pos, v.env.tick(envP_) * v.vel * g.next(), i);
           v.pos += rate;
           if (!v.env.active()) break;
         }
@@ -135,6 +173,7 @@ class Sampler final : public SynthDevice {
   float bend_ = 0.0f;
   bool sustain_ = false;
   uint64_t clock_ = 0;
+  float ghostStep_ = 0.01f;
 };
 
 }  // namespace

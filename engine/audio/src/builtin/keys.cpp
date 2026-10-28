@@ -86,14 +86,18 @@ class Keys final : public SynthDevice {
       if (!v.slot.active) continue;
       const double f = v.freq * bendMul;
       const double cInc = f / s, mInc = f * ratio / s, tInc = f * 14.0 / s;
+      // Phase modulation puts sidebands at f +- k*ratio*f; fade the modulation out as the first
+      // upper sideband nears Nyquist so high notes do not fold back into inharmonic partials.
+      const float bodyFade = nyquistFade((1.0 + ratio) * f, s);
+      const float tineFade = nyquistFade(15.0 * f, s);
       dsp::Ramp a = tl_, b = tr_, g = gain_;
       for (uint32_t i = 0; i < n; ++i) {
         if (v.attack < 1.0f) v.attack = std::min(1.0f, v.attack + attackInc_);
-        const float idx = v.index * (0.2f + 0.8f * v.modEnv);
+        const float idx = v.index * (0.2f + 0.8f * v.modEnv) * bodyFade;
         const float m = static_cast<float>(std::sin(dsp::kTwoPi * v.mph));
         const float body = static_cast<float>(std::sin(dsp::kTwoPi * v.cph + idx * m));
         const float tm = static_cast<float>(std::sin(dsp::kTwoPi * v.tph));
-        const float tine = static_cast<float>(std::sin(dsp::kTwoPi * v.cph + 1.3f * tm)) * v.tine * tineLevel;
+        const float tine = static_cast<float>(std::sin(dsp::kTwoPi * v.cph + 1.3f * tm)) * v.tine * tineLevel * tineFade;
         const float y = (body + tine) * v.amp * v.attack * v.vel * 0.3f * g.next();
         addStereo(io, nch, i, y * a.next(), y * b.next());
         v.cph += cInc; v.cph -= std::floor(v.cph);
@@ -113,6 +117,11 @@ class Keys final : public SynthDevice {
   }
 
  private:
+  // 1 while `hz` is below 0.35 * sr, falling linearly to 0 at 0.45 * sr.
+  static float nyquistFade(double hz, double rate) noexcept {
+    return static_cast<float>(std::clamp((0.45 * rate - hz) / (0.1 * rate), 0.0, 1.0));
+  }
+
   void noteOn(uint8_t note, float vel) noexcept {
     const int i = allocateVoice(v_, kVoices, note, [](const Voice& v) { return v.amp; });
     Voice& v = v_[i];

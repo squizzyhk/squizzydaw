@@ -7,7 +7,9 @@ namespace sq::engine::audio::builtin {
 namespace {
 
 enum P : uint32_t { kMode, kSync, kTimeL, kTimeR, kBpm, kFeedback, kLowCut, kHighCut, kWidth, kMix, kCount };
-constexpr double kMaxSeconds = 6.0;
+// Longest delay a line holds: the slowest tempo (20 bpm) times the longest division (1/1 = 4
+// beats) is 12 s; free time tops out at 3 s.
+constexpr double kMaxSeconds = 12.5;
 // quarter-note multiples of the sync divisions (index 0 = off)
 constexpr double kBeats[] = {0.0,  0.125, 0.25 * 2.0 / 3.0, 0.25,      0.375, 0.5 * 2.0 / 3.0, 0.5, 0.75,
                              2.0 / 3.0, 1.0,   1.5,             4.0 / 3.0, 2.0,   3.0,             4.0};
@@ -28,7 +30,7 @@ class Delay final : public FxDevice {
   Delay() : FxDevice(infoOf("delay")) {}
   uint32_t tail() const noexcept override {
     if (!prepared()) return 0;
-    const double secs = std::max(timeMs(true), timeMs(false)) * 0.001;
+    const double secs = std::max(clampedSamples(timeMs(true)), clampedSamples(timeMs(false))) / sr();
     const double fb = t(kFeedback) * 0.01;
     double repeats = fb > 0.001 ? std::log(0.001) / std::log(std::min(fb, 0.995)) : 1.0;
     double total = secs * (repeats + 1.0);
@@ -56,9 +58,8 @@ class Delay final : public FxDevice {
     const double s = sr();
     hpC_ = dsp::designBiquad(dsp::BqType::Highpass, s, p(kLowCut), 0.7071, 0);
     lpC_ = dsp::designBiquad(dsp::BqType::Lowpass, s, p(kHighCut), 0.7071, 0);
-    const double maxS = kMaxSeconds * s - 4.0;
-    targetL_ = static_cast<float>(std::clamp(timeMs(true) * 0.001 * s, 1.0, maxS));
-    targetR_ = static_cast<float>(std::clamp(timeMs(false) * 0.001 * s, 1.0, maxS));
+    targetL_ = static_cast<float>(clampedSamples(timeMs(true)));
+    targetR_ = static_cast<float>(clampedSamples(timeMs(false)));
     const float mix = p(kMix) * 0.01f;
     const float fb = p(kFeedback) * 0.01f;
     const float dry = std::min(1.0f, 2.0f * (1.0f - mix)), wet = std::min(1.0f, 2.0f * mix);
@@ -119,6 +120,8 @@ class Delay final : public FxDevice {
   }
 
  private:
+  // The delay (in samples) a line really plays for `ms`: limited to what the buffer holds.
+  double clampedSamples(double ms) const noexcept { return std::clamp(ms * 0.001 * sr(), 1.0, kMaxSeconds * sr() - 4.0); }
   double timeMs(bool left) const noexcept {
     const int sync = static_cast<int>(t(kSync) + 0.5f);
     if (sync > 0) {

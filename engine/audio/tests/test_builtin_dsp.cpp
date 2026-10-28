@@ -324,3 +324,150 @@ SQ_TEST("feedback effects and instruments decay to silence, never into denormals
     CHECK(bt::clean(out));
   }
 }
+
+namespace {
+float stereoPeak(const Channels& o) { return std::max(bt::peak(o[0]), bt::peak(o[1])); }
+double dbfs(float x) { return 20.0 * std::log10(static_cast<double>(x) + 1e-12); }
+double rmsDiff(const std::vector<float>& a, const std::vector<float>& b) {
+  double s = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) s += std::pow(static_cast<double>(a[i] - b[i]), 2.0);
+  return std::sqrt(s / static_cast<double>(a.size()));
+}
+}  // namespace
+
+SQ_TEST("instruments: default output levels leave headroom (typical peaks ~-6..-3 dBFS, never over 0 dBFS)") {
+  // a typical chord / line / beat at default settings
+  struct Case {
+    const char* id;
+    std::vector<bt::Note> notes;
+  };
+  std::vector<bt::Note> chord;
+  for (uint8_t k : std::initializer_list<uint8_t>{60, 64, 67, 72}) chord.push_back({0, 0x90, k, 100});
+  std::vector<bt::Note> beat;  // kick + snare + closed hat on the same frame, then kick + crash
+  for (uint8_t k : std::initializer_list<uint8_t>{36, 38, 42}) beat.push_back({0, 0x90, k, 127});
+  for (uint8_t k : std::initializer_list<uint8_t>{36, 49}) beat.push_back({24000, 0x90, k, 127});
+  const Case cases[] = {
+      {"synth", chord},
+      {"keys", chord},
+      {"bass", {{0, 0x90, 36, 110}}},
+      {"drums", beat},
+  };
+  for (const Case& c : cases) {
+    auto p = bt::instance(c.id);
+    REQUIRE(p->prepare(kSr, 256, 2));
+    Channels o = bt::run(*p, 2, 72000, 256, {}, c.notes);
+    const float pk = stereoPeak(o);
+    std::printf("  %s default peak %.3f (%.1f dBFS)\n", c.id, static_cast<double>(pk), dbfs(pk));
+    CHECK(pk > 0.4f);   // ~-8 dBFS
+    CHECK(pk < 0.8f);   // ~-2 dBFS
+  }
+  // drums worst case: every kit piece hit at full velocity on the same frame stays below full scale
+  auto d = bt::instance("drums");
+  REQUIRE(d->prepare(kSr, 256, 2));
+  std::vector<bt::Note> all;
+  for (uint8_t k : std::initializer_list<uint8_t>{36, 37, 38, 39, 42, 41, 45, 48, 49, 51}) all.push_back({0, 0x90, k, 127});
+  const float worst = stereoPeak(bt::run(*d, 2, 48000, 256, {}, all));
+  std::printf("  drums full kit peak %.3f (%.1f dBFS)\n", static_cast<double>(worst), dbfs(worst));
+  CHECK(worst < 1.0f);
+  // a dense synth chord (8 notes, full velocity) stays below full scale too
+  auto s = bt::instance("synth");
+  REQUIRE(s->prepare(kSr, 256, 2));
+  std::vector<bt::Note> dense;
+  for (uint8_t k : std::initializer_list<uint8_t>{48, 55, 60, 64, 67, 71, 74, 79}) dense.push_back({0, 0x90, k, 127});
+  const float sp = stereoPeak(bt::run(*s, 2, 48000, 256, {}, dense));
+  std::printf("  synth 8-note chord peak %.3f (%.1f dBFS)\n", static_cast<double>(sp), dbfs(sp));
+  CHECK(sp < 1.0f);
+}
+
+SQ_TEST("delay: tempo-synced times longer than 6 s stay on the beat") {
+  // 1/1 at 30 bpm = 8 s; the first echo of an impulse must arrive at 8 s, not clamped to 6 s
+  auto p = bt::instance("delay", {{paramIndex("delay", "mode"), 0.0}, {paramIndex("delay", "sync"), 14.0},
+                                  {paramIndex("delay", "bpm"), 30.0}, {paramIndex("delay", "mix"), 100.0},
+                                  {paramIndex("delay", "feedback"), 0.0}, {paramIndex("delay", "lowcut"), 20.0},
+                                  {paramIndex("delay", "highcut"), 20000.0}});
+  REQUIRE(p->prepare(kSr, 512, 2));
+  const int64_t frames = static_cast<int64_t>(kSr * 9.0);
+  Channels out = bt::run(*p, 2, frames, 512, impulse(2, frames));
+  size_t at = 0;
+  float best = 0.0f;
+  for (size_t i = 1; i < out[0].size(); ++i)  // skip the (silent, mix 100%) dry impulse
+    if (std::fabs(out[0][i]) > best) best = std::fabs(out[0][i]), at = i;
+  std::printf("  synced echo at %.3f s\n", static_cast<double>(at) / kSr);
+  CHECK(best > 0.1f);
+  CHECK(std::fabs(static_cast<double>(at) / kSr - 8.0) < 0.01);
+  CHECK(static_cast<double>(p->tail()) >= kSr * 8.0);
+  // slowest tempo, longest division: 12 s also fits
+  auto q = bt::instance("delay", {{paramIndex("delay", "mode"), 0.0}, {paramIndex("delay", "sync"), 14.0},
+                                  {paramIndex("delay", "bpm"), 20.0}, {paramIndex("delay", "mix"), 100.0},
+                                  {paramIndex("delay", "feedback"), 0.0}});
+  REQUIRE(q->prepare(kSr, 512, 2));
+  const int64_t f2 = static_cast<int64_t>(kSr * 12.5);
+  Channels o2 = bt::run(*q, 2, f2, 512, impulse(2, f2));
+  CHECK(bt::peak(o2[0], 1, static_cast<size_t>(kSr * 11.9)) < 1e-3f);
+  CHECK(bt::peak(o2[0], static_cast<size_t>(kSr * 11.9)) > 0.1f);
+}
+
+SQ_TEST("sampler: retriggering or stealing a sounding voice does not click") {
+  auto m = std::make_shared<MediaBuffer>();
+  m->sampleRate = kSr;
+  m->channels = 1;
+  m->frames = 96000;
+  m->data.assign(1, std::vector<float>(96000, 0.5f));  // DC: any step in the output is a click
+  std::string err;
+  auto proto = makeBuiltinWithMedia("sampler", m, {{0, 60.0}}, &err);
+  REQUIRE(proto);
+  for (const bool steal : {false, true}) {
+    auto s = proto->clone();
+    REQUIRE(s->prepare(kSr, 128, 2));
+    std::vector<bt::Note> notes;
+    if (steal) {  // 16 voices held, the 17th note steals the oldest
+      for (uint8_t k = 40; k < 56; ++k) notes.push_back({0, 0x90, k, 127});
+      notes.push_back({4000, 0x90, 70, 127});
+    } else {
+      notes.push_back({0, 0x90, 60, 127});
+      notes.push_back({4000, 0x90, 60, 127});
+    }
+    Channels o = bt::run(*s, 2, 12000, 128, {}, notes);
+    float maxStep = 0.0f;
+    for (size_t i = 3000; i < 6000; ++i) maxStep = std::max(maxStep, std::fabs(o[0][i] - o[0][i - 1]));
+    std::printf("  sampler %s max step %.4f\n", steal ? "steal" : "retrigger", static_cast<double>(maxStep));
+    CHECK(maxStep < 0.05f);
+    CHECK(bt::rms(o[0], 8000, 12000) > 0.1);
+    CHECK(bt::clean(o));
+  }
+}
+
+SQ_TEST("synth: CC121 (reset all controllers) releases pedal-sustained voices") {
+  auto p = bt::instance("synth");
+  REQUIRE(p->prepare(kSr, 256, 2));
+  Channels out = bt::run(*p, 2, static_cast<int64_t>(kSr * 3.0), 256, {},
+                         {{0, 0xB0, 64, 127}, {0, 0x90, 60, 100}, {4800, 0x80, 60, 0}, {9600, 0xB0, 121, 0}});
+  CHECK(bt::rms(out[0], 4800, 9600) > 0.01);      // still sustained by the pedal
+  CHECK(bt::peak(out[0], 9600 + 72000) == 0.0f);  // released after the reset
+}
+
+SQ_TEST("keys: the tine and FM sidebands fade out before they would alias") {
+  // note 100 (2637 Hz) at 48 kHz: a 14x tine modulator would sit at 36.9 kHz and fold back.
+  auto render = [](int note, double tine, double ratioIdx, double bright) {
+    auto p = bt::instance("keys", {{paramIndex("keys", "tine"), tine}, {paramIndex("keys", "mod_ratio"), ratioIdx},
+                                   {paramIndex("keys", "brightness"), bright},
+                                   {paramIndex("keys", "velocity_brightness"), bright > 0.0 ? 0.6 : 0.0},
+                                   {paramIndex("keys", "tremolo_depth"), 0.0}});
+    p->prepare(kSr, 128, 1);
+    return bt::run(*p, 1, 4800, 128, {}, {{0, 0x90, static_cast<uint8_t>(note), 127}});
+  };
+  const Channels with = render(100, 1.0, 1.0, 0.4), without = render(100, 0.0, 1.0, 0.4);
+  const double tineDiff = rmsDiff(with[0], without[0]);
+  std::printf("  keys tine contribution at note 100: %f (rms %f)\n", tineDiff, bt::rms(without[0]));
+  CHECK(tineDiff < 0.01 * bt::rms(without[0]));
+  // ratio 14 on the same note: the FM body falls back to the plain carrier
+  const Channels r14 = render(100, 0.0, 7.0, 0.4), plain = render(100, 0.0, 7.0, 0.0);
+  const double fmDiff = rmsDiff(r14[0], plain[0]);
+  std::printf("  keys ratio-14 FM deviation at note 100: %f\n", fmDiff);
+  CHECK(fmDiff < 0.01 * bt::rms(plain[0]));
+  // a mid-range note keeps its tine and its FM
+  const Channels m1 = render(60, 1.0, 1.0, 0.4), m0 = render(60, 0.0, 1.0, 0.4);
+  CHECK(rmsDiff(m1[0], m0[0]) > 0.05 * bt::rms(m0[0]));
+  const Channels f14 = render(60, 0.0, 7.0, 0.4), f0 = render(60, 0.0, 7.0, 0.0);
+  CHECK(rmsDiff(f14[0], f0[0]) > 0.05 * bt::rms(f0[0]));
+}

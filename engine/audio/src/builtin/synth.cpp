@@ -90,7 +90,9 @@ class Synth final : public SynthDevice {
       } else if (cc == 121) {
         bend_ = 0.0f;
         modWheel_ = 0.0f;
-        sustain_ = false;
+        sustain_ = false;  // pedal up: release what it was holding, like CC64 off
+        for (auto& v : voices_)
+          if (v.sustained) release(v);
       }
     }
   }
@@ -155,7 +157,7 @@ class Synth final : public SynthDevice {
         v.ca.set(s, fc, kRes);
       }
       const float velGain = (1.0f - velSens) + velSens * v.vel;
-      const float vout = 0.3f * velGain;
+      const float vout = 0.28f * velGain;
       dsp::Ramp trem = tremolo_;
       dsp::Ramp gr = gain_;
       for (uint32_t i = 0; i < n; ++i) {
