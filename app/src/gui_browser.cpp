@@ -143,6 +143,7 @@ class Browser final : public Widget, public CharInput {
         hotTab_ = ht;
         hotRow_ = rowAt(e.x, e.y);
         hotFoot_ = footBtn_.contains(e.x, e.y);
+        hotSb_ = maxScroll_ > 0 && sbTrack_.contains(e.x, e.y);
         ctx_.invalidate();
         return true;
       }
@@ -150,16 +151,23 @@ class Browser final : public Widget, public CharInput {
         hotRow_ = -1;
         hotTab_ = -1;
         hotFoot_ = false;
+        hotSb_ = false;
         return false;
       case MouseAction::Wheel:
         if (list_.contains(e.x, e.y)) {
-          scroll_ = std::max(0.0f, scroll_ - e.wheel * 66.0f);
-          ctx_.invalidate();
+          setScroll(scroll_ - e.wheel * 66.0f);
           return true;
         }
         return false;
       case MouseAction::Down: {
         searchFocus_ = searchR_.contains(e.x, e.y);
+        if (maxScroll_ > 0 && e.button == MouseButton::Left && sbTrack_.contains(e.x, e.y)) {
+          if (!sbThumb_.contains(e.x, e.y)) setScroll(scroll_ + (e.y < sbThumb_.y ? -1.0f : 1.0f) * (list_.h - 22.0f));
+          sbDrag_ = true;
+          sbDragY0_ = e.y;
+          sbScroll0_ = scroll_;
+          return true;
+        }
         for (int i = 0; i < 3; ++i)
           if (tabR_[i].contains(e.x, e.y)) {
             tab_ = i;
@@ -175,7 +183,7 @@ class Browser final : public Widget, public CharInput {
         }
         const int r = rowAt(e.x, e.y);
         if (r >= 0) {
-          selected_ = r;
+          selected_ = static_cast<int>(firstVisible_) + r;
           pressRow_ = r;
           pressPos_ = Point{e.x, e.y};
           if (e.button == MouseButton::Right) rowMenu(r, Point{e.x, e.y});
@@ -186,6 +194,11 @@ class Browser final : public Widget, public CharInput {
         return true;
       }
       case MouseAction::Move:
+        if (sbDrag_) {
+          const float travel = std::max(1.0f, sbTrack_.h - sbThumb_.h);
+          setScroll(sbScroll0_ + (e.y - sbDragY0_) / travel * maxScroll_);
+          return true;
+        }
         if (pressRow_ >= 0 && !dragging_ && (std::fabs(e.x - pressPos_.x) + std::fabs(e.y - pressPos_.y)) > 6) startDrag(pressRow_);
         if (dragging_) {
           dragPos_ = Point{e.x, e.y};
@@ -195,6 +208,7 @@ class Browser final : public Widget, public CharInput {
         }
         return true;
       case MouseAction::Up:
+        sbDrag_ = false;
         if (dragging_) finishDrag(e.x, e.y);
         pressRow_ = -1;
         return true;
@@ -218,23 +232,49 @@ class Browser final : public Widget, public CharInput {
         return true;
       }
       if (search_.key(k, mods)) return true;
+      // Everything that types or edits text belongs to the field (Space must not toggle the
+      // transport); only list navigation, Tab, function keys and Ctrl/Alt shortcuts pass.
+      if ((mods & (kModCtrl | kModAlt)) == 0) {
+        switch (k) {
+          case Key::Up:
+          case Key::Down:
+          case Key::PageUp:
+          case Key::PageDown:
+          case Key::Tab:
+          case Key::F1: case Key::F2: case Key::F3: case Key::F4: case Key::F5: case Key::F6:
+          case Key::F7: case Key::F8: case Key::F9: case Key::F10: case Key::F11: case Key::F12: break;
+          default: return true;
+        }
+      }
     }
     const int n = static_cast<int>(rowCount_);
     switch (k) {
       case Key::Up:
         if (n) selected_ = std::max(0, selected_ - 1);
+        ensureSel_ = n > 0;
+        if (n) ctx_.invalidate();
         return n > 0;
       case Key::Down:
         if (n) selected_ = std::min(n - 1, selected_ + 1);
+        ensureSel_ = n > 0;
+        if (n) ctx_.invalidate();
         return n > 0;
-      case Key::Enter:
-        if (selected_ >= 0) activate(selected_);
+      case Key::PageUp:
+      case Key::PageDown:
+        if (maxScroll_ <= 0) return false;
+        setScroll(scroll_ + (k == Key::PageUp ? -1.0f : 1.0f) * (list_.h - 22.0f));
         return true;
+      case Key::Enter: {
+        const int vis = selected_ - static_cast<int>(firstVisible_);
+        if (selected_ >= 0 && vis >= 0 && vis < static_cast<int>(rows_.size())) activate(vis);
+        return true;
+      }
       case Key::Right:
       case Key::Left:
-        if (tab_ == 0 && selected_ >= 0 && selected_ < static_cast<int>(rows_.size()) && rows_[static_cast<size_t>(selected_)].node &&
-            rows_[static_cast<size_t>(selected_)].node->dir) {
-          Node* nd = rows_[static_cast<size_t>(selected_)].node;
+        if (const int vis = selected_ - static_cast<int>(firstVisible_);
+            tab_ == 0 && selected_ >= 0 && vis >= 0 && vis < static_cast<int>(rows_.size()) && rows_[static_cast<size_t>(vis)].node &&
+            rows_[static_cast<size_t>(vis)].node->dir) {
+          Node* nd = rows_[static_cast<size_t>(vis)].node;
           if ((k == Key::Right) != nd->expanded) toggle(*nd);
           return true;
         }
@@ -300,15 +340,14 @@ class Browser final : public Widget, public CharInput {
               bool dir, bool expanded, Color iconCol) {
     const float rowH = 22;
     const size_t i = rowCount_++;
+    if (static_cast<int>(i) == selected_) selY_ = y - (list_.y - scroll_);
     if (y + rowH >= list_.y && y < list_.bottom()) {
       Row row;
-      row.r = Rect{list_.x + 4, y, list_.w - 8, rowH};
+      row.r = Rect{list_.x + 4, y, list_.w - 8 - (maxScroll_ > 0 ? 8.0f : 0.0f), rowH};
       row.node = node;
       row.index = index;
       const bool sel = static_cast<int>(i) == selected_;
       if (sel) c.fillRoundRect(row.r, 4, p.accent.withAlpha(0.3f));
-      else if (static_cast<int>(rows_.size()) == hotRow_ - static_cast<int>(firstVisible_)) {
-      }
       if (static_cast<int>(i) == hotRowAbs_ && !sel) c.fillRoundRect(row.r, 4, p.panel3.withAlpha(0.6f));
       float x = row.r.x + 6 + 14.0f * static_cast<float>(depth);
       if (dir) draw::triangle(c, Rect{x, y + 7, 7, 8}, expanded ? 2 : 1, p.dim);
@@ -326,18 +365,35 @@ class Browser final : public Widget, public CharInput {
   void beginList(Canvas& c) {
     rowCount_ = 0;
     firstVisible_ = 0;
+    selY_ = -1;
     hotRowAbs_ = hotRow_ >= 0 && hotRow_ < static_cast<int>(prevRows_.size()) ? prevAbs_[static_cast<size_t>(hotRow_)] : -1;
     c.pushClip(list_);
   }
-  void endList(Canvas& c, const Palette& p) {
+  // y = the running row position after the last row (headers included): the content height is
+  // what was laid out, not rowCount_ * row height.
+  void endList(Canvas& c, const Palette& p, float y) {
     c.popClip();
-    const float total = static_cast<float>(rowCount_) * 22.0f;
-    const float maxScroll = std::max(0.0f, total - list_.h + 8);
-    if (scroll_ > maxScroll) scroll_ = maxScroll;
-    if (total > list_.h) {
+    const float total = y - (list_.y - scroll_) + 8.0f;
+    const float maxScroll = std::max(0.0f, total - list_.h);
+    const bool hadBar = maxScroll_ > 0;
+    maxScroll_ = maxScroll;
+    if (ensureSel_ && selY_ >= 0) {
+      if (selY_ < scroll_) scroll_ = selY_;
+      else if (selY_ + 22.0f > scroll_ + list_.h) scroll_ = selY_ + 22.0f - list_.h;
+    }
+    ensureSel_ = false;
+    const float before = scroll_;
+    scroll_ = std::clamp(scroll_, 0.0f, maxScroll);
+    if (scroll_ != before || hadBar != (maxScroll_ > 0)) ctx_.invalidate();  // rows were laid out with the old offset
+    sbTrack_ = Rect{};
+    sbThumb_ = Rect{};
+    if (maxScroll > 0) {
+      sbTrack_ = Rect{list_.right() - 10, list_.y, 10, list_.h};
       const float th = std::max(24.0f, list_.h * list_.h / total);
-      const float ty = list_.y + (list_.h - th) * (maxScroll > 0 ? scroll_ / maxScroll : 0);
-      c.fillRoundRect(Rect{list_.right() - 5, ty, 3, th}, 1.5f, p.faint);
+      const float ty = list_.y + (list_.h - th) * (scroll_ / maxScroll);
+      sbThumb_ = Rect{sbTrack_.x, ty, sbTrack_.w, th};
+      const bool hot = hotSb_ || sbDrag_;
+      c.fillRoundRect(Rect{sbTrack_.x + (hot ? 2.0f : 4.0f), ty, hot ? 6.0f : 4.0f, th}, hot ? 3.0f : 2.0f, hot ? p.dim : p.faint);
     }
     prevRows_ = rows_;
     prevAbs_.clear();
@@ -367,7 +423,7 @@ class Browser final : public Widget, public CharInput {
       if (!search_.text.empty())
         c.drawText("Enter: search inside places", Rect{list_.x + 12, list_.bottom() - 20, list_.w - 24, 18}, p.faint, 10.5f);
     }
-    endList(c, p);
+    endList(c, p, y);
   }
 
   void paintDevices(Canvas& c, const Palette& p) {
@@ -387,7 +443,7 @@ class Browser final : public Widget, public CharInput {
       addRow(c, p, y, nullptr, static_cast<int>(i), d.name, std::string(), 1, false, false, d.instrument ? p.accent2 : p.accent);
     }
     if (devices_.empty()) c.drawText("No built-in devices in this build", Rect{list_.x + 12, list_.y + 4, list_.w - 24, 20}, p.faint, 12);
-    endList(c, p);
+    endList(c, p, y);
   }
 
   void paintPlugins(Canvas& c, const Palette& p) {
@@ -411,7 +467,7 @@ class Browser final : public Widget, public CharInput {
       addRow(c, p, y, nullptr, static_cast<int>(i), d.name, d.format, 0, false, false, inst ? p.accent2 : p.accent);
     }
     if (plugins_.empty()) c.drawText("No plugins found. Install CLAP/VST3 plugins and rescan.", Rect{list_.x + 12, list_.y + 4, list_.w - 24, 40}, p.faint, 11.5f);
-    endList(c, p);
+    endList(c, p, y);
   }
 
   static Color iconFor(const Palette& p, const std::string& name) {
@@ -440,6 +496,11 @@ class Browser final : public Widget, public CharInput {
     if (row.node) return row.node->dir ? std::string() : row.node->path;
     if (tab_ == 0 && row.index >= 0 && row.index < static_cast<int>(results_.size())) return results_[static_cast<size_t>(row.index)];
     return {};
+  }
+
+  void setScroll(float v) {
+    scroll_ = std::clamp(v, 0.0f, maxScroll_);
+    ctx_.invalidate();
   }
 
   void activate(int r) {
@@ -649,7 +710,11 @@ class Browser final : public Widget, public CharInput {
   size_t rowCount_ = 0, firstVisible_ = 0;
   int selected_ = -1, hotRow_ = -1, hotRowAbs_ = -1, pressRow_ = -1;
   Point pressPos_;
-  float scroll_ = 0;
+  float scroll_ = 0, maxScroll_ = 0, selY_ = -1;
+  bool ensureSel_ = false;
+  Rect sbTrack_, sbThumb_;
+  bool hotSb_ = false, sbDrag_ = false;
+  float sbDragY0_ = 0, sbScroll0_ = 0;
   std::vector<DeviceEntry> devices_;
   std::vector<sq_plugin_desc> plugins_;
   std::vector<std::string> results_;

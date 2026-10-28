@@ -39,6 +39,10 @@ void legato(std::vector<Note>& notes, bool onlySelected);
 
 // "C4" (MIDI 60 = C4), "F#2"...
 std::string noteName(int pitch);
+// Piece name of the built-in drum kit ("Kick", "Snare", "Closed HH"...) or nullptr for a pitch
+// the kit does not play (it plays 35..59).
+const char* drumName(int pitch);
+constexpr int kDrumLo = 35, kDrumHi = 59;
 inline bool isBlackKey(int pitch) {
   const int k = ((pitch % 12) + 12) % 12;
   return k == 1 || k == 3 || k == 6 || k == 8 || k == 10;

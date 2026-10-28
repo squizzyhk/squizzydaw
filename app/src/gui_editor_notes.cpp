@@ -101,4 +101,33 @@ std::string noteName(int pitch) {
   return std::string(kNames[pitch % 12]) + std::to_string(pitch / 12 - 1);
 }
 
+const char* drumName(int pitch) {
+  // Mirrors the piece mapping of the built-in drum kit (engine/audio/src/builtin/drums.cpp, pieceOf).
+  switch (pitch) {
+    case 35: return "Kick 2";
+    case 36: return "Kick";
+    case 37: return "Rim";
+    case 38: return "Snare";
+    case 39: return "Clap";
+    case 40: return "Snare 2";
+    case 41: return "Low Tom 2";
+    case 42: return "Closed HH";
+    case 43: return "Low Tom";
+    case 44: return "Pedal HH";
+    case 45: return "Mid Tom 2";
+    case 46: return "Open HH";
+    case 47: return "Mid Tom";
+    case 48: return "High Tom";
+    case 49: return "Crash";
+    case 50: return "High Tom 2";
+    case 51: return "Ride";
+    case 52: return "China";
+    case 53: return "Ride Bell";
+    case 55: return "Splash";
+    case 57: return "Crash 2";
+    case 59: return "Ride 2";
+    default: return nullptr;
+  }
+}
+
 }  // namespace sq::app::gui::pr

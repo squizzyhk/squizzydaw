@@ -32,7 +32,7 @@ namespace {
 using pr::Note;
 using Clock = std::chrono::steady_clock;
 
-constexpr float kHeaderH = 34, kRulerH = 22, kKeysW = 62, kSbW = 11, kDivH = 6;
+constexpr float kHeaderH = 34, kRulerH = 22, kKeysW = 62, kDrumKeysW = 92, kSbW = 11, kDivH = 6;
 constexpr int kGridDiv[] = {0, 2, 4, 8, 16, 32, 64};  // 0 = bar
 constexpr const char* kGridNames[] = {"Bar", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64"};
 constexpr int kGridCount = 7;
@@ -47,8 +47,10 @@ enum class Drag {
 };
 enum Hdr : int {
   kHToolSelect = 1, kHToolDraw, kHToolErase, kHGrid, kHTriplet, kHSnap, kHLength, kHVel, kHQuantize, kHQStrength, kHLegato,
-  kHTransDown, kHTransUp, kHFold, kHFollow, kHZoomOut, kHZoomIn, kHZoomFit, kHCreateClip, kHAddTrack
+  kHTransDown, kHTransUp, kHFold, kHFollow, kHZoomOut, kHZoomIn, kHZoomFit, kHCreateClip, kHAddTrack, kHMore
 };
+// Header control groups, left to right. Groups that do not fit the panel go into the "..." menu.
+enum HGroup : int { kGTools, kGGrid, kGLength, kGVel, kGQuantize, kGTranspose, kGView, kGCount };
 enum Zone { kZoneBody = 0, kZoneLeft = 1, kZoneRight = 2 };
 
 struct HitBox {
@@ -63,7 +65,7 @@ Color contrastText(const Palette& p, Color bgc) {
   return lum > 0.55f ? darkC : lightC;
 }
 
-class ClipEditor final : public Widget, public CharInput {
+class ClipEditor final : public Widget, public CharInput, public EditTarget {
  public:
   explicit ClipEditor(GuiContext& ctx) : Widget("ClipEditor"), ctx_(ctx), audio_(makeAudioInspector(ctx)) {
     hitTestable = true;
@@ -194,6 +196,50 @@ class ClipEditor final : public Widget, public CharInput {
     }
   }
 
+  // Edit menu commands while the piano roll has focus: they act on the notes, never on the clip.
+  bool editCommand(std::string_view cmd) override {
+    if (!haveClip_ || clip_.info.kind != SQ_CLIP_MIDI) return false;
+    const bool any = anySelected();
+    if (cmd == "Copy" || cmd == "Cut") {
+      if (!any) {
+        ctx_.setStatus("No notes selected");
+        return true;
+      }
+      copySelection();
+      if (cmd == "Cut") deleteSelected();
+      return true;
+    }
+    if (cmd == "Paste") {
+      if (clipboard_.empty()) return false;  // nothing copied here: the arrangement clipboard may apply
+      paste();
+      return true;
+    }
+    if (cmd == "Delete") {
+      if (any) deleteSelected();
+      else ctx_.setStatus("No notes selected");
+      return true;
+    }
+    if (cmd == "Duplicate") {
+      if (any) duplicateSelection();
+      else ctx_.setStatus("No notes selected");
+      return true;
+    }
+    if (cmd == "SelectAll") {
+      selectAll();
+      return true;
+    }
+    if (cmd == "SelectNone") {
+      for (Note& n : notes_) n.sel = false;
+      ctx_.invalidate();
+      return true;
+    }
+    if (cmd == "Quantize") {
+      quantizeNotes();
+      return true;
+    }
+    return false;
+  }
+
  private:
   // ==== document cache ===========================================================================
   void sync() {
@@ -220,10 +266,14 @@ class ClipEditor final : public Widget, public CharInput {
     TrackView t;
     trackName_.clear();
     trackCol_ = ctx_.palette().accent2;
+    const bool wasDrums = drums_;
+    drums_ = false;
     if (ctx_.findTrack(clip_.track, &t)) {
       trackName_ = t.name;
       trackCol_ = ctx_.trackColor(t);
+      drums_ = t.info.kind == SQ_TRACK_INSTRUMENT && ctx_.trackString(clip_.track, "user.instrument").rfind("builtin|drums", 0) == 0;
     }
+    if (drums_ != wasDrums) needFit_ = true;
     if (clip_.info.color != 0 && (clip_.info.color & 0xFF) != 0) trackCol_ = Color::rgba(clip_.info.color);
     readSignature();
     if (clip_.info.kind != SQ_CLIP_MIDI) return;
@@ -260,6 +310,9 @@ class ClipEditor final : public Widget, public CharInput {
     if (fold_) {
       std::array<bool, 128> used{};
       for (const Note& n : notes_) used[static_cast<size_t>(std::clamp(n.pitch, 0, 127))] = true;
+      if (drums_)  // a drum lane per kit piece, used or not
+        for (int pch = pr::kDrumLo; pch <= pr::kDrumHi; ++pch)
+          if (pr::drumName(pch)) used[static_cast<size_t>(pch)] = true;
       for (int pch = 127; pch >= 0; --pch)
         if (used[static_cast<size_t>(pch)]) rows_.push_back(pch);
     }
@@ -268,25 +321,34 @@ class ClipEditor final : public Widget, public CharInput {
     for (size_t r = 0; r < rows_.size(); ++r) rowOf_[static_cast<size_t>(rows_[r])] = static_cast<int>(r);
   }
   bool folded() const { return rows_.size() < 128; }
+  // Flat rows (no piano keyboard): folded view, or a drum kit (rows are named pieces).
+  bool flatKeys() const { return folded() || drums_; }
+  float keysW() const { return drums_ ? kDrumKeysW : kKeysW; }
+  std::string pitchName(int pch) const {
+    if (drums_)
+      if (const char* d = pr::drumName(pch)) return d;
+    return pr::noteName(pch);
+  }
 
   // ==== geometry ===================================================================================
   void layoutRegions() {
     const Rect& f = frame();
     header_ = Rect{f.x, f.y, f.w, kHeaderH};
     const float top = f.y + kHeaderH;
-    const float gw = std::max(10.0f, f.w - kKeysW - kSbW);
+    const float kw = keysW();
+    const float gw = std::max(10.0f, f.w - kw - kSbW);
     const float avail = f.bottom() - top - kRulerH - kSbW - kDivH;
     velH_ = std::clamp(velH_, 24.0f, std::max(24.0f, avail - 40.0f));
     float vh = velH_;
     if (avail - vh < 40) vh = std::max(0.0f, avail - 40);
-    ruler_ = Rect{f.x + kKeysW, top, gw, kRulerH};
-    corner_ = Rect{f.x, top, kKeysW, kRulerH};
-    hbar_ = Rect{f.x + kKeysW, f.bottom() - kSbW, gw, kSbW};
-    vel_ = Rect{f.x + kKeysW, hbar_.y - vh, gw, vh};
-    velLabel_ = Rect{f.x, vel_.y, kKeysW, vh};
+    ruler_ = Rect{f.x + kw, top, gw, kRulerH};
+    corner_ = Rect{f.x, top, kw, kRulerH};
+    hbar_ = Rect{f.x + kw, f.bottom() - kSbW, gw, kSbW};
+    vel_ = Rect{f.x + kw, hbar_.y - vh, gw, vh};
+    velLabel_ = Rect{f.x, vel_.y, kw, vh};
     div_ = Rect{f.x, vel_.y - kDivH, f.w, kDivH};
-    grid_ = Rect{f.x + kKeysW, ruler_.bottom(), gw, std::max(0.0f, div_.y - ruler_.bottom())};
-    keys_ = Rect{f.x, grid_.y, kKeysW, grid_.h};
+    grid_ = Rect{f.x + kw, ruler_.bottom(), gw, std::max(0.0f, div_.y - ruler_.bottom())};
+    keys_ = Rect{f.x, grid_.y, kw, grid_.h};
     vbar_ = Rect{grid_.right(), grid_.y, kSbW, grid_.h};
   }
 
@@ -354,9 +416,15 @@ class ClipEditor final : public Widget, public CharInput {
       lo = std::min(lo, r);
       hi = std::max(hi, r);
     }
-    if (hi < 0) lo = hi = std::max(0, rowOfPitch(66));
+    if (hi < 0 && drums_) {  // empty drum clip: the kit range, kick at the bottom when it does not all fit
+      lo = std::max(0, rowOfPitch(pr::kDrumHi));
+      hi = std::max(0, rowOfPitch(pr::kDrumLo));
+    } else if (hi < 0) {
+      lo = hi = std::max(0, rowOfPitch(66));
+    }
     const float centerY = (static_cast<float>(lo + hi) / 2.0f + 0.5f) * rowH_;
     scrollY_ = centerY - grid_.h / 2;
+    if (static_cast<float>(hi - lo + 1) * rowH_ > grid_.h) scrollY_ = static_cast<float>(hi + 1) * rowH_ - grid_.h;
     clampScroll();
   }
   void zoomX(double factor, float aroundX) {
@@ -615,9 +683,11 @@ class ClipEditor final : public Widget, public CharInput {
       if (h.r.contains(x, y)) return h.id;
     return -1;
   }
+  // Header widgets. In a dry pass (dry_) they only measure: nothing is drawn or hit-tested.
   float button(Canvas& c, float x, const char* lbl, int id, bool on, float minW = 0) {
     const Palette& p = ctx_.palette();
-    const float w = std::max(minW, c.measureText(lbl, 12) + 18);
+    const float w = std::max(minW, c.measureText(lbl, 12) + (compact_ ? 12.0f : 18.0f));
+    if (dry_) return x + w;
     const Rect r{x, header_.y + 5, w, header_.h - 10};
     addHit(r, id);
     const bool hot = hotHdr_ == id;
@@ -630,6 +700,7 @@ class ClipEditor final : public Widget, public CharInput {
   float dropdown(Canvas& c, float x, const std::string& lbl, int id, float minW) {
     const Palette& p = ctx_.palette();
     const float w = std::max(minW, c.measureText(lbl, 12) + 30);
+    if (dry_) return x + w;
     const Rect r{x, header_.y + 5, w, header_.h - 10};
     addHit(r, id);
     c.fillRoundRect(r, 4, hotHdr_ == id ? p.panel3 : p.panel2);
@@ -639,13 +710,64 @@ class ClipEditor final : public Widget, public CharInput {
     return x + w;
   }
   float caption(Canvas& c, float x, const char* str) {
+    if (compact_) return x;  // compact header: no captions
     const float w = c.measureText(str, 11) + 6;
-    c.drawText(str, Rect{x, header_.y, w, header_.h}, ctx_.palette().dim, 11);
+    if (!dry_) c.drawText(str, Rect{x, header_.y, w, header_.h}, ctx_.palette().dim, 11);
     return x + w;
   }
   float separator(Canvas& c, float x) {
-    c.fillRect(Rect{x + 6, header_.y + 9, 1, header_.h - 18}, ctx_.palette().border);
-    return x + 13;
+    const float w = compact_ ? 9.0f : 13.0f;
+    if (!dry_) c.fillRect(Rect{x + (w - 1) / 2, header_.y + 9, 1, header_.h - 18}, ctx_.palette().border);
+    return x + w;
+  }
+
+  // One header group (starting with its separator); returns the x after it.
+  float headerGroup(Canvas& c, int g, float x) {
+    const Palette& p = ctx_.palette();
+    x = separator(c, x);
+    switch (g) {
+      case kGTools:
+        x = button(c, x, "Select", kHToolSelect, tool_ == Tool::Select) + 2;
+        x = button(c, x, "Draw", kHToolDraw, tool_ == Tool::Draw) + 2;
+        return button(c, x, "Erase", kHToolErase, tool_ == Tool::Erase);
+      case kGGrid:
+        x = caption(c, x, "Grid");
+        x = dropdown(c, x, kGridNames[gridIdx_], kHGrid, 58) + 2;
+        x = button(c, x, "3", kHTriplet, triplet_, 24) + 2;
+        return button(c, x, "Snap", kHSnap, snap_);
+      case kGLength:
+        x = caption(c, x, "Length");
+        return dropdown(c, x, kLenNames[lenIdx_], kHLength, 62);
+      case kGVel: {
+        x = caption(c, x, "Vel");
+        const Rect r{x, header_.y + 5, 40, header_.h - 10};
+        if (dry_) return x + r.w;
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%d", newVel_);
+        addHit(r, kHVel);
+        c.fillRoundRect(r, 4, (hotHdr_ == kHVel || drag_ == Drag::HeaderVel) ? p.panel3 : p.bg);
+        c.strokeRoundRect(r, 4, p.border, 1);
+        const float frac = static_cast<float>(newVel_) / 127.0f;
+        c.fillRect(Rect{r.x + 3, r.bottom() - 4, (r.w - 6) * frac, 2}, velColor(newVel_));
+        c.drawText(buf, Rect{r.x, r.y - 1, r.w, r.h}, p.text, 12, TextAlign::Center);
+        return x + r.w;
+      }
+      case kGQuantize: {
+        x = button(c, x, compact_ ? "Quant" : "Quantize", kHQuantize, false);
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(qStrength_ * 100)));
+        x = dropdown(c, x + 2, buf, kHQStrength, 52) + 2;
+        return button(c, x, "Legato", kHLegato, false);
+      }
+      case kGTranspose:
+        x = button(c, x, "-", kHTransDown, false, 24);
+        x = compact_ ? x + 2 : caption(c, x + 3, "Transpose");
+        return button(c, x, "+", kHTransUp, false, 24);
+      case kGView:
+        x = button(c, x, "Fold", kHFold, fold_) + 2;
+        return button(c, x, "Follow", kHFollow, follow_);
+      default: return x;
+    }
   }
 
   void paintHeader(Canvas& c, bool midi) {
@@ -655,64 +777,163 @@ class ClipEditor final : public Widget, public CharInput {
     c.fillRect(header_, p.panel);
     c.fillRect(Rect{f.x, header_.bottom() - 1, f.w, 1}, p.border);
     if (tree() && tree()->focus() == this) c.fillRect(Rect{f.x, header_.bottom() - 2, f.w, 2}, p.accent.withAlpha(0.6f));
+    const std::string clipName = clip_.name.empty() ? std::string(midi ? "MIDI Clip" : "Audio Clip") : clip_.name;
+    const std::string trackName = trackName_.empty() ? std::string("-") : trackName_;
+    const float nameFull = std::max(c.measureText(clipName, 12) + 4, c.measureText(trackName, 10.5f)) + 6;
+    // Layout: the zoom group is pinned right; the groups fill the space left of it, first at full
+    // size, then compact (no captions, a shorter name), then the ones that do not fit go into "...".
+    const float zw = 24 + 2 + 24 + 2 + 34;
+    const float limit = f.right() - zw - 10 - 8;
+    std::array<float, kGCount> gw{};
+    auto measureGroups = [&]() {
+      float sum = 0;
+      dry_ = true;
+      for (int g = 0; g < kGCount; ++g) {
+        gw[static_cast<size_t>(g)] = headerGroup(c, g, 0);
+        sum += gw[static_cast<size_t>(g)];
+      }
+      dry_ = false;
+      return sum;
+    };
+    compact_ = false;
+    float nameW = std::clamp(nameFull, 70.0f, 200.0f);
+    if (midi && f.x + 20 + nameW + 4 + measureGroups() > limit) {
+      compact_ = true;
+      nameW = std::clamp(nameFull, 60.0f, 110.0f);
+      measureGroups();
+    }
     // clip + track
     float x = f.x + 10;
     c.fillRoundRect(Rect{x, header_.y + 8, 4, header_.h - 16}, 2, trackCol_);
     x += 10;
-    const std::string clipName = clip_.name.empty() ? std::string(midi ? "MIDI Clip" : "Audio Clip") : clip_.name;
-    const std::string trackName = trackName_.empty() ? std::string("-") : trackName_;
-    const float nameW = std::clamp(std::max(c.measureText(clipName, 12) + 4, c.measureText(trackName, 10.5f)) + 6, 70.0f, 200.0f);
     c.drawTextBold(clipName, Rect{x, header_.y + 3, nameW, 16}, p.text, 12);
     c.drawText(trackName, Rect{x, header_.y + 17, nameW, 14}, p.dim, 10.5f);
     x += nameW + 4;
     if (!midi) return;
-    x = separator(c, x);
-    x = button(c, x, "Select", kHToolSelect, tool_ == Tool::Select) + 2;
-    x = button(c, x, "Draw", kHToolDraw, tool_ == Tool::Draw) + 2;
-    x = button(c, x, "Erase", kHToolErase, tool_ == Tool::Erase);
-    x = separator(c, x);
-    x = caption(c, x, "Grid");
-    x = dropdown(c, x, kGridNames[gridIdx_], kHGrid, 58) + 2;
-    x = button(c, x, "3", kHTriplet, triplet_, 24) + 2;
-    x = button(c, x, "Snap", kHSnap, snap_);
-    x = separator(c, x);
-    x = caption(c, x, "Length");
-    x = dropdown(c, x, kLenNames[lenIdx_], kHLength, 62);
-    x = separator(c, x);
-    {
-      x = caption(c, x, "Vel");
-      char buf[16];
-      std::snprintf(buf, sizeof buf, "%d", newVel_);
-      const Rect r{x, header_.y + 5, 40, header_.h - 10};
-      addHit(r, kHVel);
-      c.fillRoundRect(r, 4, (hotHdr_ == kHVel || drag_ == Drag::HeaderVel) ? p.panel3 : p.bg);
-      c.strokeRoundRect(r, 4, p.border, 1);
-      const float frac = static_cast<float>(newVel_) / 127.0f;
-      c.fillRect(Rect{r.x + 3, r.bottom() - 4, (r.w - 6) * frac, 2}, velColor(newVel_));
-      c.drawText(buf, Rect{r.x, r.y - 1, r.w, r.h}, p.text, 12, TextAlign::Center);
-      x += r.w;
+    float need = 0;
+    for (float w : gw) need += w;
+    shownGroups_ = 0;
+    if (x + need <= limit) {
+      shownGroups_ = kGCount;
+    } else {
+      const float moreW = 13 + 30;
+      float xx = x;
+      while (shownGroups_ < kGCount && xx + gw[static_cast<size_t>(shownGroups_)] <= limit - moreW) xx += gw[static_cast<size_t>(shownGroups_++)];
     }
-    x = separator(c, x);
-    x = button(c, x, "Quantize", kHQuantize, false);
-    {
-      char buf[16];
-      std::snprintf(buf, sizeof buf, "%d%%", static_cast<int>(std::lround(qStrength_ * 100)));
-      x = dropdown(c, x + 2, buf, kHQStrength, 52) + 2;
+    for (int g = 0; g < shownGroups_; ++g) x = headerGroup(c, g, x);
+    if (shownGroups_ < kGCount) {
+      x = separator(c, x);
+      x = button(c, x, "...", kHMore, false, 30);
     }
-    x = button(c, x, "Legato", kHLegato, false);
-    x = separator(c, x);
-    x = button(c, x, "-", kHTransDown, false, 24);
-    x = caption(c, x + 3, "Transpose");
-    x = button(c, x, "+", kHTransUp, false, 24);
-    x = separator(c, x);
-    x = button(c, x, "Fold", kHFold, fold_) + 2;
-    x = button(c, x, "Follow", kHFollow, follow_);
-    // zoom (right aligned when there is room)
-    const float zw = 24 + 2 + 24 + 2 + 34;
+    // zoom: right aligned and always reachable (only a panel narrower than the clip name pushes it)
     float zx = std::max(x + 13, f.right() - zw - 10);
     zx = button(c, zx, "-", kHZoomOut, false, 24) + 2;
     zx = button(c, zx, "+", kHZoomIn, false, 24) + 2;
     button(c, zx, "Fit", kHZoomFit, false, 34);
+  }
+
+  // ---- header menus (dropdowns and the "..." overflow menu) ----
+  std::vector<MenuItem> gridMenu() {
+    std::vector<MenuItem> items;
+    for (int i = 0; i < kGridCount; ++i) {
+      MenuItem m;
+      m.label = kGridNames[i];
+      m.checked = i == gridIdx_;
+      m.action = [this, i] {
+        gridIdx_ = i;
+        ctx_.invalidate();
+      };
+      items.push_back(std::move(m));
+    }
+    items.push_back(MenuItem::sep());
+    MenuItem t;
+    t.label = "Triplets";
+    t.checked = triplet_;
+    t.action = [this] { triplet_ = !triplet_; };
+    items.push_back(std::move(t));
+    return items;
+  }
+  std::vector<MenuItem> lengthMenu() {
+    std::vector<MenuItem> items;
+    for (int i = 0; i < kLenCount; ++i) {
+      MenuItem m;
+      m.label = kLenNames[i];
+      if (i == 0) m.label = "Grid (follows the grid)";
+      if (i == 1) m.label = "Last (length of the last edited note)";
+      m.checked = i == lenIdx_;
+      m.action = [this, i] { lenIdx_ = i; };
+      items.push_back(std::move(m));
+      if (i == 1) items.push_back(MenuItem::sep());
+    }
+    return items;
+  }
+  std::vector<MenuItem> strengthMenu() {
+    std::vector<MenuItem> items;
+    for (int s : {100, 75, 50, 25}) {
+      MenuItem m;
+      m.label = "Strength " + std::to_string(s) + "%";
+      m.checked = std::lround(qStrength_ * 100) == s;
+      m.action = [this, s] { qStrength_ = s / 100.0; };
+      items.push_back(std::move(m));
+    }
+    return items;
+  }
+  // The controls of the header groups that did not fit.
+  std::vector<MenuItem> overflowMenu() {
+    std::vector<MenuItem> m;
+    auto add = [&m](const std::string& lbl, std::function<void()> fn, bool on = false, std::vector<MenuItem> sub = {}) {
+      MenuItem it;
+      it.label = lbl;
+      it.action = std::move(fn);
+      it.checked = on;
+      it.submenu = std::move(sub);
+      m.push_back(std::move(it));
+    };
+    for (int g = shownGroups_; g < kGCount; ++g) {
+      if (!m.empty()) m.push_back(MenuItem::sep());
+      switch (g) {
+        case kGTools:
+          add("Select Tool", [this] { tool_ = Tool::Select; }, tool_ == Tool::Select);
+          add("Draw Tool", [this] { tool_ = Tool::Draw; }, tool_ == Tool::Draw);
+          add("Erase Tool", [this] { tool_ = Tool::Erase; }, tool_ == Tool::Erase);
+          break;
+        case kGGrid:
+          add(std::string("Grid: ") + kGridNames[gridIdx_], {}, false, gridMenu());
+          add("Snap to Grid", [this] { snap_ = !snap_; }, snap_);
+          break;
+        case kGLength: add(std::string("Note Length: ") + kLenNames[lenIdx_], {}, false, lengthMenu()); break;
+        case kGVel:
+          add("Velocity for New Notes (" + std::to_string(newVel_) + ")...", [this] {
+            ctx_.prompt("Velocity for new notes (1-127)", std::to_string(newVel_), [this](const std::string& v) {
+              const int n = std::atoi(v.c_str());
+              if (n >= 1 && n <= 127) newVel_ = n;
+              ctx_.invalidate();
+            });
+          });
+          break;
+        case kGQuantize:
+          add("Quantize", [this] { quantizeNotes(); });
+          add("Quantize Strength", {}, false, strengthMenu());
+          add("Legato", [this] { legatoNotes(); });
+          break;
+        case kGTranspose:
+          add("Transpose +1", [this] { transpose(1, false); });
+          add("Transpose -1", [this] { transpose(-1, false); });
+          add("Transpose +12", [this] { transpose(12, false); });
+          add("Transpose -12", [this] { transpose(-12, false); });
+          break;
+        case kGView:
+          add("Fold", [this] {
+            fold_ = !fold_;
+            buildRows();
+            fitView(true);
+          }, fold_);
+          add("Follow Playhead", [this] { follow_ = !follow_; }, follow_);
+          break;
+        default: break;
+      }
+    }
+    return m;
   }
 
   Color velColor(int vel) const {
@@ -729,7 +950,7 @@ class ClipEditor final : public Widget, public CharInput {
     c.fillRect(ruler_, p.panel);
     c.fillRect(Rect{corner_.x, ruler_.bottom() - 1, frame().w, 1}, p.border);
     // hovered pitch in the corner
-    if (hoverPitch_ >= 0) c.drawTextBold(pr::noteName(hoverPitch_), Rect{corner_.x + 6, corner_.y, corner_.w - 10, corner_.h}, p.dim, 11, TextAlign::Left);
+    if (hoverPitch_ >= 0) c.drawTextBold(pitchName(hoverPitch_), Rect{corner_.x + 6, corner_.y, corner_.w - 10, corner_.h}, p.dim, 11, TextAlign::Left);
     c.pushClip(ruler_);
     const double cs = clipStart(), len = clipLen();
     // clip range strip
@@ -791,10 +1012,10 @@ class ClipEditor final : public Widget, public CharInput {
     for (int r = r0; r <= r1; ++r) {
       const int pch = rows_[static_cast<size_t>(r)];
       const float y = yOfRow(r);
-      Color rc = pr::isBlackKey(pch) ? black : white;
+      Color rc = (drums_ ? !pr::drumName(pch) : pr::isBlackKey(pch)) ? black : white;
       if (pch == hoverPitch_ && drag_ == Drag::None) rc = draw::mix(rc, p.accent, 0.07f);
       c.fillRect(Rect{grid_.x, y, grid_.w, rowH_}, rc);
-      const bool octave = !folded() && (pch % 12) == 0;
+      const bool octave = !flatKeys() && (pch % 12) == 0;
       c.fillRect(Rect{grid_.x, y + rowH_ - 1, grid_.w, 1}, octave ? p.gridBar : p.grid.withAlpha(0.7f));
     }
     // vertical lines
@@ -837,7 +1058,7 @@ class ClipEditor final : public Widget, public CharInput {
       }
       if (r.w > 30 && rowH_ >= 10) {
         const float fs = std::min(11.0f, rowH_ - 3);
-        c.drawText(pr::noteName(n.pitch), Rect{r.x + 6, r.y, r.w - 8, r.h}, contrastText(p, col), fs);
+        c.drawText(pitchName(n.pitch), Rect{r.x + 6, r.y, r.w - 8, r.h}, contrastText(p, col), fs);
       }
     }
     // draw-tool ghost
@@ -898,26 +1119,30 @@ class ClipEditor final : public Widget, public CharInput {
     for (int r = r0; r <= r1; ++r) {
       const int pch = rows_[static_cast<size_t>(r)];
       const float y = yOfRow(r);
-      const bool blk = pr::isBlackKey(pch);
+      const bool flat = flatKeys();
+      const char* drum = drums_ ? pr::drumName(pch) : nullptr;
+      const bool blk = drums_ ? drum == nullptr : pr::isBlackKey(pch);
       Color kc = blk ? blackK : whiteK;
       Color hl{0, 0, 0, 0};
       if (pch == previewPitch_) hl = p.accent;
       else if (pch == hoverPitch_) hl = p.accent.withAlpha(0.55f);
       else if (selPitch[static_cast<size_t>(pch)]) hl = p.accent.withAlpha(0.32f);
-      if (blk && !folded()) {
+      if (blk && !flat) {
         c.fillRect(Rect{keys_.x, y, bw, rowH_}, hl.a > 0 ? draw::mix(kc, hl.withAlpha(1), hl.a) : kc);
         if (hl.a > 0) c.fillRect(Rect{keys_.x + bw, y, keys_.w - bw, rowH_}, hl.withAlpha(hl.a * 0.4f));
       } else {
-        if (folded()) c.fillRect(Rect{keys_.x, y, keys_.w, rowH_}, kc);
+        if (flat) c.fillRect(Rect{keys_.x, y, keys_.w, rowH_}, kc);
         if (hl.a > 0) c.fillRect(Rect{keys_.x, y, keys_.w, rowH_}, hl);
-        if (folded() || pch % 12 == 0 || pch % 12 == 5) c.fillRect(Rect{keys_.x, y + rowH_ - 1, keys_.w, 1}, line);
+        if (flat || pch % 12 == 0 || pch % 12 == 5) c.fillRect(Rect{keys_.x, y + rowH_ - 1, keys_.w, 1}, line);
       }
-      if (blk && !folded()) c.fillRect(Rect{keys_.x + bw, y + rowH_ / 2, keys_.w - bw, 1}, line);
-      const bool showLabel = folded() ? rowH_ >= 9 : (pch % 12 == 0 && rowH_ >= 7);
+      if (blk && !flat) c.fillRect(Rect{keys_.x + bw, y + rowH_ / 2, keys_.w - bw, 1}, line);
+      const bool showLabel = flat ? rowH_ >= 9 : (pch % 12 == 0 && rowH_ >= 7);
       if (showLabel) {
         const float fs = std::clamp(rowH_ - 3, 8.0f, 11.0f);
-        const Color tc = folded() && blk ? contrastText(p, blackK) : contrastText(p, whiteK);
-        c.drawText(pr::noteName(pch), Rect{keys_.x + 3, y, keys_.w - 7, rowH_}, pch % 12 == 0 ? tc : tc.withAlpha(0.75f), fs, TextAlign::Right);
+        const Color tc = flat && blk ? contrastText(p, blackK) : contrastText(p, whiteK);
+        const bool strong = drums_ ? drum != nullptr : pch % 12 == 0;
+        c.drawText(drum ? std::string(drum) : pr::noteName(pch), Rect{keys_.x + 3, y, keys_.w - 7, rowH_}, strong ? tc : tc.withAlpha(0.6f), fs,
+                   drums_ ? TextAlign::Left : TextAlign::Right);
       }
     }
     c.fillRect(Rect{keys_.right() - 1, keys_.y, 1, keys_.h}, p.border);
@@ -970,7 +1195,7 @@ class ClipEditor final : public Widget, public CharInput {
 
   void paintScrollbars(Canvas& c) {
     const Palette& p = ctx_.palette();
-    c.fillRect(Rect{frame().x, hbar_.y, kKeysW, kSbW}, p.panel);
+    c.fillRect(Rect{frame().x, hbar_.y, keysW(), kSbW}, p.panel);
     c.fillRect(hbar_, p.panel);
     c.fillRect(vbar_, p.panel);
     c.fillRect(Rect{vbar_.x, vel_.y - kDivH, kSbW, vel_.h + kDivH + kSbW}, p.panel);
@@ -1038,10 +1263,9 @@ class ClipEditor final : public Widget, public CharInput {
   void createClip() {
     TrackView t;
     if (!createTarget(&t)) return;
-    double at = std::max(0.0, ctx_.editState().cursor);
+    const double at = std::max(0.0, ctx_.editState().cursor);  // exactly at the edit cursor (the hint says so)
     readSignature();
     const double bar = barLen();
-    at = std::floor(at / bar + 1e-9) * bar;
     auto a = sq::makeAttributes();
     a->setGuid("track", &t.id);
     a->setInt("kind", SQ_CLIP_MIDI);
@@ -1144,54 +1368,10 @@ class ClipEditor final : public Widget, public CharInput {
       case kHZoomIn: zoomX(1.5, grid_.x + grid_.w / 2); break;
       case kHZoomOut: zoomX(1 / 1.5, grid_.x + grid_.w / 2); break;
       case kHZoomFit: fitView(true); break;
-      case kHGrid: {
-        std::vector<MenuItem> items;
-        for (int i = 0; i < kGridCount; ++i) {
-          MenuItem m;
-          m.label = kGridNames[i];
-          m.checked = i == gridIdx_;
-          m.action = [this, i] {
-            gridIdx_ = i;
-            ctx_.invalidate();
-          };
-          items.push_back(std::move(m));
-        }
-        items.push_back(MenuItem::sep());
-        MenuItem t;
-        t.label = "Triplets";
-        t.checked = triplet_;
-        t.action = [this] { triplet_ = !triplet_; };
-        items.push_back(std::move(t));
-        ctx_.showMenu(std::move(items), Point{hitRect(id).x, header_.bottom()});
-        break;
-      }
-      case kHLength: {
-        std::vector<MenuItem> items;
-        for (int i = 0; i < kLenCount; ++i) {
-          MenuItem m;
-          m.label = kLenNames[i];
-          if (i == 0) m.label = "Grid (follows the grid)";
-          if (i == 1) m.label = "Last (length of the last edited note)";
-          m.checked = i == lenIdx_;
-          m.action = [this, i] { lenIdx_ = i; };
-          items.push_back(std::move(m));
-          if (i == 1) items.push_back(MenuItem::sep());
-        }
-        ctx_.showMenu(std::move(items), Point{hitRect(id).x, header_.bottom()});
-        break;
-      }
-      case kHQStrength: {
-        std::vector<MenuItem> items;
-        for (int s : {100, 75, 50, 25}) {
-          MenuItem m;
-          m.label = "Strength " + std::to_string(s) + "%";
-          m.checked = std::lround(qStrength_ * 100) == s;
-          m.action = [this, s] { qStrength_ = s / 100.0; };
-          items.push_back(std::move(m));
-        }
-        ctx_.showMenu(std::move(items), Point{hitRect(id).x, header_.bottom()});
-        break;
-      }
+      case kHGrid: ctx_.showMenu(gridMenu(), Point{hitRect(id).x, header_.bottom()}); break;
+      case kHLength: ctx_.showMenu(lengthMenu(), Point{hitRect(id).x, header_.bottom()}); break;
+      case kHQStrength: ctx_.showMenu(strengthMenu(), Point{hitRect(id).x, header_.bottom()}); break;
+      case kHMore: ctx_.showMenu(overflowMenu(), Point{hitRect(id).x, header_.bottom()}); break;
       default: break;
     }
     ctx_.invalidate();
@@ -1547,7 +1727,7 @@ class ClipEditor final : public Widget, public CharInput {
       preview(newPitch, a.vel, a.chan);
     }
     char buf[96];
-    std::snprintf(buf, sizeof buf, "%s%s  %s", copy ? "Copy  " : "", ctx_.formatBars(clipStart() + a.pos + delta).c_str(), pr::noteName(newPitch).c_str());
+    std::snprintf(buf, sizeof buf, "%s%s  %s", copy ? "Copy  " : "", ctx_.formatBars(clipStart() + a.pos + delta).c_str(), pitchName(newPitch).c_str());
     dragInfo_ = buf;
   }
 
@@ -1601,7 +1781,7 @@ class ClipEditor final : public Widget, public CharInput {
       n.len = std::clamp(end - n.pos, ml, std::max(ml, clipLen() - n.pos));
       lastLen_ = n.len;
     }
-    dragInfo_ = pr::noteName(n.pitch) + "  " + lengthText(n.len);
+    dragInfo_ = pitchName(n.pitch) + "  " + lengthText(n.len);
   }
 
   std::string lengthText(double ppq) const {
@@ -1732,7 +1912,7 @@ class ClipEditor final : public Widget, public CharInput {
     add("Select All", [this] { selectAll(); }, "Ctrl+A", !notes_.empty());
     if (hit >= 0) {
       const int pch = notes_[static_cast<size_t>(hit)].pitch;
-      add("Select All " + pr::noteName(pch), [this, pch] {
+      add("Select All " + pitchName(pch), [this, pch] {
         for (Note& n : notes_) n.sel = n.pitch == pch;
         ctx_.invalidate();
       });
@@ -1767,7 +1947,9 @@ class ClipEditor final : public Widget, public CharInput {
   // settings
   Tool tool_ = Tool::Select;
   int gridIdx_ = 4, lenIdx_ = 0, newVel_ = 100;
-  bool triplet_ = false, snap_ = true, fold_ = false, follow_ = true;
+  bool triplet_ = false, snap_ = true, fold_ = false, follow_ = true, drums_ = false;
+  bool dry_ = false, compact_ = false;  // header layout passes
+  int shownGroups_ = kGCount;
   double qStrength_ = 1.0, lastLen_ = 0;
   // regions
   Rect header_, ruler_, corner_, grid_, keys_, vel_, velLabel_, div_, hbar_, vbar_;
