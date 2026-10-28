@@ -613,6 +613,7 @@ int runGuiOffscreen(Shell& shell, const GuiRunOptions& o) {
     if (auto f = sq::readFile(o.script); f && o.script.find('\n') == std::string::npos && o.script.find(';') == std::string::npos) text = *f;
     std::string cur;
     for (char ch : text) {
+      if (ch == '\r') continue;  // CRLF scripts (Windows checkouts)
       if (ch == '\n' || ch == ';') {
         lines.push_back(cur);
         cur.clear();
