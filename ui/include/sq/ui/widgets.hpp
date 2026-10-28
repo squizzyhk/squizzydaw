@@ -40,6 +40,21 @@ class Canvas {
   void drawLine(Point a, Point b, Color c, float w) { r_.drawLine(px(a), px(b), c, w * s_); }
   void drawArc(Point ctr, float radius, float start, float sweep, Color c, float w) { r_.drawArc(px(ctr), radius * s_, start, sweep, c, w * s_); }
   void drawText(std::string_view t, const Rect& r, Color c, float size, TextAlign a = TextAlign::Left) { r_.drawText(t, px(r), c, size * s_, a); }
+  void drawTextBold(std::string_view t, const Rect& r, Color c, float size, TextAlign a = TextAlign::Left) {
+    r_.drawTextStyled(t, px(r), c, size * s_, a, true);
+  }
+  void fillPolygon(const std::vector<Point>& pts, Color c) {
+    std::vector<Point> q(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i) q[i] = px(pts[i]);
+    r_.fillPolygon(q.data(), q.size(), c);
+  }
+  void strokePolyline(const std::vector<Point>& pts, Color c, float w) {
+    std::vector<Point> q(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i) q[i] = px(pts[i]);
+    r_.strokePolyline(q.data(), q.size(), c, w * s_);
+  }
+  // Text width in DIPs.
+  float measureText(std::string_view t, float size) { return r_.measureText(t, size * s_) / s_; }
   void drawImage(const Image& img, const Rect& r, float opacity = 1.0f) { r_.drawImage(img, px(r), opacity); }
   void pushClip(const Rect& r) { r_.pushClip(px(r)); }
   void popClip() { r_.popClip(); }

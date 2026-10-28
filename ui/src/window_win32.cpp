@@ -1,10 +1,17 @@
-// Win32 window + GDI renderer (M0 stand-in for the Skia backend).
+// Win32 window. Paints with the portable software renderer (soft_renderer.cpp, anti-aliased, real
+// text; same pixels as every other platform) presented with SetDIBitsToDevice. SQ_UI_BACKEND=gdi
+// selects the old GDI renderer (no alpha, no anti-aliasing).
 #ifdef _WIN32
 #include <windows.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
+
+#include "soft_renderer.hpp"
 
 #include "sq/ui/accessibility.hpp"
 #include "sq/ui/uia.hpp"
@@ -129,7 +136,7 @@ class Win32Window final : public IWindow {
     if (!registered) {
       WNDCLASSEXW wc{};
       wc.cbSize = sizeof wc;
-      wc.style = CS_HREDRAW | CS_VREDRAW;
+      wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
       wc.lpfnWndProc = &Win32Window::wndProc;
       wc.hInstance = inst;
       wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -243,12 +250,15 @@ class Win32Window final : public IWindow {
       case WM_LBUTTONUP:
       case WM_RBUTTONDOWN:
       case WM_RBUTTONUP:
+      case WM_MBUTTONDOWN:
+      case WM_MBUTTONUP:
       case WM_LBUTTONDBLCLK:
+      case WM_MOUSEHWHEEL:
       case WM_MOUSEWHEEL: {
         if (!self->cb_.onMouse) return 0;
         MouseEvent e;
         POINT pt{static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp))};
-        if (msg == WM_MOUSEWHEEL) ScreenToClient(h, &pt);
+        if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL) ScreenToClient(h, &pt);
         e.x = static_cast<float>(pt.x);
         e.y = static_cast<float>(pt.y);
         e.modifiers = currentModifiers();
@@ -258,7 +268,14 @@ class Win32Window final : public IWindow {
           case WM_LBUTTONUP: e.action = MouseAction::Up; e.button = MouseButton::Left; break;
           case WM_RBUTTONDOWN: e.action = MouseAction::Down; e.button = MouseButton::Right; break;
           case WM_RBUTTONUP: e.action = MouseAction::Up; e.button = MouseButton::Right; break;
+          case WM_MBUTTONDOWN: e.action = MouseAction::Down; e.button = MouseButton::Middle; break;
+          case WM_MBUTTONUP: e.action = MouseAction::Up; e.button = MouseButton::Middle; break;
           case WM_LBUTTONDBLCLK: e.action = MouseAction::DoubleClick; e.button = MouseButton::Left; break;
+          case WM_MOUSEHWHEEL:
+            e.action = MouseAction::Wheel;
+            e.wheel = -static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA;
+            e.modifiers |= kModShift;
+            break;
           default: e.action = MouseAction::Wheel; e.wheel = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA; break;
         }
         self->cb_.onMouse(e);
@@ -278,18 +295,43 @@ class Win32Window final : public IWindow {
     }
   }
 
+  static bool useGdi() {
+    const char* b = std::getenv("SQ_UI_BACKEND");
+    return b && std::strcmp(b, "gdi") == 0;
+  }
+
   void paint() {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(hwnd_, &ps);
     RECT rc;
     GetClientRect(hwnd_, &rc);
     Size sz{rc.right - rc.left, rc.bottom - rc.top};
+    float scale = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
+    if (!(scale > 0)) scale = 1.0f;
+    if (!useGdi() && sz.width > 0 && sz.height > 0) {
+      const size_t stride = static_cast<size_t>(sz.width) * 4;
+      pixels_.resize(stride * static_cast<size_t>(sz.height));
+      SoftSurface surf{pixels_.data(), sz.width, sz.height, stride};
+      auto r = makeSoftRenderer(surf, scale);
+      if (cb_.onPaint) cb_.onPaint(*r);
+      else r->clear(Color::rgb(0x202124));
+      BITMAPINFO bi{};
+      bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+      bi.bmiHeader.biWidth = sz.width;
+      bi.bmiHeader.biHeight = -sz.height;  // top-down
+      bi.bmiHeader.biPlanes = 1;
+      bi.bmiHeader.biBitCount = 32;
+      bi.bmiHeader.biCompression = BI_RGB;
+      SetDIBitsToDevice(dc, 0, 0, static_cast<DWORD>(sz.width), static_cast<DWORD>(sz.height), 0, 0, 0, static_cast<UINT>(sz.height),
+                        pixels_.data(), &bi, DIB_RGB_COLORS);
+      EndPaint(hwnd_, &ps);
+      return;
+    }
     // Double buffer to avoid flicker.
     HDC mem = CreateCompatibleDC(dc);
     HBITMAP bmp = CreateCompatibleBitmap(dc, sz.width > 0 ? sz.width : 1, sz.height > 0 ? sz.height : 1);
     HGDIOBJ old = SelectObject(mem, bmp);
-    float scale = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
-    GdiRenderer r(mem, sz, scale > 0 ? scale : 1.0f);
+    GdiRenderer r(mem, sz, scale);
     if (cb_.onPaint) cb_.onPaint(r);
     else r.clear(Color::rgb(0x202124));
     BitBlt(dc, 0, 0, sz.width, sz.height, mem, 0, 0, SRCCOPY);
@@ -326,12 +368,25 @@ class Win32Window final : public IWindow {
       case '0': case VK_NUMPAD0: return Key::Zero;
       case VK_DELETE: return Key::Delete;
       case VK_BACK: return Key::Backspace;
+      case VK_INSERT: return Key::Insert;
+      case VK_F1: return Key::F1;
+      case VK_F2: return Key::F2;
+      case VK_F3: return Key::F3;
+      case VK_F4: return Key::F4;
+      case VK_F6: return Key::F6;
+      case VK_F7: return Key::F7;
+      case VK_F8: return Key::F8;
+      case VK_F9: return Key::F9;
+      case VK_F10: return Key::F10;
+      case VK_F11: return Key::F11;
+      case VK_F12: return Key::F12;
       default: return Key::Unknown;
     }
   }
 
 
   HWND hwnd_ = nullptr;
+  std::vector<uint8_t> pixels_;
   bool closed_ = false;
   std::unique_ptr<UiaBridge> uia_;
   WindowCallbacks cb_;
@@ -345,7 +400,7 @@ std::unique_ptr<IWindow> createWindow(const WindowDesc& desc) {
   return w;
 }
 
-const char* defaultBackendName() { return "gdi"; }
+const char* defaultBackendName() { return "win32"; }
 
 }  // namespace sq::ui
 

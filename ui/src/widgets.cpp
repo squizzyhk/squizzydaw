@@ -490,6 +490,10 @@ bool WidgetTree::dispatchMouse(const MouseEvent& pe) {
           hover_ = h;
           changed = true;
         }
+        WidgetMouse he = e;
+        he.action = MouseAction::Hover;
+        for (Widget* w = h; w; w = w->parent())
+          if (w->onMouse(he)) return true;
       }
       return changed;
     case MouseAction::Leave:
@@ -513,6 +517,7 @@ bool WidgetTree::dispatchMouse(const MouseEvent& pe) {
       return bubble(hitTest(e.x, e.y)) != nullptr;
     case MouseAction::Wheel:
     case MouseAction::DoubleClick: return bubble(hitTest(e.x, e.y)) != nullptr;
+    case MouseAction::Hover: return false;
   }
   return false;
 }

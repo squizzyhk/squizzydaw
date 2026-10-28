@@ -39,6 +39,10 @@ struct Options {
   std::string logLevel;
   std::string audioDriver;
   std::vector<std::string> run;  // --run "Category.Name key=value ..."
+  std::string screenshot;        // --screenshot FILE.png (headless GUI render)
+  std::string uiScript;          // --ui-script FILE|"op;op"
+  int shotW = 1600, shotH = 1000;
+  float shotScale = 1.0f;
 };
 
 void printUsage() {
@@ -57,6 +61,9 @@ void printUsage() {
       "  --audio-driver D      none|null|offline|wasapi|asio (overrides Devices.Audio.Driver)\n"
       "  --log-level LEVEL     trace|debug|info|warn|error\n"
       "  --quit-after MS       GUI smoke test: close the window after MS milliseconds\n"
+      "  --screenshot FILE     render the GUI offscreen (no display) after --run commands\n"
+      "  --ui-script S         replay GUI input headlessly (file or 'op;op', see gui.hpp)\n"
+      "  --size WxH            offscreen GUI size (default 1600x1000); --scale F for HiDPI\n"
       "  --new-guid [N]        print N fresh GUIDs for class/interface IDs\n"
       "  --version             print version + ABI stamp\n"
       "  --licenses            print the third-party license notices (THIRD_PARTY_NOTICES.txt)\n",
@@ -100,6 +107,21 @@ bool parseArgs(int argc, char** argv, Options& o) {
       std::string v;
       if (!value(v)) return false;
       o.run.push_back(v);
+    } else if (a == "--screenshot") {
+      if (!value(o.screenshot)) return false;
+    } else if (a == "--ui-script") {
+      if (!value(o.uiScript)) return false;
+    } else if (a == "--size") {
+      std::string v;
+      if (!value(v)) return false;
+      size_t x = v.find('x');
+      if (x == std::string::npos) return false;
+      o.shotW = std::atoi(v.substr(0, x).c_str());
+      o.shotH = std::atoi(v.substr(x + 1).c_str());
+    } else if (a == "--scale") {
+      std::string v;
+      if (!value(v)) return false;
+      o.shotScale = static_cast<float>(std::atof(v.c_str()));
     } else if (a == "--help" || a == "-h" || a == "/?") o.help = true;
     else if (a == "--version") o.version = true;
     else if (a == "--licenses") o.licenses = true;
@@ -343,7 +365,8 @@ int main(int argc, char** argv) {
     return 3;
   }
 
-  bool gui = !(opt.headless || opt.listClasses || opt.listCommands || opt.selftest || opt.reloadTest || !opt.run.empty());
+  const bool offscreen = !opt.screenshot.empty() || !opt.uiScript.empty();
+  bool gui = !(opt.headless || opt.listClasses || opt.listCommands || opt.selftest || opt.reloadTest || !opt.run.empty() || offscreen);
   App app;
   sq::app::Shell::registerDefaults(app.shell.settings);
 
@@ -375,6 +398,15 @@ int main(int argc, char** argv) {
   if (!opt.run.empty()) rc |= app.runCommands(opt.run);
   if (opt.selftest) rc |= app.selftest();
   if (opt.reloadTest) rc |= app.reloadTest(opt.reloadCycles);
+  if (offscreen) {
+    sq::app::GuiRunOptions go;
+    go.screenshot = opt.screenshot;
+    go.script = opt.uiScript;
+    go.width = opt.shotW;
+    go.height = opt.shotH;
+    go.scale = opt.shotScale;
+    rc |= sq::app::runGuiOffscreen(app.shell, go);
+  }
 #ifdef _WIN32
   // Console-subsystem exe (so CLI modes behave in terminals/CI). When started by double-click the
   // console belongs to us alone: detach it so only the window remains.

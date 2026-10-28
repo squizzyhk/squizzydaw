@@ -78,13 +78,28 @@ class IRenderer {
   virtual void popClip() {}
   // Width in pixels of a single line of text at sizePx (approximation allowed).
   virtual float measureText(std::string_view utf8, float sizePx) { return static_cast<float>(utf8.size()) * sizePx * 0.55f; }
+  // Filled polygon (non-zero winding) and an open polyline. The defaults approximate with the
+  // bounding box / line segments; the software renderer draws them anti-aliased.
+  virtual void fillPolygon(const Point* pts, size_t count, Color c);
+  virtual void strokePolyline(const Point* pts, size_t count, Color c, float width) {
+    for (size_t i = 1; i < count; ++i) drawLine(pts[i - 1], pts[i], c, width);
+  }
+  // Text with a weight hint (bold = semibold UI font where the backend has one).
+  virtual void drawTextStyled(std::string_view utf8, const Rect& r, Color c, float sizePx, TextAlign align, bool bold) {
+    (void)bold;
+    drawText(utf8, r, c, sizePx, align);
+  }
 };
 
-enum class Key { Unknown, Escape, Enter, F5, Space, Left, Right, Up, Down, Tab, Home, End, PageUp, PageDown, Plus, Minus, Zero, Delete, Backspace };
+enum class Key { Unknown, Escape, Enter, F5, Space, Left, Right, Up, Down, Tab, Home, End, PageUp, PageDown, Plus, Minus, Zero, Delete, Backspace,
+                 // appended (letters/digits still arrive through onChar as well)
+                 Insert, F1, F2, F3, F4, F6, F7, F8, F9, F10, F11, F12 };
 
 enum Modifiers : unsigned { kModShift = 1u, kModCtrl = 2u, kModAlt = 4u };
 
-enum class MouseAction { Move, Down, Up, DoubleClick, Wheel, Leave };
+// Hover: WidgetTree delivers pointer motion without a captured widget to the widget under the
+// pointer (bubbling) as Hover; Move is only sent to the widget that captured the button press.
+enum class MouseAction { Move, Down, Up, DoubleClick, Wheel, Leave, Hover };
 enum class MouseButton { None, Left, Right, Middle };
 
 struct MouseEvent {
@@ -108,7 +123,9 @@ struct WindowCallbacks {
   std::function<void(uint32_t ch, unsigned modifiers)> onChar;
 };
 
-enum class Backend { Auto, Direct2D, Gdi, Raster };
+// Software = the portable anti-aliased renderer with real text (soft_renderer.cpp), the default
+// for every window backend; Raster = the minimal deterministic rasterizer of the snapshot tests.
+enum class Backend { Auto, Direct2D, Gdi, Raster, Software };
 
 struct WindowDesc {
   std::string title = "Squizzy Studio";
@@ -141,10 +158,14 @@ class IWindow {
 };
 
 // Creates a platform window with the requested renderer backend.
-// Returns nullptr where no windowing backend exists (headless / Linux / macOS).
+// Returns nullptr where no windowing backend exists (headless, macOS, Linux without X11).
 std::unique_ptr<IWindow> createWindow(const WindowDesc& desc);
 
-// Name of the default window backend ("d2d", "gdi", "none").
+// Width in pixels of one line of UI text at sizePx (the software renderer's font; every window
+// backend paints with it, so layouts measure with this).
+float measureUiText(std::string_view utf8, float sizePx);
+
+// Name of the default window backend ("win32", "x11", "none").
 const char* defaultBackendName();
 
 // ---- offscreen rendering ----------------------------------------------------------------------
@@ -157,7 +178,8 @@ struct PixelBuffer {
 };
 
 // Renders `paint` into an offscreen surface. Backend::Raster is portable and deterministic
-// (snapshot tests); Backend::Direct2D uses a WIC bitmap target (Windows only). Auto = Raster.
+// (snapshot tests); Backend::Software is the anti-aliased renderer every window uses (screenshots).
+// Auto = Raster.
 bool renderOffscreen(Backend backend, int width, int height, float scale, const std::function<void(IRenderer&)>& paint,
                      PixelBuffer& out, std::string* error = nullptr);
 

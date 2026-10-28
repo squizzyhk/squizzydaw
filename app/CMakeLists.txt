@@ -42,7 +42,10 @@ add_custom_command(
   COMMENT "app: embedding default.skin.xml"
   VERBATIM)
 
-add_executable(SquizzyStudio src/main.cpp src/gui.cpp src/gui.hpp "${_gen}/default_skin.h" resources/default.skin.xml)
+add_executable(SquizzyStudio src/main.cpp src/gui.cpp src/gui.hpp src/gui_context.cpp src/gui_context.hpp src/gui_panels.hpp
+  src/gui_overlay.cpp src/gui_overlay.hpp src/gui_menubar.cpp src/gui_transport.cpp src/gui_browser.cpp src/gui_arrange.cpp
+  src/gui_editor.cpp src/gui_mixer.cpp src/gui_devices.cpp
+  "${_gen}/default_skin.h" resources/default.skin.xml)
 sq_target_defaults(SquizzyStudio)
 target_include_directories(SquizzyStudio PRIVATE "${_gen}" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(SquizzyStudio PRIVATE sq::shell sq::ui)

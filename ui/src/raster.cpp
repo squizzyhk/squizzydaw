@@ -6,6 +6,7 @@
 #include <cmath>
 #include <vector>
 
+#include "soft_renderer.hpp"
 #include "sq/ui/image.hpp"
 #include "sq/ui/ui.hpp"
 
@@ -125,8 +126,26 @@ bool renderOffscreen(Backend backend, int width, int height, float scale, const 
     if (error) *error = "invalid size";
     return false;
   }
+  if (backend == Backend::Software) {
+    std::vector<uint8_t> bgra(static_cast<size_t>(width) * static_cast<size_t>(height) * 4, 0);
+    SoftSurface s{bgra.data(), width, height, static_cast<size_t>(width) * 4};
+    auto r = makeSoftRenderer(s, scale);
+    if (paint) paint(*r);
+    out.width = width;
+    out.height = height;
+    out.rgba.assign(bgra.size(), 0);
+    for (size_t i = 0; i < bgra.size(); i += 4) {  // premultiplied BGRA -> straight RGBA
+      const uint8_t a = bgra[i + 3];
+      auto un = [a](uint8_t v) { return a ? static_cast<uint8_t>(std::min(255, (v * 255 + a / 2) / a)) : uint8_t{0}; };
+      out.rgba[i] = un(bgra[i + 2]);
+      out.rgba[i + 1] = un(bgra[i + 1]);
+      out.rgba[i + 2] = un(bgra[i]);
+      out.rgba[i + 3] = a;
+    }
+    return true;
+  }
   if (backend != Backend::Raster && backend != Backend::Auto) {
-    if (error) *error = "only the raster backend renders offscreen in this build";
+    if (error) *error = "only the raster and software backends render offscreen in this build";
     return false;
   }
   out.width = width;

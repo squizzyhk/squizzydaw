@@ -1,5 +1,5 @@
-// Non-Windows platforms have no windowing backend in M0 (Skia + native window is planned).
-#ifndef _WIN32
+// No windowing backend (non-Windows without X11; macOS has no native window yet).
+#if !defined(_WIN32) && !defined(SQ_UI_X11)
 #include "sq/ui/ui.hpp"
 
 namespace sq::ui {

@@ -43,6 +43,18 @@ void IRenderer::drawLine(Point a, Point b, Color c, float width) {
   }
 }
 
+void IRenderer::fillPolygon(const Point* pts, size_t count, Color c) {
+  if (!pts || count < 3) return;
+  float x0 = pts[0].x, y0 = pts[0].y, x1 = x0, y1 = y0;
+  for (size_t i = 1; i < count; ++i) {
+    x0 = std::min(x0, pts[i].x);
+    y0 = std::min(y0, pts[i].y);
+    x1 = std::max(x1, pts[i].x);
+    y1 = std::max(y1, pts[i].y);
+  }
+  fillRect(Rect{x0, y0, x1 - x0, y1 - y0}, c);
+}
+
 void IRenderer::drawArc(Point center, float radius, float startDeg, float sweepDeg, Color c, float width) {
   if (!(radius > 0) || !std::isfinite(sweepDeg) || !std::isfinite(startDeg)) return;
   int segs = std::clamp(static_cast<int>(std::fabs(sweepDeg) / 6.0f) + 1, 1, 120);

@@ -1,67 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Squizzy Studio default skin (original). Forms are instantiated by the app shell:
-       Main        the window: transport bar, arrange area, mixer area, status line
-       Strip       one mixer strip per audio/instrument track (defines: trackName, trackId, trackIndex, kind)
-     Widgets with command="..." fire shell commands; target/property bind to document properties
-     (object://doc/active/node/<id> + an engine/doc property name). -->
+<!-- Squizzy Studio default skin (original). The Main form lays out the window; its custom elements
+     are the GUI panels (app/src/gui_panels.hpp), each painting itself with the active theme:
+       MenuBar TransportBar Browser Arrange PanelTabs ClipEditor Mixer DeviceRack StatusBar
+       HSplitter (resizes "bottom") VSplitter (resizes "browser")
+     Named elements the app toggles: browser, browserSplit, bottom, bottomSplit, mixer, editor, devices. -->
 <Skin name="default" format="1">
   <Defines>
     <define name="bg" value="#1C1D21"/>
     <define name="panel" value="#26282E"/>
-    <define name="panel2" value="#2F323A"/>
-    <define name="text" value="#E4E6EB"/>
-    <define name="dim" value="#9AA0A8"/>
-    <define name="accent" value="#4FB3A9"/>
-    <define name="rec" value="#E0604A"/>
   </Defines>
   <Forms>
     <Form name="Main" direction="column" background="$(bg)">
-      <View name="transport" direction="row" height="44" padding="6 10" gap="6" align="center" background="$(panel)">
-        <Label text="Squizzy Studio" fontSize="16" color="$(text)" width="150"/>
-        <Button name="new" text="New" command="File.New" tooltip="New song (Ctrl+N)"/>
-        <Button name="save" text="Save" command="File.Save" tooltip="Save (Ctrl+S)"/>
-        <View width="16"/>
-        <Button name="rewind" text="|&lt;" command="Transport.Rewind" tooltip="Go to start (Home)"/>
-        <Button name="play" text="Play" command="Transport.Play" tooltip="Play (Space)"/>
-        <Button name="stop" text="Stop" command="Transport.Stop" tooltip="Stop (Space)"/>
-        <Button name="record" text="Rec" command="Transport.Record" accent="$(rec)" tooltip="Record (R)"/>
-        <Button name="loop" text="Loop" command="Transport.ToggleLoop" toggles="1" accent="$(accent)"/>
-        <View width="16"/>
-        <Button name="undo" text="Undo" command="Edit.Undo" tooltip="Undo (Ctrl+Z)"/>
-        <Button name="redo" text="Redo" command="Edit.Redo" tooltip="Redo (Ctrl+Y)"/>
-        <Button name="split" text="Split" command="Edit.Split" tooltip="Split at cursor (S)"/>
-        <View width="16"/>
-        <Button name="addAudio" text="+ Audio" command="Track.AddAudio"/>
-        <Button name="addInst" text="+ Instrument" command="Track.AddInstrument"/>
-        <View grow="1"/>
-        <Label name="position" text="1.1.000" fontSize="14" color="$(accent)" width="140" textAlign="right"/>
+      <MenuBar name="menubar" height="28"/>
+      <TransportBar name="transport" height="52"/>
+      <View name="middle" direction="row" grow="1" shrink="1" minHeight="120">
+        <Browser name="browser" width="250"/>
+        <VSplitter name="browserSplit" width="4"/>
+        <Arrange name="arrange" grow="1" shrink="1"/>
       </View>
-      <Arrange name="arrange" grow="1" background="$(bg)"/>
-      <View name="mixer" direction="row" height="230" padding="6" gap="4" background="$(panel)"/>
-      <View direction="row" height="24" padding="2 10" background="$(panel2)">
-        <Label name="status" text="" color="$(dim)" grow="1"/>
-        <Label name="device" text="" color="$(dim)" width="320" textAlign="right"/>
+      <HSplitter name="bottomSplit" height="4"/>
+      <View name="bottom" direction="column" height="320">
+        <PanelTabs name="tabs" height="28"/>
+        <Mixer name="mixer" grow="1"/>
+        <ClipEditor name="editor" grow="1"/>
+        <DeviceRack name="devices" grow="1"/>
       </View>
-    </Form>
-
-    <Form name="Strip" width="84" direction="column" gap="4" padding="4" background="$(panel2)" radius="4">
-      <Label name="name-$(trackIndex)" text="$(trackName)" color="$(text)" textAlign="center"/>
-      <Knob name="pan-$(trackIndex)" target="object://doc/active/node/$(trackId)" property="pan" min="-1" max="1" default="0" bipolar="1"
-            alignSelf="center" accent="$(accent)" tooltip="Pan"/>
-      <View direction="row" grow="1" gap="4" justify="center">
-        <Fader name="vol-$(trackIndex)" target="object://doc/active/node/$(trackId)" property="volumeDb" min="-60" max="6" default="0"
-               accent="$(accent)" tooltip="Volume (dB)"/>
-        <Meter name="meter-$(trackIndex)" min="0" max="1" width="8"/>
-      </View>
-      <View direction="row" gap="2" justify="center">
-        <Button name="mute-$(trackIndex)" text="M" toggles="1" target="object://doc/active/node/$(trackId)" property="mute" accent="#D9A441"/>
-        <Button name="solo-$(trackIndex)" text="S" toggles="1" target="object://doc/active/node/$(trackId)" property="solo" accent="$(accent)"/>
-        <switch value="$(kind)">
-          <case value="audio">
-            <Button name="arm-$(trackIndex)" text="R" toggles="1" target="object://doc/active/node/$(trackId)" property="armed" accent="$(rec)"/>
-          </case>
-        </switch>
-      </View>
+      <StatusBar name="statusbar" height="24"/>
     </Form>
   </Forms>
 </Skin>

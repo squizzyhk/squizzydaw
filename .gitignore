@@ -5,3 +5,4 @@
 *.user
 CMakeUserPresets.json
 /re/
+.claude/worktrees/

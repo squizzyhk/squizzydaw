@@ -7,7 +7,9 @@
 sq_add_library(NAME squi
   SOURCES
     src/window_win32.cpp
+    src/window_x11.cpp
     src/window_null.cpp
+    src/soft_renderer.cpp
     src/render_common.cpp
     src/raster.cpp
     src/layout.cpp
@@ -23,9 +25,29 @@ sq_add_library(NAME squi
     include/sq/ui/theme.hpp
     include/sq/ui/remote_pages.hpp
     include/sq/ui/uia.hpp
-  LIBS tp::miniz
+  LIBS tp::miniz tp::stb_truetype
   INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/include")
 add_library(sq::ui ALIAS squi)
+# X11 window (Linux/BSD) presenting the software renderer. Optional: without X11 headers the app
+# still builds and runs headless.
+if(UNIX AND NOT APPLE)
+  find_package(X11)
+  if(X11_FOUND)
+    target_compile_definitions(squi PRIVATE SQ_UI_X11=1)
+    target_link_libraries(squi PRIVATE X11::X11)
+    message(STATUS "sq: ui: X11 window backend")
+  else()
+    message(STATUS "sq: ui: no X11 (install libx11-dev): no window backend, headless only")
+  endif()
+endif()
+# UI fonts (third_party/inter-font) next to the binaries: <bin>/fonts/.
+if(SQ_UI_FONT_FILES)
+  file(MAKE_DIRECTORY "${SQ_BIN_DIR}/fonts")
+  foreach(_f IN LISTS SQ_UI_FONT_FILES)
+    get_filename_component(_n "${_f}" NAME)
+    configure_file("${_f}" "${SQ_BIN_DIR}/fonts/${_n}" COPYONLY)
+  endforeach()
+endif()
 if(WIN32)
   target_link_libraries(squi PRIVATE user32 gdi32 ole32 oleaut32 windowscodecs uiautomationcore)
 endif()
