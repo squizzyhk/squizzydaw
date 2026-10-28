@@ -31,11 +31,18 @@
 //   routed to it (Graph::routeLiveMidi, tracks with liveMidi set) are merged per block and fed to
 //   that synth, which renders whether or not the transport plays (live play while stopped). On a
 //   transport stop / locate / loop wrap the track sends note-offs for the sequenced notes it
-//   started (no note chasing into a locate position yet).
+//   started and resets the controllers the sequence moved (sustain CC64=0 unless the live pedal
+//   is down, pitch bend centre, mod wheel 0); a stop also sends all-notes-off (CC123) on the
+//   channels the sequence used where no live note is held (no note chasing into a locate
+//   position yet). Live notes and the live sustain pedal are tracked per track: when the track
+//   stops receiving live MIDI (target / arm change) it releases them (note-offs, CC64=0).
+//   The instrument's latency counts in the track's latency (PDC).
 //
 // AUTOMATION (automation.hpp format, resolved per graph into AutomationData)
-//   While playing, Graph::process evaluates every lane at the ppq of the block (tracks: the source
-//   read position; buses: that minus their input arrival) and applies it before processing the
+//   While playing, Graph::process evaluates every lane at the timeline position of the audio the
+//   target sees in this block: fader/pan/mute/send lanes at the read position minus the strip's
+//   arrival (tracks: instrument + insert latency; buses: input arrival + bus chain latency),
+//   insert parameter lanes minus the latency in front of that insert, and applies it before processing the
 //   strip: volume/pan/mute as overrides of the static mixer values (the fader ramp smooths them),
 //   send levels likewise, insert/instrument parameters through AudioProcessor::setParameter. When
 //   the transport stops the overrides are dropped (static values again) and automated parameters
@@ -113,6 +120,7 @@ struct AutoLane {
   int32_t slot = -1;                   // Send: send index; Insert: chain index (bypassed/failed lines skipped)
   uint32_t param = 0;                  // Insert / Instrument parameter index
   float staticValue = 0.0f;            // Insert / Instrument: value restored when the transport stops
+                                       // (NaN = unknown, e.g. a plugin parameter: not restored)
   AutomationLane lane;                 // ppq points; volume/send in dB, pan -1..1, mute 0/1
 };
 struct AutomationData {
@@ -200,8 +208,10 @@ class TrackProcessor final : public AudioProcessor {
   bool prepare(double sr, uint32_t maxFrames, uint32_t outChannels) override;
   void reset() noexcept override;
   void process(const ProcessContext& ctx, float* const* io, uint32_t channels) noexcept override;
-  uint32_t latency() const noexcept override { return chain_.latency(); }
+  uint32_t latency() const noexcept override { return chain_.latency() + (instrument_ ? instrument_->latency() : 0u); }
   uint32_t tail() const noexcept override;
+  // Latency in front of insert chain index `slot` (instrument + inserts before it); slot -1 = 0.
+  uint32_t latencyBefore(int32_t slot) const noexcept;
 
   // RT parameter setters (audio thread / owner thread of the graph).
   void setVolume(float v) noexcept { volume_ = v; }
@@ -211,7 +221,11 @@ class TrackProcessor final : public AudioProcessor {
   void setSoloSilenced(bool s) noexcept { soloSilenced_ = s; }
   void setMonitor(bool m) noexcept { monitor_ = m; }
   void setMonitorInMain(bool m) noexcept { monitorInMain_ = m; }
-  void setLiveMidi(bool on) noexcept { liveMidi_ = on; }
+  // Turning live MIDI off releases the live notes / sustain pedal this track received (next block).
+  void setLiveMidi(bool on) noexcept {
+    if (liveMidi_ && !on) releaseLive_ = true;
+    liveMidi_ = on;
+  }
   // Automation overrides (RT): replace the static values while set.
   void setAutoVolume(float v) noexcept { autoVolume_ = v, hasAutoVolume_ = true; }
   void setAutoPan(float p) noexcept { autoPan_ = p, hasAutoPan_ = true; }
@@ -265,6 +279,11 @@ class TrackProcessor final : public AudioProcessor {
   int64_t expectNext_ = INT64_MIN;
   bool seqPlaying_ = false;
   uint8_t seqNotes_[16][128] = {};  // sequenced notes currently on (note-offs on stop / jump)
+  // Per channel: controllers the sequence moved (kSeq* bits; reset on stop / jump).
+  uint8_t seqCtl_[16] = {};
+  uint8_t liveNotes_[16][128] = {};  // live notes currently on
+  uint8_t liveSustain_[16] = {};     // live sustain pedal down
+  bool releaseLive_ = false;
 };
 
 // Sub-mix / bus: (summed inputs) -> inserts -> fader/pan. The graph sums inputs into input().
@@ -281,6 +300,8 @@ class SubMixProcessor final : public AudioProcessor {
   void process(const ProcessContext& ctx, float* const* io, uint32_t channels) noexcept override;
   uint32_t latency() const noexcept override { return chain_.latency(); }
   uint32_t tail() const noexcept override { return chain_.tail(); }
+  // Latency of the inserts in front of chain index `slot`.
+  uint32_t latencyBefore(int32_t slot) const noexcept;
   void setVolume(float v) noexcept { volume_ = v; }
   void setPan(float p) noexcept { pan_ = p; }
   void setMute(bool m) noexcept { mute_ = m; }

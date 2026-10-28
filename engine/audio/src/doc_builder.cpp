@@ -1,6 +1,7 @@
 // Squizzy Studio engine/audio - document -> graph description.
 #include "sq/engine/audio/doc_builder.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -95,10 +96,14 @@ std::vector<std::string> specLines(const std::string& text) {
   return out;
 }
 
+// Value an automated parameter returns to when the automation stops: the spec value, else the
+// prototype's value when it can report one; NaN = unknown (plugins report no parameters to the
+// engine: their prototype has no instance), and an unknown value is never written back.
 float staticParam(const ParamList& params, const ProcessorProto& proto, uint32_t index) {
   for (const auto& [i, v] : params)
     if (i == index) return static_cast<float>(v);
-  return proto ? proto->parameter(index) : 0.0f;
+  if (!proto || index >= proto->parameterCount()) return std::nanf("");
+  return proto->parameter(index);
 }
 
 // One insert chain from "user.inserts" text. slotToChain[line] = chain index or -1 (bypassed /
@@ -369,7 +374,10 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
               td.midi.push_back(TimedMidi{f, {ce.bytes[0], ce.bytes[1], ce.bytes[2]}, static_cast<uint8_t>(ce.size ? std::min<uint32_t>(ce.size, 3) : 3)});
               if ((ce.bytes[0] & 0xF0u) == 0x90 && ce.bytes[2] > 0 && ce.length > 0) {
                 const double endPpq = std::min(ce.position + ce.length, ci.length);
-                td.midi.push_back(TimedMidi{ppqToFrame(ci.start + endPpq), {static_cast<uint8_t>(0x80u | (ce.bytes[0] & 0x0Fu)), ce.bytes[1], 0}, 3});
+                // at least one frame after its note-on: a note shorter than a frame must not end
+                // before it starts (note-offs sort first at equal frames)
+                const int64_t offFrame = std::max(f + 1, ppqToFrame(ci.start + endPpq));
+                td.midi.push_back(TimedMidi{offFrame, {static_cast<uint8_t>(0x80u | (ce.bytes[0] & 0x0Fu)), ce.bytes[1], 0}, 3});
               }
             }
           }

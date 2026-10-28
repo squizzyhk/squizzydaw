@@ -1,6 +1,7 @@
 // engine/audio - unit tests: RT primitives, laws, graph structure, transport, swaps, fast lane.
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 #include "sq/engine/audio/devices.hpp"
@@ -327,4 +328,99 @@ SQ_TEST("graph: fast lane monitors input without plugin delay, main path is comp
   auto main = runGraph(*g2, 0, 512, 64, false, ip, 1);
   CHECK_EQ(main[0][10], 0.0f);
   CHECK_EQ(main[0][110], 1.0f);  // through the latent insert
+}
+
+namespace {
+struct CoreIo {
+  float l[64] = {}, r[64] = {};
+  float* ch[2] = {l, r};
+  sq_audio_block out{};
+  sq_audio_io io{};
+  CoreIo() {
+    out.channels = ch;
+    out.channel_count = 2;
+    out.frames = 64;
+    io.struct_size = sizeof io;
+    io.output = &out;
+  }
+};
+sq_stream_format coreFormat() {
+  sq_stream_format f{};
+  f.struct_size = sizeof f;
+  f.sample_rate = 48000.0;
+  f.channels = 2;
+  f.max_block_frames = 64;
+  return f;
+}
+std::unique_ptr<Graph> oneTrackGraph() {
+  GraphDesc d;
+  d.tracks.resize(1);
+  GraphConfig cfg;
+  cfg.maxBlock = 64;
+  return Graph::compile(d, cfg);
+}
+}  // namespace
+
+SQ_TEST("core: a command for a published graph whose install was deferred is applied once the graph is installed") {
+  sq::Ptr<EngineCore> core = sq::Ptr<EngineCore>::adopt(new EngineCore());
+  const sq_stream_format fmt = coreFormat();
+  core->setGraph(oneTrackGraph());
+  REQUIRE_OK(core->onStart(nullptr, &fmt, nullptr));
+  // No collectGarbage: the retire queue fills up and the audio thread defers the next install.
+  for (int i = 0; i < 80; ++i) {
+    core->setGraph(oneTrackGraph());
+    core->process(nullptr);
+  }
+  core->setGraph(oneTrackGraph());
+  Command c;
+  c.type = CmdType::TrackVolume;
+  c.index = 0;
+  c.generation = core->currentGeneration();
+  c.value = 0.25;
+  REQUIRE(core->post(c));
+  core->process(nullptr);  // install deferred: the command must wait, not be dropped
+  core->collectGarbage();
+  core->process(nullptr);  // installs the graph, then applies the command
+  core->onStop();
+  Graph* g = core->graphForControlThread();
+  REQUIRE(g != nullptr);
+  CHECK_EQ(g->generation(), c.generation);
+  CHECK(std::fabs(g->track(0).volume() - 0.25f) < 1e-6f);
+}
+
+SQ_TEST("core: commands queued when the stream stops are applied at the stop, before later direct commands") {
+  sq::Ptr<EngineCore> core = sq::Ptr<EngineCore>::adopt(new EngineCore());
+  const sq_stream_format fmt = coreFormat();
+  core->setGraph(oneTrackGraph());
+  REQUIRE_OK(core->onStart(nullptr, &fmt, nullptr));
+  CoreIo io;
+  core->process(&io.io);
+  Command stop;
+  stop.type = CmdType::Stop;
+  REQUIRE(core->post(stop));  // queued; the stream dies before a callback takes it
+  core->onStop();
+  Command play;
+  play.type = CmdType::Play;
+  REQUIRE(core->post(play));  // applied directly (not running)
+  CHECK((core->transport().flags & SQ_TRANSPORT_PLAYING) != 0);
+  REQUIRE_OK(core->onStart(nullptr, &fmt, nullptr));
+  core->process(&io.io);
+  CHECK((core->transport().flags & SQ_TRANSPORT_PLAYING) != 0);  // the stale Stop is not replayed
+  core->onStop();
+  // queued automation data is freed with the core (leak checkers)
+  REQUIRE_OK(core->onStart(nullptr, &fmt, nullptr));
+  Command a;
+  a.type = CmdType::SetAutomation;
+  a.generation = core->currentGeneration();
+  a.ptr = new AutomationData();
+  REQUIRE(core->post(a));
+  // live MIDI producers: more events than one parse batch in one call
+  std::vector<uint8_t> many;
+  for (int i = 0; i < 100; ++i) {
+    many.push_back(0x90);
+    many.push_back(static_cast<uint8_t>(i));
+    many.push_back(1);
+  }
+  CHECK(core->pushLiveMidi(many.data(), static_cast<uint32_t>(many.size())));
+  CHECK_EQ(core->liveMidiDropped(), uint64_t(0));
 }
