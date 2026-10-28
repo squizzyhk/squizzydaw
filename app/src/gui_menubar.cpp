@@ -215,6 +215,102 @@ std::vector<MenuItem> buildMainMenu(GuiContext& ctx, const std::string& title) {
       theme.submenu.push_back(it);
     }
     m.push_back(theme);
+  } else if (title == "Options") {
+    Shell& sh = ctx.shell();
+    std::string curDrv = sh.settings.get("Devices.Audio.Driver");
+#ifdef _WIN32
+    if (curDrv.empty()) curDrv = "wasapi";
+#elif defined(__linux__)
+    if (curDrv.empty()) curDrv = "alsa";
+#endif
+    const std::string curDev = sh.settings.get("Devices.Audio.Device");
+    auto select = [&ctx](const std::string& drv, const std::string& dev) {
+      auto a = sq::makeAttributes();
+      a->setString("driver", drv.c_str());
+      a->setString("device", dev.c_str());
+      ctx.run("Audio.SelectDevice", a.get());
+    };
+    MenuItem drivers;
+    drivers.label = "Audio Driver";
+#ifdef _WIN32
+    const char* kDrivers[] = {"wasapi", "asio", "null", "none"};
+#elif defined(__linux__)
+    const char* kDrivers[] = {"alsa", "pulse", "null", "none"};
+#else
+    const char* kDrivers[] = {"null", "none"};
+#endif
+    for (const char* d : kDrivers) {
+      MenuItem it;
+      it.label = d;
+      it.checked = curDrv == d;
+      const std::string ds = d;
+      it.action = [select, ds] { select(ds, std::string()); };
+      drivers.submenu.push_back(it);
+    }
+    m.push_back(drivers);
+    MenuItem devices;
+    devices.label = "Audio Device";
+    {
+      auto a = sq::makeAttributes();
+      auto res = sq::makeAttributes();
+      a->setString("driver", curDrv.c_str());
+      if (!curDrv.empty() && curDrv != "none" && curDrv != "null" &&
+          SQ_SUCCEEDED(sh.execute("Audio", "ListDevices", a.get(), res.get()))) {
+        const std::string lines = sq::getAttrString(res.get(), "devices");
+        size_t pos = 0;
+        while (pos < lines.size()) {
+          size_t nl = lines.find('\n', pos);
+          std::string line = lines.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+          pos = nl == std::string::npos ? lines.size() : nl + 1;
+          const size_t t1 = line.find('\t'), t2 = t1 == std::string::npos ? std::string::npos : line.find('\t', t1 + 1);
+          if (t2 == std::string::npos) continue;
+          const std::string id = line.substr(t1 + 1, t2 - t1 - 1), name = line.substr(t2 + 1);
+          MenuItem it;
+          it.label = name.empty() ? id : name;
+          it.checked = id == curDev;
+          it.action = [select, curDrv, id] { select(curDrv, id); };
+          devices.submenu.push_back(it);
+        }
+      }
+      if (devices.submenu.empty()) {
+        MenuItem none;
+        none.label = curDrv.empty() || curDrv == "none" ? "(choose a driver first)" : "(no devices found)";
+        none.enabled = false;
+        devices.submenu.push_back(none);
+      }
+    }
+    m.push_back(devices);
+    auto settingMenu = [&](const char* label, const char* key, std::vector<int> values, const char* suffix) {
+      MenuItem mi;
+      mi.label = label;
+      const int64_t cur = sh.settings.getInt(key, 0);
+      for (int v : values) {
+        MenuItem it;
+        it.label = std::to_string(v) + suffix;
+        it.checked = cur == v;
+        const std::string k = key;
+        it.action = [&ctx, select, k, v] {
+          ctx.shell().settings.setInt(k.c_str(), v);
+          const std::string d = ctx.shell().settings.get("Devices.Audio.Driver");
+          if (!d.empty() && d != "none") select(d, ctx.shell().settings.get("Devices.Audio.Device"));
+        };
+        mi.submenu.push_back(it);
+      }
+      return mi;
+    };
+    m.push_back(settingMenu("Sample Rate", "Engine.SampleRate", {44100, 48000, 88200, 96000}, " Hz"));
+    m.push_back(settingMenu("Buffer Size", "Engine.BlockSize", {32, 64, 128, 256, 512, 1024, 2048}, " samples"));
+    MenuItem llm;
+    llm.label = "Low-Latency Input Monitoring";
+    llm.checked = sh.settings.getBool("Engine.LowLatencyMonitoring", SQ_TRUE) != 0;
+    llm.action = [&ctx] {
+      auto& st = ctx.shell().settings;
+      st.setBool("Engine.LowLatencyMonitoring", st.getBool("Engine.LowLatencyMonitoring", SQ_TRUE) ? SQ_FALSE : SQ_TRUE);
+    };
+    m.push_back(llm);
+    m.push_back(MenuItem::sep());
+    m.push_back(fn("MIDI Inputs...", [&ctx] { ctx.run("Midi.ListInputs"); }));
+    m.push_back(fn("Audio Status", [&ctx] { ctx.run("Audio.ListDevices"); }));
   } else if (title == "Help") {
     m.push_back(fn("Keyboard Shortcuts", [&ctx] {
       ctx.confirm("Space play/stop, R record, L loop, C metronome, S split, Q quantize, Del delete, Ctrl+Z/Y undo/redo, "
@@ -285,7 +381,7 @@ class MenuBar final : public Widget {
   }
 
  private:
-  static constexpr const char* kTitles[] = {"File", "Edit", "Track", "Transport", "View", "Help"};
+  static constexpr const char* kTitles[] = {"File", "Edit", "Track", "Transport", "View", "Options", "Help"};
   GuiContext& ctx_;
   std::vector<Rect> titles_;
   int hot_ = -1;
