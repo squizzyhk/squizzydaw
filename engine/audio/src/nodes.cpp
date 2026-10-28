@@ -2,6 +2,7 @@
 #include "sq/engine/audio/nodes.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace sq::engine::audio {
@@ -64,6 +65,33 @@ sq_result loadMediaFile(IClassRegistry* reg, const char* path, MediaPtr* out) {
 void MediaNode::render(const ProcessContext& ctx, float* const* out, uint32_t channels) noexcept {
   if (!media_ || media_->channels == 0) return;
   const int64_t t0 = ctx.timelineFrame;
+  const double graphRate = ctx.sampleRate > 0 ? ctx.sampleRate : 48000.0;
+  const double ratio = media_->sampleRate > 0 ? media_->sampleRate / graphRate : 1.0;
+  if (std::fabs(ratio - 1.0) > 1e-9) {
+    // Linear-interpolating sample-rate conversion so imported media at any rate plays at the
+    // right pitch/speed through a graph that runs at the device rate. t0 and ctx.frames are
+    // graph frames; the source position is t0 * ratio.
+    const double last = static_cast<double>(media_->frames - 1);
+    for (uint32_t c = 0; c < channels; ++c) {
+      uint32_t sc = c;
+      if (sc >= media_->channels) {
+        if (media_->channels != 1) continue;
+        sc = 0;
+      }
+      const float* src = media_->channel(sc);
+      float* dst = out[c];
+      for (uint32_t i = 0; i < ctx.frames; ++i) {
+        const double p = (static_cast<double>(t0) + static_cast<double>(i)) * ratio;
+        if (p < 0 || p > last) continue;
+        const int64_t i0 = static_cast<int64_t>(p);
+        const double frac = p - static_cast<double>(i0);
+        const float a = src[i0];
+        const float b = i0 + 1 < media_->frames ? src[i0 + 1] : a;
+        dst[i] += static_cast<float>(a + (b - a) * frac);
+      }
+    }
+    return;
+  }
   const int64_t s = std::max<int64_t>(t0, 0);
   const int64_t e = std::min<int64_t>(t0 + ctx.frames, media_->frames);
   if (s >= e) return;

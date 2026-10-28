@@ -221,7 +221,9 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
             ClipParams p;
             p.start = s;
             p.length = e - s;
-            p.sourceOffset = static_cast<int64_t>(std::llround(ci.source_offset_seconds * media->sampleRate));
+            // ClipParams/MediaNode advance in graph frames; the media node converts to source
+            // frames with its own sample rate, so keep the offset in graph frames here.
+            p.sourceOffset = static_cast<int64_t>(std::llround(ci.source_offset_seconds * sr));
             p.gain = dbToGain(ci.gain_db);
             p.fadeIn = static_cast<int64_t>(std::llround(ci.fade_in_seconds * sr));
             p.fadeOut = static_cast<int64_t>(std::llround(ci.fade_out_seconds * sr));

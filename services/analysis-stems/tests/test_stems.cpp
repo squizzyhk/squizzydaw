@@ -301,8 +301,12 @@ SQ_TEST("analysis-stems service: dynamic ONNX Runtime seam rejects a non-ORT lib
   sq::app::ClassRegistry reg;
   sq::app::HostContext host(settings, reg);
   sq::app::ModuleLoader loader(host, reg);
-  // Point the seam at a library that exists but is not ONNX Runtime.
-  const std::string bogus = sq::joinPath(sq::specialDir(SQ_DIR_EXE), std::string("sqplatform") + sq_dylib_suffix());
+  // Point the seam at a library that exists but is not ONNX Runtime (the platform DLL is
+  // "sqplatform.dll" on Windows and "libsqplatform.so" on POSIX).
+  const std::string exeDir = sq::specialDir(SQ_DIR_EXE);
+  std::string bogus = sq::joinPath(exeDir, std::string("sqplatform") + sq_dylib_suffix());
+  if (!sq_fs_is_file(bogus.c_str())) bogus = sq::joinPath(exeDir, std::string("libsqplatform") + sq_dylib_suffix());
+  REQUIRE(sq_fs_is_file(bogus.c_str()));
   settings.setString("Services.analysis-stems.OnnxRuntimePath", bogus.c_str());
   REQUIRE(loader.load(modulePath("analysis-stems")).ok());
   {

@@ -12,10 +12,11 @@ using namespace sq::engine::audio;
 
 namespace {
 
-MediaPtr makeMedia(uint32_t channels, int64_t frames, float (*fn)(int64_t, uint32_t)) {
+MediaPtr makeMedia(uint32_t channels, int64_t frames, float (*fn)(int64_t, uint32_t), double sampleRate = 48000.0) {
   auto m = std::make_shared<MediaBuffer>();
   m->channels = channels;
   m->frames = frames;
+  m->sampleRate = sampleRate;
   m->data.resize(channels);
   for (uint32_t c = 0; c < channels; ++c) {
     m->data[c].resize(static_cast<size_t>(frames));
@@ -327,4 +328,36 @@ SQ_TEST("graph: fast lane monitors input without plugin delay, main path is comp
   auto main = runGraph(*g2, 0, 512, 64, false, ip, 1);
   CHECK_EQ(main[0][10], 0.0f);
   CHECK_EQ(main[0][110], 1.0f);  // through the latent insert
+}
+
+SQ_TEST("nodes: media at a different sample rate is resampled to the graph rate") {
+  // 24 kHz source, 48 kHz graph: two output frames per source frame.
+  auto m = makeMedia(1, 4, [](int64_t i, uint32_t) { return static_cast<float>(i); }, 24000.0);
+  MediaNode node(m);
+  std::vector<float> out(8, 0.0f);
+  float* dst[1] = {out.data()};
+  ProcessContext ctx;
+  ctx.sampleRate = 48000.0;
+  ctx.frames = 8;
+  ctx.timelineFrame = 0;
+  ctx.playing = true;
+  node.render(ctx, dst, 1);
+  const float expected[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 2.5f, 3.0f, 0.0f};
+  for (int i = 0; i < 8; ++i) CHECK(std::fabs(out[static_cast<size_t>(i)] - expected[i]) < 1e-6f);
+
+  // 96 kHz source, 48 kHz graph: every other source frame, starting at a source offset.
+  auto hi = makeMedia(1, 8, [](int64_t i, uint32_t) { return static_cast<float>(i); }, 96000.0);
+  MediaNode hiNode(hi);
+  std::vector<float> out2(4, 0.0f);
+  float* dst2[1] = {out2.data()};
+  ProcessContext ctx2;
+  ctx2.sampleRate = 48000.0;
+  ctx2.frames = 4;
+  ctx2.timelineFrame = 1;
+  ctx2.playing = true;
+  hiNode.render(ctx2, dst2, 1);
+  CHECK(std::fabs(out2[0] - 2.0f) < 1e-6f);
+  CHECK(std::fabs(out2[1] - 4.0f) < 1e-6f);
+  CHECK(std::fabs(out2[2] - 6.0f) < 1e-6f);
+  CHECK(std::fabs(out2[3] - 0.0f) < 1e-6f);
 }

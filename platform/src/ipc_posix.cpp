@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <semaphore.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -67,7 +68,9 @@ std::atomic<uint32_t> gLocalSemCounter{0};
 
 struct sq_pipe_server {
   int fd = -1;
+  int lockFd = -1;
   std::string path;
+  std::string lockPath;
 };
 struct sq_pipe {
   int fd = -1;
@@ -89,43 +92,61 @@ sq_result sq_pipe_listen(const char* name, sq_pipe_server** out) {
   if (!out || !sqp::validIpcName(name)) return SQ_E_INVALIDARG;
   *out = nullptr;
   std::string path = sockPath(name);
+  std::string lockPath = path + ".lock";
   sockaddr_un a;
   if (!fillAddr(path, a)) return SQ_E_INVALIDARG;
+
+  // A sidecar lock file makes duplicate-listen detection non-invasive. Probing a live Unix
+  // socket with connect() would enqueue a phantom connection for the listening server to accept.
+  int lockFd = open(lockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (lockFd < 0) return SQ_E_IO;
+  if (flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+    close(lockFd);
+    return errno == EWOULDBLOCK ? SQ_E_EXISTS : SQ_E_IO;
+  }
+
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd < 0) return SQ_E_FAIL;
+  if (fd < 0) {
+    close(lockFd);
+    unlink(lockPath.c_str());
+    return SQ_E_FAIL;
+  }
   fcntl(fd, F_SETFD, FD_CLOEXEC);
   if (bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
-    // A stale socket file from a crashed process: probe it, unlink if nobody answers.
-    if (errno == EADDRINUSE) {
-      int probe = socket(AF_UNIX, SOCK_STREAM, 0);
-      bool alive = probe >= 0 && connect(probe, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0;
-      if (probe >= 0) close(probe);
-      if (alive) {
-        close(fd);
-        return SQ_E_EXISTS;
-      }
-      unlink(path.c_str());
-      if (bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
-        close(fd);
-        return SQ_E_IO;
-      }
-    } else {
+    // We hold the lock, so nobody is listening: an existing socket file is stale.
+    if (errno != EADDRINUSE) {
       close(fd);
+      close(lockFd);
+      unlink(lockPath.c_str());
+      return SQ_E_IO;
+    }
+    unlink(path.c_str());
+    if (bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
+      close(fd);
+      close(lockFd);
+      unlink(lockPath.c_str());
       return SQ_E_IO;
     }
   }
   if (listen(fd, 16) != 0) {
     close(fd);
     unlink(path.c_str());
+    close(lockFd);
+    unlink(lockPath.c_str());
     return SQ_E_IO;
   }
   auto* s = new (std::nothrow) sq_pipe_server();
   if (!s) {
     close(fd);
+    unlink(path.c_str());
+    close(lockFd);
+    unlink(lockPath.c_str());
     return SQ_E_OUTOFMEMORY;
   }
   s->fd = fd;
+  s->lockFd = lockFd;
   s->path = path;
+  s->lockPath = lockPath;
   *out = s;
   return SQ_OK;
 }
@@ -153,6 +174,8 @@ void sq_pipe_server_close(sq_pipe_server* s) {
   if (!s) return;
   if (s->fd >= 0) close(s->fd);
   unlink(s->path.c_str());
+  if (s->lockFd >= 0) close(s->lockFd);
+  if (!s->lockPath.empty()) unlink(s->lockPath.c_str());
   delete s;
 }
 

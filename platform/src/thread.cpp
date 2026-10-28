@@ -73,8 +73,13 @@ void setNativePriority(
   int policy = SCHED_OTHER;
   sched_param sp{};
   if (p == SQ_PRIORITY_REALTIME) {
+    const int maxPrio = sched_get_priority_max(SCHED_FIFO);
+    if (maxPrio <= sched_get_priority_min(SCHED_FIFO)) {
+      *r = SQ_E_ACCESS;  // this kernel/container exposes no RT priority range
+      return;
+    }
     policy = SCHED_FIFO;
-    sp.sched_priority = sched_get_priority_max(SCHED_FIFO) - 10;
+    sp.sched_priority = maxPrio > 10 ? maxPrio - 10 : maxPrio;
   }
   *r = pthread_setschedparam(h, policy, &sp) == 0 ? SQ_OK : SQ_E_ACCESS;  // RT usually needs privileges
 #endif

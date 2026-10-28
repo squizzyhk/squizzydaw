@@ -271,6 +271,8 @@ struct Shell::Impl {
     add("File", "ExportAudio", "Export Mixdown...", [this](IAttributes* a, IAttributes* res) { return render(a, res, SQ_RENDER_MIXDOWN); }, haveDoc);
     add("File", "ExportStems", "Export Stems...", [this](IAttributes* a, IAttributes* res) { return render(a, res, SQ_RENDER_STEMS); }, haveDoc);
     add("File", "ExportMidi", "Export MIDI File...", [this](IAttributes* a, IAttributes* res) { return exportMidi(a, res); }, haveDoc);
+    add("File", "ImportAudio", "Import Audio...", [this](IAttributes* a, IAttributes* res) { return importAudio(a, res); }, haveDoc);
+    add("File", "ImportMidi", "Import MIDI File...", [this](IAttributes* a, IAttributes* res) { return importMidi(a, res); }, haveDoc);
 #if SQ_SHELL_DAWPROJECT
     add("File", "ExportDawProject", "Export DAWproject...", [this](IAttributes* a, IAttributes*) {
       auto d = active();
@@ -370,6 +372,43 @@ struct Shell::Impl {
       return setTrackProp(t.get(), "user.input_channel", [&](IAttributes* p) { p->setInt("value", ch); });
     }, haveDoc);
     add("Track", "InsertPlugin", "Insert Plugin...", [this](IAttributes* a, IAttributes*) { return insertPlugin(a); }, haveDoc);
+    add("Track", "SetVolume", "Set Track Volume", [this](IAttributes* a, IAttributes*) {
+      auto t = track(a);
+      if (!t || !a) return SQ_E_INVALIDARG;
+      const double db = num(a, "value", 0.0);
+      if (db < -96.0 || db > 24.0) return SQ_E_INVALIDARG;
+      return setTrackProp(t.get(), "volumeDb", [&](IAttributes* p) { p->setDouble("value", db); });
+    }, haveDoc);
+    add("Track", "SetPan", "Set Track Pan", [this](IAttributes* a, IAttributes*) {
+      auto t = track(a);
+      if (!t || !a) return SQ_E_INVALIDARG;
+      const double pan = num(a, "value", 0.0);
+      if (pan < -1.0 || pan > 1.0) return SQ_E_INVALIDARG;
+      return setTrackProp(t.get(), "pan", [&](IAttributes* p) { p->setDouble("value", pan); });
+    }, haveDoc);
+    add("Track", "ToggleMute", "Mute Track", [this](IAttributes* a, IAttributes*) {
+      auto t = track(a);
+      if (!t) return SQ_E_NOTFOUND;
+      sq_track_info ti{};
+      ti.struct_size = sizeof ti;
+      t->getTrackInfo(&ti);
+      return setTrackProp(t.get(), "mute", [&](IAttributes* p) { p->setBool("value", (ti.flags & SQ_TRACK_MUTE) ? SQ_FALSE : SQ_TRUE); });
+    }, haveDoc);
+    add("Track", "ToggleSolo", "Solo Track", [this](IAttributes* a, IAttributes*) {
+      auto t = track(a);
+      if (!t) return SQ_E_NOTFOUND;
+      sq_track_info ti{};
+      ti.struct_size = sizeof ti;
+      t->getTrackInfo(&ti);
+      return setTrackProp(t.get(), "solo", [&](IAttributes* p) { p->setBool("value", (ti.flags & SQ_TRACK_SOLO) ? SQ_FALSE : SQ_TRUE); });
+    }, haveDoc);
+    add("Track", "Rename", "Rename Track", [this](IAttributes* a, IAttributes*) {
+      auto t = track(a);
+      if (!t || !a) return SQ_E_INVALIDARG;
+      const std::string name = str(a, "name");
+      if (name.empty()) return SQ_E_INVALIDARG;
+      return setTrackProp(t.get(), "name", [&](IAttributes* p) { p->setString("value", name.c_str()); });
+    }, haveDoc);
 #endif
     add("Plugins", "Rescan", "Rescan Plugins", [this](IAttributes* a, IAttributes*) {
       auto reg = sh.plugins();
@@ -763,6 +802,275 @@ struct Shell::Impl {
     if (SQ_SUCCEEDED(r)) r = task->getResult();
     if (res && SQ_SUCCEEDED(r)) res->setInt("outputs", task->getOutputCount());
     return setMessage(r, SQ_SUCCEEDED(r) ? "exported " + out : std::string("export failed: ") + sq_result_string(r));
+  }
+
+  static std::string fileNameOf(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+  }
+  static std::string stemOf(const std::string& name) {
+    const size_t dot = name.find_last_of('.');
+    return dot == std::string::npos || dot == 0 ? name : name.substr(0, dot);
+  }
+
+  // File.ImportAudio path=<audio> [track=<guid>|track_index=<i>] [start=ppq] [length=ppq]
+  //                [source_offset=seconds] [name=<clip name>] [copy=true]
+  // One undo step. References the file by default; copy=true puts it next to a saved song
+  // (<song>/Media/<name>) or in Media.Folder. Media at any sample rate is resampled by the graph.
+  sq_result importAudio(IAttributes* a, IAttributes* res) {
+    auto d = active();
+    const std::string path = str(a, "path");
+    if (!d) return SQ_E_NOTFOUND;
+    if (path.empty()) return setMessage(SQ_E_INVALIDARG, "import audio: path is required");
+    if (!sq_fs_is_file(path.c_str())) return setMessage(SQ_E_NOTFOUND, "import audio: no such file: " + path);
+    const std::string ext = lowerExt(path);
+    if (ext.empty()) return setMessage(SQ_E_INVALIDARG, "import audio: file has no extension");
+    auto codec = sq::Ptr<ICodecService>::adopt(sq::codec::findCodec(&sh.registry, ext.c_str(), nullptr, SQ_CODEC_READ));
+    if (!codec) return setMessage(SQ_E_UNSUPPORTED, "import audio: no codec for ." + ext);
+    sq::Ptr<IAudioFileReader> reader;
+    sq_result r = codec->createReader(reader.put());
+    if (SQ_FAILED(r) || !reader) return setMessage(r, "import audio: cannot create reader");
+    r = reader->open(path.c_str());
+    if (SQ_FAILED(r)) return setMessage(r, "import audio: cannot open " + path);
+    sq_audio_file_format fmt{};
+    fmt.struct_size = sizeof fmt;
+    r = reader->getFormat(&fmt);
+    if (SQ_FAILED(r)) return setMessage(r, "import audio: cannot read format");
+    if (!(fmt.sample_rate > 0) || fmt.channels == 0) return setMessage(SQ_E_UNSUPPORTED, "import audio: invalid format");
+    if (fmt.frame_count <= 0) return setMessage(SQ_E_UNSUPPORTED, "import audio: stream length is unknown");
+    const double seconds = static_cast<double>(fmt.frame_count) / fmt.sample_rate;
+
+    sq::Ptr<ITempoMap> tm;
+    r = d->getTempoMap(tm.put());
+    if (SQ_FAILED(r) || !tm) return setMessage(r, "import audio: no tempo map");
+    const double start = num(a, "start", 0.0);
+    if (start < 0 || !std::isfinite(start)) return setMessage(SQ_E_INVALIDARG, "import audio: invalid start");
+    const double offset = num(a, "source_offset", 0.0);
+    if (offset < 0 || !std::isfinite(offset)) return setMessage(SQ_E_INVALIDARG, "import audio: invalid source_offset");
+    if (offset >= seconds) return setMessage(SQ_E_INVALIDARG, "import audio: source_offset is past the end of the file");
+    double length = num(a, "length", 0.0);
+    if (length <= 0) length = tm->secondsToPpq(seconds) - tm->secondsToPpq(offset);
+    if (!(length > 0) || !std::isfinite(length)) return setMessage(SQ_E_INVALIDARG, "import audio: invalid clip length");
+
+    std::string source = path;
+    if (a && a->getBool("copy", SQ_FALSE)) {
+      std::string dir;
+      char docPath[1024] = {};
+      uint32_t need = 0;
+      if (d->getPath(docPath, sizeof docPath, &need) == SQ_OK && need > 1) dir = sq::joinPath(dirOf(docPath), "Media");
+      if (dir.empty()) {
+        const std::string media = sh.settings.get("Media.Folder");
+        if (!media.empty() && media.rfind("mem://", 0) != 0) dir = media;
+      }
+      if (dir.empty()) return setMessage(SQ_E_INVALIDARG, "import audio: copy requested, but the song is unsaved and Media.Folder is empty");
+      r = sq_fs_create_dirs(dir.c_str());
+      if (SQ_FAILED(r)) return setMessage(r, "import audio: cannot create " + dir);
+      const std::string base = fileNameOf(path);
+      std::string dest = sq::joinPath(dir, base);
+      for (int n = 1; sq_fs_exists(dest.c_str()) && dest != path && n < 1000; ++n)
+        dest = sq::joinPath(dir, stemOf(base) + "-" + std::to_string(n) + (base.size() > stemOf(base).size() ? base.substr(stemOf(base).size()) : std::string()));
+      if (dest != path) {
+        r = sq_fs_copy_file(path.c_str(), dest.c_str(), SQ_FALSE);
+        if (SQ_FAILED(r)) return setMessage(r, "import audio: cannot copy media to " + dest);
+        source = dest;
+      }
+    }
+
+    const bool explicitTrack = a && (a->getType("track") == SQ_VALUE_GUID || a->getType("track_index") != SQ_VALUE_NONE);
+    sq::Ptr<ITrack> t = track(a);
+    if (explicitTrack && !t) return setMessage(SQ_E_NOTFOUND, "import audio: target track not found");
+    auto usable = [](const sq_track_info& ti) { return ti.kind == SQ_TRACK_AUDIO || ti.kind == SQ_TRACK_INSTRUMENT; };
+    sq_track_info ti{};
+    ti.struct_size = sizeof ti;
+    bool haveTrack = false;
+    if (t && t->getTrackInfo(&ti) == SQ_OK) {
+      if (!usable(ti)) {
+        if (explicitTrack) return setMessage(SQ_E_INVALIDARG, "import audio: the target track cannot hold audio clips");
+        t.reset();
+      } else {
+        haveTrack = true;
+      }
+    }
+
+    auto ed = editor();
+    if (!ed) return SQ_E_NOTFOUND;
+    sq_result tx = ed->beginTransaction("Import Audio");
+    if (SQ_FAILED(tx)) return tx;
+    auto fail = [&](sq_result e, const std::string& msg) {
+      ed->cancelTransaction();
+      return setMessage(e, msg);
+    };
+
+    sq_guid trackId{};
+    if (!haveTrack) {
+      auto p = sq::makeAttributes();
+      p->setInt("kind", SQ_TRACK_AUDIO);
+      p->setString("name", stemOf(fileNameOf(source)).c_str());
+      auto tr = sq::makeAttributes();
+      r = exec(sq::doc::kAddTrack, p.get(), tr.get());
+      if (SQ_FAILED(r)) return fail(r, "import audio: cannot add a track");
+      tr->getGuid("node", &trackId);
+    } else {
+      trackId = nodeId(t.get());
+    }
+    if (sq_guid_is_null(&trackId)) return fail(SQ_E_FAIL, "import audio: no target track");
+
+    auto cp = sq::makeAttributes();
+    cp->setGuid("track", &trackId);
+    cp->setInt("kind", SQ_CLIP_AUDIO);
+    cp->setDouble("start", start);
+    cp->setDouble("length", length);
+    cp->setString("source", source.c_str());
+    cp->setDouble("source_offset", offset);
+    const std::string clipName = str(a, "name", stemOf(fileNameOf(source)));
+    if (!clipName.empty()) cp->setString("name", clipName.c_str());
+    auto cr = sq::makeAttributes();
+    r = exec(sq::doc::kAddClip, cp.get(), cr.get());
+    if (SQ_FAILED(r)) return fail(r, "import audio: cannot add the clip");
+
+    r = ed->commitTransaction();
+    if (SQ_FAILED(r)) return setMessage(r, "import audio: commit failed");
+    sq_guid clipId{};
+    cr->getGuid("node", &clipId);
+    if (res) {
+      res->setGuid("node", &clipId);
+      res->setGuid("track", &trackId);
+      res->setDouble("length", length);
+      res->setDouble("seconds", seconds);
+      res->setInt("sample_rate", static_cast<int64_t>(std::llround(fmt.sample_rate)));
+      res->setInt("channels", fmt.channels);
+      res->setInt("frames", fmt.frame_count);
+    }
+    return setMessage(SQ_OK, "imported " + fileNameOf(source) + " (" + std::to_string(seconds) + " s)");
+  }
+
+  // File.ImportMidi path=<file.mid> [name=<prefix>] -> one instrument track + clip per SMF track.
+  sq_result importMidi(IAttributes* a, IAttributes* res) {
+    auto d = active();
+    const std::string path = str(a, "path");
+    if (!d) return SQ_E_NOTFOUND;
+    if (path.empty()) return setMessage(SQ_E_INVALIDARG, "import MIDI: path is required");
+    if (!sq_fs_is_file(path.c_str())) return setMessage(SQ_E_NOTFOUND, "import MIDI: no such file: " + path);
+    auto rd = sq::createInstance<IMidiFileReader>(&sh.registry, sq::midi::kMidiFileReaderClassId);
+    if (!rd) return setMessage(SQ_E_UNSUPPORTED, "import MIDI: no MIDI file reader (codec-midifile not loaded)");
+    sq_result r = rd->open(path.c_str());
+    if (SQ_FAILED(r)) return setMessage(r, "import MIDI: cannot open " + path);
+    sq_midi_file_info info{};
+    info.struct_size = sizeof info;
+    r = rd->getInfo(&info);
+    if (SQ_FAILED(r)) return setMessage(r, "import MIDI: cannot read file info");
+    if (info.ticks_per_quarter == 0) return setMessage(SQ_E_UNSUPPORTED, "import MIDI: SMPTE-timed files are not supported");
+    const double tpq = info.ticks_per_quarter;
+
+    struct Note {
+      double start = 0, length = 0;
+      uint8_t bytes[3] = {0x90, 60, 100};
+    };
+    struct Part {
+      std::string name;
+      std::vector<Note> notes;
+      double length = 0;
+    };
+    std::vector<Part> parts;
+    for (uint32_t ti = 0; ti < info.track_count; ++ti) {
+      Part part;
+      char nb[256] = {};
+      uint32_t need = 0;
+      if (rd->getTrackName(ti, nb, sizeof nb, &need) == SQ_OK) part.name = nb;
+      struct Open { uint64_t tick; uint8_t velocity; };
+      std::map<std::pair<uint8_t, uint8_t>, std::vector<Open>> open;
+      uint64_t lastTick = 0;
+      auto close = [&](uint8_t ch, uint8_t note, uint64_t tick, uint8_t velocity) {
+        auto it = open.find({ch, note});
+        if (it == open.end() || it->second.empty()) return;
+        const Open o = it->second.back();
+        it->second.pop_back();
+        if (tick <= o.tick) tick = o.tick + 1;  // dangling note-on: keep a minimal event
+        Note n;
+        n.start = static_cast<double>(o.tick) / tpq;
+        n.length = static_cast<double>(tick - o.tick) / tpq;
+        n.bytes[0] = static_cast<uint8_t>(0x90u | (ch & 0x0Fu));
+        n.bytes[1] = note;
+        n.bytes[2] = o.velocity ? o.velocity : velocity;
+        part.length = std::max(part.length, n.start + n.length);
+        part.notes.push_back(n);
+      };
+      const uint32_t evCount = rd->getEventCount(ti);
+      for (uint32_t ei = 0; ei < evCount; ++ei) {
+        sq_midi_file_event ev{};
+        ev.struct_size = sizeof ev;
+        if (rd->getEvent(ti, ei, &ev) != SQ_OK) continue;
+        lastTick = std::max(lastTick, ev.tick);
+        if (ev.status >= 0x80 && ev.status < 0xF0) {
+          const uint8_t ch = ev.status & 0x0Fu;
+          const uint8_t type = ev.status & 0xF0u;
+          if (type == 0x90u && ev.data2 > 0) open[{ch, ev.data1}].push_back(Open{ev.tick, ev.data2});
+          else if (type == 0x80u || (type == 0x90u && ev.data2 == 0)) close(ch, ev.data1, ev.tick, ev.data2);
+        }
+      }
+      for (auto& [key, stack] : open)
+        while (!stack.empty()) {
+          close(key.first, key.second, std::max(lastTick, stack.back().tick), 64);
+        }
+      if (!part.notes.empty()) parts.push_back(std::move(part));
+    }
+    if (parts.empty()) return setMessage(SQ_E_NOTFOUND, "import MIDI: no notes found");
+
+    auto ed = editor();
+    if (!ed) return SQ_E_NOTFOUND;
+    sq_result tx = ed->beginTransaction("Import MIDI");
+    if (SQ_FAILED(tx)) return tx;
+    auto fail = [&](sq_result e, const std::string& msg) {
+      ed->cancelTransaction();
+      return setMessage(e, msg);
+    };
+    const std::string prefix = str(a, "name", stemOf(fileNameOf(path)));
+    int64_t madeClips = 0;
+    for (size_t pi = 0; pi < parts.size(); ++pi) {
+      Part& part = parts[pi];
+      auto tp = sq::makeAttributes();
+      tp->setInt("kind", SQ_TRACK_INSTRUMENT);
+      const std::string trackName =
+          part.name.empty() ? prefix + (parts.size() > 1 ? " " + std::to_string(pi + 1) : "") : part.name;
+      tp->setString("name", trackName.c_str());
+      auto tr = sq::makeAttributes();
+      r = exec(sq::doc::kAddTrack, tp.get(), tr.get());
+      if (SQ_FAILED(r)) return fail(r, "import MIDI: cannot add an instrument track");
+      sq_guid trackId{};
+      tr->getGuid("node", &trackId);
+      auto cp = sq::makeAttributes();
+      cp->setGuid("track", &trackId);
+      cp->setInt("kind", SQ_CLIP_MIDI);
+      cp->setDouble("start", 0);
+      cp->setDouble("length", std::max(0.25, part.length));
+      cp->setString("name", (part.name.empty() ? trackName : part.name).c_str());
+      auto cr = sq::makeAttributes();
+      r = exec(sq::doc::kAddClip, cp.get(), cr.get());
+      if (SQ_FAILED(r)) return fail(r, "import MIDI: cannot add a clip");
+      sq_guid clipId{};
+      cr->getGuid("node", &clipId);
+      std::vector<sq_clip_event> events(part.notes.size());
+      for (size_t i = 0; i < part.notes.size(); ++i) {
+        events[i].struct_size = sizeof(sq_clip_event);
+        events[i].position = part.notes[i].start;
+        events[i].length = part.notes[i].length;
+        std::memcpy(events[i].bytes, part.notes[i].bytes, 3);
+        events[i].size = 3;
+      }
+      auto ep = sq::makeAttributes();
+      ep->setGuid("clip", &clipId);
+      ep->setBlob("events", events.data(), static_cast<uint32_t>(events.size() * sizeof(sq_clip_event)));
+      r = exec(sq::doc::kSetClipEvents, ep.get());
+      if (SQ_FAILED(r)) return fail(r, "import MIDI: cannot add notes");
+      ++madeClips;
+    }
+    r = ed->commitTransaction();
+    if (SQ_FAILED(r)) return setMessage(r, "import MIDI: commit failed");
+    if (res) {
+      res->setInt("tracks", static_cast<int64_t>(parts.size()));
+      res->setInt("clips", madeClips);
+    }
+    return setMessage(SQ_OK, "imported " + std::to_string(parts.size()) + " MIDI track(s) from " + fileNameOf(path));
   }
 
   sq_result exportMidi(IAttributes* a, IAttributes* res) {

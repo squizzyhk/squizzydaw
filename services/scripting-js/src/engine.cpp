@@ -115,8 +115,13 @@ size_t stackHeadroom() {
 // native stack, i.e. crash the host.
 size_t effectiveStackBytes(uint64_t requested) {
   constexpr size_t kDefault = 512u << 10, kMin = 16u << 10;
+  // Some hosts report an enormous stack for the main thread (e.g. Linux with RLIMIT_STACK
+  // unlimited), while the mapping really available to us is much smaller. Keep an absolute
+  // ceiling matching QuickJS' own default (with a reserve below it) so a huge requested value
+  // can never reach the native stack guard.
+  constexpr size_t kMaxRoom = 1u << 20;
   size_t want = requested ? static_cast<size_t>(std::min<uint64_t>(requested, uint64_t(1) << 30)) : kDefault;
-  const size_t room = stackHeadroom();
+  const size_t room = std::min(stackHeadroom(), kMaxRoom);
   if (room) {
     const size_t reserve = std::max<size_t>(room / 4, 96u << 10);
     const size_t cap = room > reserve + kMin ? room - reserve : kMin;

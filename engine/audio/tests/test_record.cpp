@@ -81,7 +81,10 @@ SQ_TEST("record: 2 tracks, 64-frame blocks, 60 s simulated, no ring overflow, sa
   const double wall = static_cast<double>(sq_time_monotonic_ns() - t0) / 1e9;
   REQUIRE_OK(eng->stop());
   const uint64_t deviceXruns = dev->getXrunCount();
-  CHECK(dev->renderThread().priorityApplied());
+  // RT scheduling is optional on POSIX hosts (and unavailable in many containers); only require
+  // the render thread to match a capability the process actually has.
+  const bool rtPossible = sq_thread_set_current_priority(SQ_PRIORITY_REALTIME) == SQ_OK;
+  CHECK(dev->renderThread().priorityApplied() || !rtPossible);
 #ifdef _WIN32
   CHECK(dev->renderThread().mmcssApplied());
 #endif

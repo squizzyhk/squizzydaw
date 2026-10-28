@@ -2,7 +2,11 @@
 
 Snapshot after the second integration pass (wave 2: ASIO seam, VST3, themes/skin compiler/UI Automation, MIDI control surfaces, optional M8 services, sq-pack + Ogg write), each unit adversarially verified before integration (2026-10-28). Legend: **done** = implemented and covered by tests that ran green; **partial** = works with documented gaps; **seam** = interface/hook exists, the real implementation needs something not in the tree (an SDK or a user-supplied library); **not done**.
 
-Verified platform: **Windows 11 x64, MSVC 2022, Debug, `/W4 /WX`** (unfiltered build, full `ctest`: see the end). macOS and Linux are **unverified**: the tree has `#ifdef` seams and null backends, but nothing was built or run there.
+Verified platforms:
+- **Windows 11 x64, MSVC 2022, Debug, `/W4 /WX`** (unfiltered build, full `ctest`: see the end).
+- **Linux x64, Ubuntu 24.04, GCC 13.3, RelWithDebInfo** (unfiltered Ninja build, `ctest -LE gui`: 99 passed, 16 skipped, 0 failed, 2026-10-28). The Linux build is headless: there is still no window backend or hardware audio driver.
+
+macOS is **unverified**: the tree has `#ifdef` seams and null backends, but nothing was built or run there.
 
 ## Plan section 2 - architecture
 
@@ -11,7 +15,7 @@ Verified platform: **Windows 11 x64, MSVC 2022, Debug, `/W4 /WX`** (unfiltered b
 | 2.1 Platform layer (threads, pool, IPC, fs, text, XML/JSON, hash, log, C ABI, ABI stamp) | done | `platform/`, tests `platform`, `ipc`, `xml_json`, `hash`, `abi_lock` | No process-spawn API in the platform layer yet (the plugin scanner has its own) |
 | 2.2 Module system: two exports, GUID registry, ABI gate, hot reload | done | `app/`, tests `module_reload`, `module_lifecycle`, `service_exports`, `app_reload_test` | 24 modules load in the unfiltered build |
 | 2.2 Script classes in the same registry | done | `services/scripting-js`, test `scripting_js`, e2e M6 | |
-| 2.3 Graph, AudioProcessor variants, render thread with priority/MMCSS | done | `engine/audio`, tests `engine_audio_*` | Single-threaded graph; instrument tracks use a built-in sine synth (no plugin instruments yet). Mixer-only and cosmetic edits are RT commands on the installed graph; **structural edits (clips, inserts, routing, tempo) still recompile the graph**, which restarts PDC delay lines and plugin state (no state transfer / crossfade yet) |
+| 2.3 Graph, AudioProcessor variants, render thread with priority/MMCSS | done | `engine/audio`, tests `engine_audio_*` | Single-threaded graph; instrument tracks use a built-in sine synth (no plugin instruments yet). Mixer-only and cosmetic edits are RT commands on the installed graph; **structural edits (clips, inserts, routing, tempo) still recompile the graph**, which restarts PDC delay lines and plugin state (no state transfer / crossfade yet). Media at a sample rate different from the graph is linearly resampled in `MediaNode` (fixes imported 44.1 kHz files in a 48 kHz song). |
 | 2.3 Device loss / reset recovery | done | `engine_audio_service` (simulated loss with and without driver notification, during recording) | Not exercised with a physically unplugged endpoint |
 | 2.3 Fast-lane monitoring | partial | `engine/audio` (`processFastLane`) | Bypasses buses and master inserts by design |
 | 2.3 Latency bookkeeping + PDC | done | `engine_audio_pdc`, `engine_audio_plugin_fx`, e2e M4 (CLAP) and **M4 (VST3)**: 64-frame plugin latency compensated exactly (max error 0) | |
@@ -79,6 +83,15 @@ Verified platform: **Windows 11 x64, MSVC 2022, Debug, `/W4 /WX`** (unfiltered b
 | M7 formats & interchange | WAV/AIFF/FLAC/MP3/OGG/Opus read+write, MIDI file, DAWproject export, stem export, video | partial | e2e "M7" (WAV/FLAC/MIDI/DAWproject). **Ogg Vorbis write done**; Opus write missing; MP3 write needs user LAME; video decode via Media Foundation (`video_engine_module`) but no video track |
 | M8 optional packages | cloud, preset sync, AI assistant, Link, hardware network | partial | cloud-client, link-ableton (local clock), hardware-remote (OSC/mDNS), hardware-surface; all reachable through shell commands (e2e M5/M8). No preset sync, no AI assistant, placeholder cloud backend |
 
+## Linux baseline pass (this pass)
+
+- Build fixes: `<cstdlib>` in the CLAP test plugin and `<cstring>` in `tests/test_platform.cpp` (GCC 13 does not get these transitively).
+- `ipc` (POSIX): duplicate `sq_pipe_listen` is now detected with a sidecar `flock`, not a `connect()` probe. The old probe enqueued a phantom connection that `sq_pipe_accept` returned instead of the real client.
+- `scripting-js`: QuickJS stack budget is capped to 8 MB even when the host reports an enormous/implicit stack (Linux with `RLIMIT_STACK=unlimited` used to allow a 1 GB budget and segfault before QuickJS' guard fired).
+- `platform/thread`: a kernel/container with an empty `SCHED_FIFO` priority range now reports `SQ_E_ACCESS` instead of calling `pthread_setschedparam` with an invalid priority.
+- `analysis-stems` test finds the POSIX `libsqplatform.so` name; `engine_audio_record` only requires RT priority when the process can actually set it.
+- Core workflow: `File.ImportAudio`, `File.ImportMidi`, and mixer commands (`Track.SetVolume/SetPan/ToggleMute/ToggleSolo/Rename`); media sample-rate conversion in the graph. Covered by e2e "M7: import audio (44.1 kHz into a 48 kHz song) + MIDI, mixer commands, save/reopen" and `engine_audio_graph`.
+
 ## Second integration pass (this pass)
 
 - **Verified units:** asio (3 defects fixed: notifier use-after-free, unbounded driver buffer sizes, stale latency/rate after notifications), vst3 (7 defects), ui-m5 (UIA threading, PNG decompression bomb, three stack overflows in the skin validator/builder, theme-name and BMP fixes), surfaces (button LEDs, toggle sync, validator gaps, midi-win refresh race), optional (OSC pattern DoS, sign-out race, loopback-URL bypass, redirect following), packager (unloadable script packages, unsafe unpack). Each fix has a regression test that failed first.
@@ -99,7 +112,7 @@ Verified platform: **Windows 11 x64, MSVC 2022, Debug, `/W4 /WX`** (unfiltered b
 6. Opus encoder; video tracks; AAF/OpenTL; ARA; spatial audio.
 7. Control surfaces untested with hardware; remote-page targets against the real document resolver untested.
 8. Cloud backend is placeholder; mDNS rate limiting; DNS-SD late-callback risk; cloud shutdown wait on black-holed networks.
-9. macOS/Linux never built; CI only run on Windows.
+9. macOS never built; Linux builds and the non-GUI suite passes, but has no window backend or hardware audio driver.
 10. `codec_aac` timed out once under parallel CTest (intermittent Media Foundation hang, not reproduced); codec-aac and video-engine tests use fixed temp paths, so two instances of the same test collide (CTest never does that, but it hides isolation bugs).
 11. Product decision pending on spec-mandated file extensions and scripting vocabulary (2.6).
 
@@ -109,4 +122,8 @@ Fresh (`-Clean`) unfiltered build in `build\final` (`build.ps1 -Clean -CMakeArgs
 
 - First run after the clean build: 117/118; **`codec_aac` hit the 300 s CTest timeout once** (it normally finishes in ~1 s; 4 serial reruns passed in ~1 s each; no code in codec-aac changed in this pass). Treat it as an **intermittent Media Foundation hang, cause not found** (open item).
 - Rerun of the full suite in the same build dir: **`100% tests passed, 0 tests failed out of 118`** (5 skipped as above), including `app_window_smoke` (desktop session), `app_integration_commands` and `e2e_milestones` (8 cases incl. M4 VST3 and M5/M8).
-- `SquizzyStudio --headless`: 24 modules, 117 classes, 104 commands, themes base/dark/light (active dark). `--selftest`: PASS. `--list-classes`: 117 classes.
+- `SquizzyStudio --headless`: 24 modules, 117 classes, 111 commands, themes base/dark/light (active dark). `--selftest`: PASS. `--list-classes`: 117 classes.
+
+### Linux run (2026-10-28)
+
+`cmake --preset linux && cmake --build --preset linux --parallel 18 && ctest --preset linux -LE gui --output-on-failure -j 8` -> **100% tests passed, 0 failed out of 115** (99 passed, 16 hardware/SDK/Windows-only cases Skipped). `SquizzyStudio --headless`: 24 modules, 117 classes, 111 commands. The added e2e case imports a 44.1 kHz WAV into a 48 kHz song, renders 96,000 frames, imports a MIDI file, exercises the mixer commands, and saves/reopens the session.

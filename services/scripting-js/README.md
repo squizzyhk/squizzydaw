@@ -70,7 +70,7 @@ Command `args` conventions used by the bundled packages:
 
 - `Services.scripting-js.TimeLimitMs` (default 10000) applies per outermost native-to-script call. The interrupt is uncatchable by scripts.
 - `MemoryLimitMB` (default 256) covers the whole runtime.
-- `StackSizeKB` (default 512). Always capped to what the calling thread's native stack really has left (minus a reserve); 0 or negative means the default, never "no limit" (that would let deep recursion crash the host).
+- `StackSizeKB` (default 512). Always capped to 1 MB (QuickJS' default) and to what the calling thread's native stack really has left (minus a reserve); 0 or negative means the default, never "no limit" (that would let deep recursion crash the host).
 - Script exceptions never cross the ABI. They become `SQ_E_FAIL` (`SQ_E_PARSE` for syntax errors), and `getLastError()` gives `file:line: Name: message` plus the stack.
 - A transaction that a script opened and left open when its call ended (an exception or a timeout) is cancelled, so the document is unchanged.
 - All calls are main-thread only. Calls from other threads get `SQ_E_ACCESS`. Releasing script objects from other threads is safe: the last release is decided under the engine's live-object lock and the JS value is freed by the engine thread on its next entry/idle. `getLastError` and the `object://scripting` properties other than `info` are engine-thread state and also answer `SQ_E_ACCESS` off-thread.

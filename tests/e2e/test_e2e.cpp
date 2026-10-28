@@ -848,3 +848,177 @@ SQ_TEST("M7: export WAV + FLAC + MIDI file + DAWproject, read everything back") 
     for (size_t i = 0; i < W.frames(); ++i) d2 = std::fmax(d2, std::fabs(W.ch[c][i] - W2.ch[c][i]));
   CHECK(d2 < 1e-6);
 }
+
+// ------------------------------------------------------------------------------------------------
+SQ_TEST("M7: import audio (44.1 kHz into a 48 kHz song) + MIDI, mixer commands, save/reopen") {
+  TestShell t("imports");
+  REQUIRE_OK(t.run("File.New"));
+  auto tr = makeAttributes();
+  REQUIRE_OK(t.run("Track.AddAudio", [](IAttributes* a) { a->setString("name", "Imported"); }, tr.get()));
+  sq_guid track{};
+  tr->getGuid("node", &track);
+
+  const std::string wav = joinPath(t.dir, "tone-44k.wav");
+  writeWav(t.sh, wav, 44100, 44100 * 2, [](uint32_t i) {
+    return 0.5f * std::sin(2.0f * 3.14159265358979323846f * 220.0f * static_cast<float>(i) / 44100.0f);
+  });
+
+  auto imported = makeAttributes();
+  REQUIRE_OK(t.run("File.ImportAudio", [&](IAttributes* a) {
+    a->setString("path", wav.c_str());
+    a->setDouble("start", 0);
+  }, imported.get()));
+  sq_guid clip{};
+  imported->getGuid("node", &clip);
+  CHECK(!sq_guid_is_null(&clip));
+  CHECK_EQ(imported->getInt("sample_rate", 0), int64_t(44100));
+  auto ed = t.editor();
+  const uint32_t undoAfterImport = ed->getUndoCount();
+
+  auto d = t.doc();
+  Ptr<ITrack> importedTrack;
+  REQUIRE_OK(d->findNode(&track, reinterpret_cast<INode**>(importedTrack.put())));
+  sq_track_info ti{};
+  ti.struct_size = sizeof ti;
+  REQUIRE_OK(importedTrack->getTrackInfo(&ti));
+  REQUIRE_EQ(ti.clip_count, 1u);
+  Ptr<IClip> c;
+  REQUIRE_OK(importedTrack->getClip(0, c.put()));
+  sq_clip_info ci{};
+  ci.struct_size = sizeof ci;
+  REQUIRE_OK(c->getClipInfo(&ci));
+  CHECK_EQ(clipSource(c.get()), wav);
+  Ptr<ITempoMap> tm;
+  REQUIRE_OK(d->getTempoMap(tm.put()));
+  CHECK(std::fabs(ci.length - tm->secondsToPpq(2.0)) < 1e-6);
+  CHECK_EQ(ci.kind, int32_t(SQ_CLIP_AUDIO));
+
+  // One undo step for the import; undo/redo are exact.
+  REQUIRE_OK(t.run("Edit.Undo"));
+  CHECK_EQ(ed->getUndoCount(), undoAfterImport - 1);
+  REQUIRE_OK(importedTrack->getTrackInfo(&ti));
+  CHECK_EQ(ti.clip_count, 0u);
+  REQUIRE_OK(t.run("Edit.Redo"));
+  REQUIRE_OK(importedTrack->getTrackInfo(&ti));
+  CHECK_EQ(ti.clip_count, 1u);
+
+  // Render the imported 44.1 kHz material through the 48 kHz graph.
+  const std::string mix = joinPath(t.dir, "mix.wav");
+  REQUIRE_OK(t.run("File.ExportAudio", [&](IAttributes* a) { a->setString("path", mix.c_str()); }));
+  Audio rendered;
+  REQUIRE(readAudio(t.sh, mix, rendered));
+  CHECK_EQ(rendered.sr, 48000.0);
+  CHECK(std::llabs(static_cast<long long>(rendered.frames()) - 96000) <= 64);
+  double rms = 0;
+  for (float v : rendered.ch[0]) rms += static_cast<double>(v) * v;
+  rms = std::sqrt(rms / static_cast<double>(rendered.frames()));
+  CHECK(rms > 0.2);  // a full-scale 0.5 sine resampled without losing energy
+
+  // Save/reopen keeps the source and the musical length.
+  const std::string song = joinPath(t.dir, "imports.song");
+  REQUIRE_OK(t.run("File.Save", [&](IAttributes* a) { a->setString("path", song.c_str()); }));
+  REQUIRE_OK(t.run("File.Close"));
+  REQUIRE_OK(t.run("File.Open", [&](IAttributes* a) { a->setString("path", song.c_str()); }));
+  d = t.doc();
+  REQUIRE(d);
+  REQUIRE_OK(d->findNode(&track, reinterpret_cast<INode**>(importedTrack.put())));
+  REQUIRE_OK(importedTrack->getTrackInfo(&ti));
+  REQUIRE_EQ(ti.clip_count, 1u);
+  REQUIRE_OK(importedTrack->getClip(0, c.put()));
+  REQUIRE_OK(c->getClipInfo(&ci));
+  CHECK_EQ(clipSource(c.get()), wav);
+  CHECK(std::fabs(ci.length - tm->secondsToPpq(2.0)) < 1e-6);
+
+  // Mixer commands: volume, pan, mute, solo, rename (each one undo step).
+  auto mixTr = makeAttributes();
+  REQUIRE_OK(t.run("Track.AddAudio", [](IAttributes* a) { a->setString("name", "Mix"); }, mixTr.get()));
+  sq_guid mixTrack{};
+  mixTr->getGuid("node", &mixTrack);
+  auto runOn = [&](const char* cmd, std::function<void(IAttributes*)> args) {
+    return t.run(cmd, [&](IAttributes* a) {
+      a->setGuid("track", &mixTrack);
+      if (args) args(a);
+    });
+  };
+  CHECK_EQ(runOn("Track.SetVolume", [](IAttributes* a) { a->setDouble("value", 100.0); }), SQ_E_INVALIDARG);
+  REQUIRE_OK(runOn("Track.SetVolume", [](IAttributes* a) { a->setDouble("value", -6.0); }));
+  REQUIRE_OK(runOn("Track.SetPan", [](IAttributes* a) { a->setDouble("value", 0.5); }));
+  REQUIRE_OK(runOn("Track.ToggleMute", {}));
+  REQUIRE_OK(runOn("Track.ToggleSolo", {}));
+  REQUIRE_OK(runOn("Track.Rename", [](IAttributes* a) { a->setString("name", "MIX"); }));
+  Ptr<ITrack> mt;
+  REQUIRE_OK(d->findNode(&mixTrack, reinterpret_cast<INode**>(mt.put())));
+  sq_track_info mi{};
+  mi.struct_size = sizeof mi;
+  REQUIRE_OK(mt->getTrackInfo(&mi));
+  CHECK_EQ(name(mt.get()), std::string("MIX"));
+  CHECK(std::fabs(mi.volume_db + 6.0) < 1e-9);
+  CHECK(std::fabs(mi.pan - 0.5) < 1e-9);
+  CHECK(mi.flags & SQ_TRACK_MUTE);
+  CHECK(mi.flags & SQ_TRACK_SOLO);
+  REQUIRE_OK(runOn("Track.ToggleMute", {}));
+  REQUIRE_OK(mt->getTrackInfo(&mi));
+  CHECK(!(mi.flags & SQ_TRACK_MUTE));
+
+  // MIDI file import: one instrument track with the file's notes.
+  const std::string mid = joinPath(t.dir, "notes.mid");
+  auto writer = createInstance<IMidiFileWriter>(&t.sh.registry, midi::kMidiFileWriterClassId);
+  REQUIRE(writer);
+  REQUIRE_OK(writer->create(mid.c_str(), 1, 480));
+  REQUIRE_OK(writer->beginTrack());
+  sq_midi_file_event ev{};
+  ev.struct_size = sizeof ev;
+  ev.tick = 0;
+  ev.status = 0x90;
+  ev.data1 = 60;
+  ev.data2 = 100;
+  REQUIRE_OK(writer->addEvent(&ev));
+  ev.tick = 480;
+  ev.status = 0x80;
+  ev.data2 = 0;
+  REQUIRE_OK(writer->addEvent(&ev));
+  ev.tick = 480;
+  ev.status = 0x90;
+  ev.data1 = 67;
+  ev.data2 = 90;
+  REQUIRE_OK(writer->addEvent(&ev));
+  ev.tick = 960;
+  ev.status = 0x80;
+  ev.data2 = 0;
+  REQUIRE_OK(writer->addEvent(&ev));
+  REQUIRE_OK(writer->endTrack());
+  REQUIRE_OK(writer->finish());
+  writer = nullptr;
+
+  sq_document_info before{};
+  before.struct_size = sizeof before;
+  REQUIRE_OK(d->getDocumentInfo(&before));
+  auto midiRes = makeAttributes();
+  REQUIRE_OK(t.run("File.ImportMidi", [&](IAttributes* a) { a->setString("path", mid.c_str()); }, midiRes.get()));
+  CHECK(midiRes->getInt("tracks", 0) >= 1);
+  sq_document_info after{};
+  after.struct_size = sizeof after;
+  REQUIRE_OK(d->getDocumentInfo(&after));
+  CHECK_EQ(after.track_count, before.track_count + 1);
+  Ptr<ITrack> last;
+  REQUIRE_OK(d->getTrack(after.track_count - 1, last.put()));
+  sq_track_info li{};
+  li.struct_size = sizeof li;
+  REQUIRE_OK(last->getTrackInfo(&li));
+  CHECK_EQ(li.kind, int32_t(SQ_TRACK_INSTRUMENT));
+  REQUIRE_EQ(li.clip_count, 1u);
+  Ptr<IClip> mc;
+  REQUIRE_OK(last->getClip(0, mc.put()));
+  sq_clip_info mci{};
+  mci.struct_size = sizeof mci;
+  REQUIRE_OK(mc->getClipInfo(&mci));
+  CHECK_EQ(mci.kind, int32_t(SQ_CLIP_MIDI));
+  CHECK_EQ(mci.event_count, 2u);
+  sq_clip_event ce{};
+  ce.struct_size = sizeof ce;
+  REQUIRE_OK(mc->getEvent(0, &ce));
+  CHECK_EQ(ce.position, 0.0);
+  CHECK_EQ(ce.length, 1.0);
+  CHECK_EQ(int(ce.bytes[0]), 0x90);
+  CHECK_EQ(int(ce.bytes[1]), 60);
+}
