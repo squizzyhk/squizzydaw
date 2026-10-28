@@ -24,7 +24,8 @@ param(
   [switch]$NoTest,
   [switch]$Clean,
   [switch]$ConfigureOnly,
-  [int]$Jobs = 0
+  [int]$Jobs = 0,
+  [switch]$KeepGoing
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,6 +93,7 @@ Write-Host '== build'
 $b = @('--build', $BuildDir)
 if ($Target) { $b += @('--target', $Target) }
 if ($Jobs -gt 0) { $b += @('--parallel', "$Jobs") }
+if ($KeepGoing) { $b += @('--', '-k', '0') }  # Ninja: report every failing file, not just the first
 & $cmake @b
 if ($LASTEXITCODE -ne 0) { Write-Host '== BUILD FAILED'; exit $LASTEXITCODE }
 

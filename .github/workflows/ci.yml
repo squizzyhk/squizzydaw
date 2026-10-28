@@ -37,7 +37,7 @@ jobs:
       - name: Build + test (Windows, via build.ps1 / vcvars64)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./build.ps1 -Preset ${{ matrix.preset }} -BuildDir build/ci -CMakeArgs "-DSQ_WARNINGS_AS_ERRORS=ON" -ExcludeLabel gui
+        run: ./build.ps1 -Preset ${{ matrix.preset }} -BuildDir build/ci -CMakeArgs "-DSQ_WARNINGS_AS_ERRORS=ON" -ExcludeLabel gui -KeepGoing
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
