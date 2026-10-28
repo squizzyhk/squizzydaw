@@ -260,13 +260,13 @@ class Browser final : public Widget, public CharInput {
 
   void buildPlaces() {
     places_.clear();
-    auto add = [&](const std::string& name, const std::string& path) {
+    auto add = [&](const std::string& nm, const std::string& path) {
       const std::string p = norm(path);
       if (p.empty() || !sq_fs_is_dir(p.c_str())) return;
       for (const auto& q : places_)
         if (q->path == p) return;
       auto n = std::make_unique<Node>();
-      n->name = name;
+      n->name = nm;
       n->path = p;
       n->dir = true;
       places_.push_back(std::move(n));
@@ -349,8 +349,8 @@ class Browser final : public Widget, public CharInput {
     if (!search_.text.empty() && searched_ == search_.text) {
       for (size_t i = 0; i < results_.size(); ++i) {
         const std::string& path = results_[i];
-        const std::string name = path.substr(path.find_last_of('/') + 1);
-        addRow(c, p, y, nullptr, static_cast<int>(i), name, parentName(path), 0, false, false, iconFor(p, name));
+        const std::string nm = path.substr(path.find_last_of('/') + 1);
+        addRow(c, p, y, nullptr, static_cast<int>(i), nm, parentName(path), 0, false, false, iconFor(p, nm));
       }
       if (results_.empty()) c.drawText("No matches", Rect{list_.x + 12, list_.y + 4, list_.w - 24, 20}, p.faint, 12);
     } else {
@@ -612,19 +612,19 @@ class Browser final : public Widget, public CharInput {
       } cx;
       sq_fs_list_dir(
           dir.c_str(),
-          [](void* u, const char* name, sq_bool isDir) -> sq_bool {
+          [](void* u, const char* nm, sq_bool isDir) -> sq_bool {
             auto* c = static_cast<Ctx*>(u);
-            if (name && name[0] != '.') c->list.emplace_back(name, isDir != 0);
+            if (nm && nm[0] != '.') c->list.emplace_back(nm, isDir != 0);
             return c->list.size() < 5000 ? SQ_TRUE : SQ_FALSE;
           },
           &cx);
-      for (auto& [name, isDir] : cx.list) {
+      for (auto& [nm, isDir] : cx.list) {
         if (isDir) continue;
-        const std::string e = extOf(name);
-        if ((isAudio(e) || isMidi(e) || isSong(e)) && lower(name).find(want) != std::string::npos) results_.push_back(join(dir, name));
+        const std::string e = extOf(nm);
+        if ((isAudio(e) || isMidi(e) || isSong(e)) && lower(nm).find(want) != std::string::npos) results_.push_back(join(dir, nm));
       }
-      for (auto& [name, isDir] : cx.list)
-        if (isDir) rec(join(dir, name), depth + 1);
+      for (auto& [nm, isDir] : cx.list)
+        if (isDir) rec(join(dir, nm), depth + 1);
     };
     for (auto& pl : places_) rec(pl->path, 0);
     std::sort(results_.begin(), results_.end());

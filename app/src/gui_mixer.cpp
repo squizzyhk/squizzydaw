@@ -450,8 +450,8 @@ class Mixer final : public Widget {
 
   void rename(Strip& s) {
     const sq_guid id = s.t.id;
-    ctx_.prompt("Rename Track", s.t.name, [this, id](const std::string& name) {
-      if (!name.empty()) ctx_.setPropertyString(id, "name", name);
+    ctx_.prompt("Rename Track", s.t.name, [this, id](const std::string& nm) {
+      if (!nm.empty()) ctx_.setPropertyString(id, "name", nm);
     });
   }
 
