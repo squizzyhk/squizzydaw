@@ -83,9 +83,15 @@ sq_result sq_dylib_open(const char* path, sq_dylib** out, char* err, size_t err_
   std::error_code ec;
   fs::path abs = fs::absolute(fs::path(sqp::widen(path)), ec);
   std::wstring w = (ec ? fs::path(sqp::widen(path)) : abs).make_preferred().wstring();
+  // No system error boxes ("Bad Image", missing dependency) for files that are not loadable
+  // modules: a plugin scan or a headless run must fail cleanly instead of blocking on a dialog.
+  DWORD oldMode = 0;
+  const BOOL modeSet = SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, &oldMode);
   HMODULE h = LoadLibraryExW(w.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+  const DWORD loadErr = h ? 0 : GetLastError();
+  if (modeSet) SetThreadErrorMode(oldMode, nullptr);
   if (!h) {
-    DWORD e = GetLastError();
+    DWORD e = loadErr;
     sqp::copyErr(err, err_size, sqp::lastErrorString(e));
     return e == ERROR_MOD_NOT_FOUND || e == ERROR_FILE_NOT_FOUND ? SQ_E_NOTFOUND : SQ_E_FAIL;
   }

@@ -92,7 +92,12 @@ SQ_TEST("record: 2 tracks, 64-frame blocks, 60 s simulated, no ring overflow, sa
   // POSIX real-time scheduling needs privileges (root or an RLIMIT_RTPRIO grant); unprivileged
   // CI runners and desktops without rtprio limits fall back to normal priority, which is allowed.
   struct rlimit rl {};
+  #ifdef RLIMIT_RTPRIO
   const bool rtAllowed = geteuid() == 0 || (getrlimit(RLIMIT_RTPRIO, &rl) == 0 && rl.rlim_cur > 0);
+#else
+  (void)rl;
+  const bool rtAllowed = false;  // macOS: time-constraint threads; not asserted here
+#endif
   if (rtAllowed) CHECK(dev->renderThread().priorityApplied());
   else std::printf("record: real-time priority not permitted for this user; not checked\n");
 #endif
