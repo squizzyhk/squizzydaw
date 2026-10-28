@@ -90,4 +90,9 @@ class ArrangeView final : public Widget {
 
 std::unique_ptr<Widget> makeArrange(GuiContext& ctx) { return std::make_unique<ArrangeView>(ctx); }
 
+bool arrangeDropFile(Widget* arrange, float x, float y, const std::string& path) {
+  (void)arrange, (void)x, (void)y, (void)path;
+  return false;  // placeholder until the full arrange view lands
+}
+
 }  // namespace sq::app::gui

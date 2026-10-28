@@ -16,6 +16,9 @@ std::unique_ptr<Widget> makeClipEditor(GuiContext& ctx);    // <ClipEditor>   gu
 std::unique_ptr<Widget> makeMixer(GuiContext& ctx);         // <Mixer>        gui_mixer.cpp
 std::unique_ptr<Widget> makeDeviceRack(GuiContext& ctx);    // <DeviceRack>   gui_devices.cpp
 
+// Drop of a browser file onto the arrange view (x, y in DIPs, tree coordinates). True if consumed.
+bool arrangeDropFile(Widget* arrange, float x, float y, const std::string& path);
+
 // Menu entries shared by the menu bar and context menus (gui_menubar.cpp).
 std::vector<MenuItem> buildMainMenu(GuiContext& ctx, const std::string& title);
 // Global keyboard shortcuts not consumed by a focused panel (gui_menubar.cpp). True if handled.
