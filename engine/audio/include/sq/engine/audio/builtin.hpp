@@ -1,0 +1,66 @@
+// Squizzy Studio engine/audio - built-in devices (instruments + effects) shipped with the engine.
+//
+// Every built-in device is an AudioProcessor (SynthProcessor for instruments, FxProcessor for
+// effects) whose parameters are exposed through AudioProcessor::parameterCount / setParameter /
+// parameter using PLAIN values in [ParamInfo::min, ParamInfo::max].
+//
+// DOCUMENT MODEL (same spec grammar as plugin inserts, plugin_fx.hpp):
+//   builtin spec  "builtin|<device id>|[|<param index>=<plain value>]..."
+//   e.g.          "builtin|eq||0=-3|4=1.5"   (unlisted params keep their defaults)
+//   track property "user.inserts"    one insert spec per line (built-in or plugin effects)
+//   track property "user.instrument" one spec (built-in or plugin instrument) for an instrument
+//                                    track; empty = the default instrument (kDefaultInstrument)
+// The GUI builds device panels and "insert" menus from builtinDevices(); the app's insert /
+// instrument resolver calls makeBuiltin() for specs whose format field is "builtin".
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "sq/engine/audio/processor.hpp"
+
+namespace sq::engine::audio {
+
+enum class ParamKind : uint8_t { Continuous, Integer, Toggle, Choice };
+
+struct ParamInfo {
+  std::string id;      // stable key ("cutoff")
+  std::string name;    // display name ("Cutoff")
+  float min = 0, max = 1, def = 0;
+  std::string unit;    // "dB", "Hz", "ms", "%", "" ...
+  ParamKind kind = ParamKind::Continuous;
+  bool logScale = false;              // GUI knob mapping (frequencies, times)
+  std::vector<std::string> choices;   // ParamKind::Choice: index -> label (min = 0, max = n-1)
+};
+
+struct DeviceInfo {
+  std::string id;        // "synth", "eq", "reverb" ...
+  std::string name;      // "Squizzy Synth"
+  std::string category;  // "Instrument", "EQ", "Dynamics", "Reverb", "Delay", "Modulation", "Distortion", "Filter", "Utility"
+  bool instrument = false;
+  std::vector<ParamInfo> params;
+};
+
+inline constexpr const char* kDefaultInstrument = "builtin|synth|";
+
+// Catalog of every built-in device (stable order; static lifetime).
+const std::vector<DeviceInfo>& builtinDevices();
+const DeviceInfo* findBuiltin(const std::string& id);
+
+// Creates a prototype with the given plain parameter values (index, value); nullptr + error for
+// an unknown id. Values are clamped to the parameter ranges.
+ProcessorProto makeBuiltin(const std::string& id, const std::vector<std::pair<uint32_t, double>>& params, std::string* error);
+
+// Spec helpers ("builtin|<id>|" + "|i=v" for every value that differs from its default).
+std::string builtinSpec(const std::string& id, const std::vector<float>& values);
+// Splits any insert/instrument spec "<format>|<id>|<path>[|i=v]..." (built-in or plugin).
+struct SpecParts {
+  std::string format, id, path;
+  std::vector<std::pair<uint32_t, double>> params;
+};
+bool parseSpec(const std::string& spec, SpecParts* out);
+std::string formatSpec(const SpecParts& parts);
+
+}  // namespace sq::engine::audio

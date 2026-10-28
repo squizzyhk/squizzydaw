@@ -8,6 +8,7 @@
 //     reports the change as an output parameter event) and a note output port (echoes notes),
 //   - state save/load of the parameter values.
 // Used by the pluginhost-clap and pluginscanner tests; lives in bin/testplugins/.
+#include <cstdlib>
 #include <clap/clap.h>
 
 #include <cmath>

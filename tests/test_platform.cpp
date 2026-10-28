@@ -1,4 +1,5 @@
 // Threads, pool, TLS, locks, text, filesystem, logging, system.
+#include <cstring>
 #include <atomic>
 #include <set>
 #include <string>
