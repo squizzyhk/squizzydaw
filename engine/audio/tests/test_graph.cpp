@@ -13,10 +13,11 @@ using namespace sq::engine::audio;
 
 namespace {
 
-MediaPtr makeMedia(uint32_t channels, int64_t frames, float (*fn)(int64_t, uint32_t)) {
+MediaPtr makeMedia(uint32_t channels, int64_t frames, float (*fn)(int64_t, uint32_t), double sampleRate = 48000.0) {
   auto m = std::make_shared<MediaBuffer>();
   m->channels = channels;
   m->frames = frames;
+  m->sampleRate = sampleRate;
   m->data.resize(channels);
   for (uint32_t c = 0; c < channels; ++c) {
     m->data[c].resize(static_cast<size_t>(frames));
