@@ -242,3 +242,35 @@ Color lighten(Color a, float amount);
 }  // namespace draw
 
 }  // namespace sq::app::gui
+
+// ---- app-level helpers (shell / menu bar / transport / overlays) ---------------------------------
+namespace sq::app::gui {
+
+// One tempo range for every tempo control (drag, wheel, typed entry, tap, Set Tempo...).
+inline constexpr double kMinBpm = 10.0;
+inline constexpr double kMaxBpm = 999.0;
+// "120" or "95.50" (gui_transport.cpp).
+std::string formatBpm(double bpm);
+// Transport.Record with a check: with nothing armed it only explains how to arm a track (gui_transport.cpp).
+void toggleRecord(GuiContext& ctx);
+
+// Message with buttons (left to right); onPick gets the index. Enter = first, Escape = last (gui.cpp).
+void askChoice(GuiContext& ctx, const std::string& message, std::vector<std::string> buttons, std::function<void(int)> onPick);
+// Folder chooser ("Select Folder"); onOk gets an existing or a new (typed) folder path (gui.cpp).
+void chooseFolder(GuiContext& ctx, const std::string& title, const std::string& initial, std::function<void(const std::string&)> onOk);
+// A menu opened from the menu bar: Left/Right and clicking/hovering another title switch menus (gui.cpp).
+// openTitle(index, how) reopens the menu of that title; how = how this menu was opened.
+inline constexpr int kMenuByClick = 0, kMenuByHover = 1, kMenuByKey = 2;
+void showMenuBarMenu(GuiContext& ctx, std::vector<MenuItem> items, Point at, std::vector<Rect> titles, int current,
+                     std::function<void(int, int)> openTitle, int how);
+// Folder of the active song ("" for an unsaved song) (gui.cpp).
+std::string songFolder(GuiContext& ctx);
+
+// Runs proceed() once the active song's unsaved changes are dealt with: asks Save / Don't Save /
+// Cancel when it is modified (Save may go through Save As first) (gui_menubar.cpp).
+void guardUnsavedChanges(GuiContext& ctx, std::function<void()> proceed);
+// Edit command for the focused panel (EditTarget) first, else the fallback command (gui_menubar.cpp).
+// fallback may be null: then a status message says there is nothing to do.
+void runEditCommand(GuiContext& ctx, std::string_view editCmd, const char* fallback);
+
+}  // namespace sq::app::gui

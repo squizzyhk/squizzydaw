@@ -183,10 +183,11 @@ namespace {
 
 class MenuOverlay final : public Overlay {
  public:
-  MenuOverlay(std::vector<MenuItem> items, Point at) {
+  MenuOverlay(std::vector<MenuItem> items, Point at, MenuBarLink link = {}) : bar_(std::move(link)) {
     Level l;
     l.items = std::move(items);
     l.origin = at;
+    if (bar_.how == kMenuByKey) l.hot = firstEnabled(l.items, 0, 1);
     levels_.push_back(std::move(l));
   }
 
@@ -237,7 +238,12 @@ class MenuOverlay final : public Overlay {
   bool onMouse(const WidgetMouse& e) override {
     int li = -1, ii = -1;
     hit(e.x, e.y, li, ii);
+    const int title = li < 0 ? barTitleAt(e.x, e.y) : -1;
     if (e.action == MouseAction::Move || e.action == MouseAction::Hover) {
+      if (title >= 0 && title != bar_.current) {  // hover another menu-bar title: switch menus
+        switchTo(title, kMenuByHover);
+        return true;
+      }
       if (li >= 0) {
         Level& l = levels_[static_cast<size_t>(li)];
         l.hot = ii;
@@ -248,7 +254,9 @@ class MenuOverlay final : public Overlay {
     }
     if (e.action == MouseAction::Down) {
       if (li < 0) {
-        closed = true;  // click outside closes
+        if (title >= 0 && title != bar_.current) switchTo(title, kMenuByClick);  // another menu-bar title
+        else if (title >= 0 && bar_.how == kMenuByHover) bar_.how = kMenuByClick;  // opened by hovering: the click keeps it
+        else closed = true;  // click outside (or a second click on this menu's title) closes
         return true;
       }
       return true;
@@ -264,12 +272,11 @@ class MenuOverlay final : public Overlay {
     Level& l = levels_.back();
     auto step = [&](int dir) {
       const int n = static_cast<int>(l.items.size());
-      for (int t = 0; t < n; ++t) {
-        l.hot = (l.hot + dir + n) % n;
-        if (l.hot < 0) l.hot = 0;
-        const MenuItem& it = l.items[static_cast<size_t>(l.hot)];
-        if (!it.separator && it.enabled) break;
-      }
+      if (n == 0) return;
+      // Nothing highlighted yet: Down starts at the first item, Up at the last one.
+      const int from = l.hot < 0 ? (dir > 0 ? n - 1 : 0) : l.hot;
+      const int next = firstEnabled(l.items, (from + dir + n) % n, dir);
+      if (next >= 0) l.hot = next;
     };
     switch (k) {
       case Key::Escape:
@@ -279,13 +286,16 @@ class MenuOverlay final : public Overlay {
       case Key::Down: step(1); return true;
       case Key::Up: step(-1); return true;
       case Key::Right:
-        if (l.hot >= 0 && !l.items[static_cast<size_t>(l.hot)].submenu.empty()) {
+        if (l.hot >= 0 && !l.items[static_cast<size_t>(l.hot)].submenu.empty() && l.items[static_cast<size_t>(l.hot)].enabled) {
           openSub(levels_.size() - 1, static_cast<size_t>(l.hot));
-          levels_.back().hot = 0;
+          levels_.back().hot = firstEnabled(levels_.back().items, 0, 1);
+        } else if (hasBar()) {
+          switchTo((bar_.current + 1) % static_cast<int>(bar_.titles.size()), kMenuByKey);
         }
         return true;
       case Key::Left:
         if (levels_.size() > 1) levels_.pop_back();
+        else if (hasBar()) switchTo((bar_.current + static_cast<int>(bar_.titles.size()) - 1) % static_cast<int>(bar_.titles.size()), kMenuByKey);
         return true;
       case Key::Enter:
       case Key::Space:
@@ -304,6 +314,26 @@ class MenuOverlay final : public Overlay {
     std::vector<Rect> rows;
     int hot = -1;
   };
+  static int firstEnabled(const std::vector<MenuItem>& items, int start, int dir) {
+    const int n = static_cast<int>(items.size());
+    for (int t = 0, i = start; t < n; ++t, i = (i + dir + n) % n) {
+      const MenuItem& it = items[static_cast<size_t>(i)];
+      if (!it.separator && it.enabled) return i;
+    }
+    return -1;
+  }
+  bool hasBar() const { return bar_.openTitle && !bar_.titles.empty() && bar_.current >= 0; }
+  int barTitleAt(float x, float y) const {
+    if (!hasBar()) return -1;
+    for (size_t i = 0; i < bar_.titles.size(); ++i)
+      if (bar_.titles[i].contains(x, y)) return static_cast<int>(i);
+    return -1;
+  }
+  void switchTo(int index, int how) {
+    auto open = bar_.openTitle;
+    after = [open, index, how] { open(index, how); };
+    closed = true;
+  }
   void hit(float x, float y, int& li, int& ii) {
     li = ii = -1;
     for (size_t l = levels_.size(); l-- > 0;) {
@@ -335,6 +365,7 @@ class MenuOverlay final : public Overlay {
   }
   std::vector<Level> levels_;
   Rect vp_;
+  MenuBarLink bar_;
 };
 
 // ---- Prompt / Confirm ---------------------------------------------------------------------------
@@ -430,6 +461,60 @@ class ConfirmOverlay final : public Overlay {
   int hot_ = 0;
 };
 
+class ChoiceOverlay final : public Overlay {
+ public:
+  ChoiceOverlay(std::string msg, std::vector<std::string> buttons, std::function<void(int)> pick)
+      : msg_(std::move(msg)), buttons_(std::move(buttons)), pick_(std::move(pick)) {
+    if (buttons_.empty()) buttons_.push_back("OK");
+  }
+  void paint(Canvas& c, const Palette& p, const Rect& vp) override {
+    float bw = 0;
+    for (const auto& b : buttons_) bw = std::max(bw, c.measureText(b, 12) + 28);
+    bw = std::max(bw, 90.0f);
+    const float need = static_cast<float>(buttons_.size()) * (bw + 10) + 22;
+    box_ = centered(vp, std::max(460.0f, std::max(need, c.measureText(msg_, 13) + 40)), 150);
+    dialogFrame(c, p, vp, box_, "Squizzy Studio");
+    c.drawText(msg_, Rect{box_.x + 16, box_.y + 42, box_.w - 32, 54}, p.text, 13);
+    rects_.assign(buttons_.size(), Rect{});
+    float x = box_.right() - 16 - bw;
+    for (size_t i = buttons_.size(); i-- > 0;) {  // the last button (Cancel) at the right
+      rects_[i] = Rect{x, box_.bottom() - 44, bw, 28};
+      x -= bw + 10;
+    }
+    for (size_t i = 0; i < buttons_.size(); ++i) draw::button(c, p, rects_[i], buttons_[i], hot_ == static_cast<int>(i), static_cast<int>(i) == focus_, p.accent);
+  }
+  bool onMouse(const WidgetMouse& e) override {
+    hot_ = -1;
+    for (size_t i = 0; i < rects_.size(); ++i)
+      if (rects_[i].contains(e.x, e.y)) hot_ = static_cast<int>(i);
+    if (e.action == MouseAction::Up && hot_ >= 0) choose(hot_);
+    return true;
+  }
+  bool onKey(Key k, unsigned mods) override {
+    const int n = static_cast<int>(buttons_.size());
+    if (k == Key::Enter || k == Key::Space) choose(focus_);
+    else if (k == Key::Right || (k == Key::Tab && !(mods & sq::ui::kModShift))) focus_ = (focus_ + 1) % n;
+    else if (k == Key::Left || k == Key::Tab) focus_ = (focus_ + n - 1) % n;
+    else if (k == Key::Escape) choose(static_cast<int>(buttons_.size()) - 1);
+    return true;
+  }
+
+ private:
+  void choose(int i) {
+    auto cb = pick_;
+    after = [cb, i] {
+      if (cb) cb(i);
+    };
+    closed = true;
+  }
+  std::string msg_;
+  std::vector<std::string> buttons_;
+  std::function<void(int)> pick_;
+  Rect box_;
+  std::vector<Rect> rects_;
+  int hot_ = -1, focus_ = 0;  // focus_: keyboard choice (Enter), starts on the first button
+};
+
 // ---- File chooser -------------------------------------------------------------------------------
 std::string lower(std::string s) {
   for (char& ch : s) ch = static_cast<char>((ch >= 'A' && ch <= 'Z') ? ch - 'A' + 'a' : ch);
@@ -452,12 +537,16 @@ std::string parentDir(const std::string& d) {
 
 class FileOverlay final : public Overlay {
  public:
-  FileOverlay(bool save, std::string title, std::vector<std::string> exts, const std::string& initial, std::function<void(const std::string&)> ok)
-      : save_(save), title_(std::move(title)), exts_(std::move(exts)), ok_(std::move(ok)) {
+  FileOverlay(bool save, std::string title, std::vector<std::string> exts, const std::string& initial, std::function<void(const std::string&)> ok,
+              bool folder = false)
+      : save_(save || folder), folder_(folder), title_(std::move(title)), exts_(std::move(exts)), ok_(std::move(ok)) {
     std::string init = normSlashes(initial);
     std::string dir;
     if (!init.empty() && sq_fs_is_dir(init.c_str())) {
       dir = init;
+    } else if (!init.empty() && folder_) {  // a folder that does not exist yet: start in its parent
+      dir = parentDir(init);
+      if (!sq_fs_is_dir(dir.c_str())) dir.clear();
     } else if (!init.empty()) {
       dir = parentDir(init);
       size_t k = init.find_last_of('/');
@@ -498,21 +587,47 @@ class FileOverlay final : public Overlay {
     if (entries_.empty()) c.drawText(error_.empty() ? "(empty)" : error_, Rect{list_.x + 10, list_.y + 6, list_.w - 20, 20}, p.faint, 12);
     c.popClip();
     const float fy = list_.bottom() + 12;
-    c.drawText(save_ ? "File name" : "File", Rect{box_.x + 16, fy, 80, 28}, p.dim, 12);
+    c.drawText(folder_ ? "New folder" : save_ ? "File name" : "File", Rect{box_.x + 16, fy, 80, 28}, p.dim, 12);
     field_ = Rect{box_.x + 96, fy, box_.w - 112, 28};
-    name_.paint(c, p, field_, true);
-    if (!exts_.empty()) {
+    name_.paint(c, p, field_, confirm_.empty());
+    if (folder_) {
+      c.drawText("Select Folder uses the folder shown above (or the selected / typed one).", Rect{box_.x + 16, box_.bottom() - 42, box_.w - 260, 26},
+                 p.faint, 11.5f);
+    } else if (!exts_.empty()) {
       std::string f = "Types: ";
       for (size_t i = 0; i < exts_.size(); ++i) f += (i ? ", ." : ".") + exts_[i];
       c.drawText(f, Rect{box_.x + 16, box_.bottom() - 42, box_.w / 2, 26}, p.faint, 11.5f);
     }
-    okR_ = Rect{box_.right() - 16 - 100, box_.bottom() - 44, 100, 28};
+    okR_ = Rect{box_.right() - 16 - 110, box_.bottom() - 44, 110, 28};
     cancelR_ = Rect{okR_.x - 110, okR_.y, 100, 28};
     draw::button(c, p, cancelR_, "Cancel", hot_ == kCancel, false, p.accent);
-    draw::button(c, p, okR_, save_ ? "Save" : "Open", hot_ == kOk, true, p.accent);
+    draw::button(c, p, okR_, folder_ ? "Select Folder" : save_ ? "Save" : "Open", hot_ == kOk, true, p.accent);
+    if (!confirm_.empty()) {  // "already exists - replace?" on top of the chooser
+      c.fillRoundRect(box_, 8, Color{0, 0, 0, 0.35f});
+      const Rect q = centered(box_, 460, 130);
+      c.fillRoundRect(Rect{q.x + 2, q.y + 4, q.w, q.h}, 8, Color{0, 0, 0, 0.35f});
+      c.fillRoundRect(q, 8, p.panel2);
+      c.strokeRoundRect(q, 8, p.panel3, 1);
+      c.drawTextBold("Replace file?", Rect{q.x + 16, q.y + 10, q.w - 32, 22}, p.text, 14);
+      const size_t k = confirm_.find_last_of('/');
+      c.drawText((k == std::string::npos ? confirm_ : confirm_.substr(k + 1)) + " already exists. Replace it?", Rect{q.x + 16, q.y + 40, q.w - 32, 30},
+                 p.text, 13);
+      replaceR_ = Rect{q.right() - 16 - 100, q.bottom() - 42, 100, 28};
+      keepR_ = Rect{replaceR_.x - 110, replaceR_.y, 100, 28};
+      draw::button(c, p, keepR_, "Cancel", hot_ == kKeep, false, p.accent);
+      draw::button(c, p, replaceR_, "Replace", hot_ == kReplace, true, p.accent);
+    }
   }
 
   bool onMouse(const WidgetMouse& e) override {
+    if (!confirm_.empty()) {
+      hot_ = replaceR_.contains(e.x, e.y) ? kReplace : keepR_.contains(e.x, e.y) ? kKeep : 0;
+      if (e.action == MouseAction::Up) {
+        if (hot_ == kReplace) finish(confirm_);
+        else if (hot_ == kKeep) confirm_.clear();
+      }
+      return true;
+    }
     hot_ = upR_.contains(e.x, e.y) ? kUp : homeR_.contains(e.x, e.y) ? kHome : okR_.contains(e.x, e.y) ? kOk : cancelR_.contains(e.x, e.y) ? kCancel : 0;
     hotRow_ = -1;
     for (size_t i = 0; i < rows_.size(); ++i)
@@ -548,6 +663,11 @@ class FileOverlay final : public Overlay {
     }
   }
   bool onKey(Key k, unsigned mods) override {
+    if (!confirm_.empty()) {
+      if (k == Key::Enter) finish(confirm_);
+      else if (k == Key::Escape) confirm_.clear();
+      return true;
+    }
     switch (k) {
       case Key::Escape: closed = true; return true;
       case Key::Enter: accept(); return true;
@@ -567,13 +687,13 @@ class FileOverlay final : public Overlay {
     }
   }
   bool onChar(uint32_t ch, unsigned mods) override {
-    if (ch == 13 || ch == 27 || ch == 9) return true;
+    if (ch == 13 || ch == 27 || ch == 9 || !confirm_.empty()) return true;
     name_.chr(ch, mods);
     return true;
   }
 
  private:
-  enum { kUp = 1, kHome, kOk, kCancel };
+  enum { kUp = 1, kHome, kOk, kCancel, kReplace, kKeep };
   struct Entry {
     std::string name;
     bool dir;
@@ -616,7 +736,7 @@ class FileOverlay final : public Overlay {
     dir_ = dir;
     entries_.clear();
     for (auto& en : list)
-      if (en.dir || accepts(en.name)) entries_.push_back(en);
+      if (en.dir || (!folder_ && accepts(en.name))) entries_.push_back(en);
     std::sort(entries_.begin(), entries_.end(), [](const Entry& a, const Entry& b) {
       if (a.dir != b.dir) return a.dir;
       return lower(a.name) < lower(b.name);
@@ -626,6 +746,17 @@ class FileOverlay final : public Overlay {
   }
   void accept() {
     std::string n = normSlashes(name_.text);
+    if (folder_) {  // the typed folder (may be new), else the selected subfolder, else the current one
+      const bool sel = selected_ >= 0 && selected_ < static_cast<int>(entries_.size());
+      std::string full = n.empty() ? (sel ? join(dir_, entries_[static_cast<size_t>(selected_)].name) : dir_)
+                                   : ((n[0] == '/' || (n.size() > 2 && n[1] == ':')) ? n : join(dir_, n));
+      if (sq_fs_exists(full.c_str()) && !sq_fs_is_dir(full.c_str())) {
+        error_ = "not a folder: " + full;
+        return;
+      }
+      finish(full);
+      return;
+    }
     if (n.empty()) {
       if (selected_ >= 0 && selected_ < static_cast<int>(entries_.size()) && entries_[static_cast<size_t>(selected_)].dir)
         load(join(dir_, entries_[static_cast<size_t>(selected_)].name));
@@ -643,14 +774,25 @@ class FileOverlay final : public Overlay {
       error_ = "not found: " + full;
       return;
     }
+    if (save_ && sq_fs_is_file(full.c_str())) {  // ask before overwriting
+      confirm_ = full;
+      hot_ = 0;
+      return;
+    }
+    finish(full);
+  }
+  void finish(const std::string& full) {
     auto cb = ok_;
     after = [cb, full] {
       if (cb) cb(full);
     };
+    confirm_.clear();
     closed = true;
   }
 
-  bool save_;
+  bool save_, folder_;
+  std::string confirm_;  // existing file waiting for "Replace?"
+  Rect replaceR_, keepR_;
   std::string title_;
   std::vector<std::string> exts_;
   std::function<void(const std::string&)> ok_;
@@ -665,6 +807,15 @@ class FileOverlay final : public Overlay {
 }  // namespace
 
 std::unique_ptr<Overlay> makeMenuOverlay(std::vector<MenuItem> items, Point at) { return std::make_unique<MenuOverlay>(std::move(items), at); }
+std::unique_ptr<Overlay> makeMenuBarOverlay(std::vector<MenuItem> items, Point at, MenuBarLink link) {
+  return std::make_unique<MenuOverlay>(std::move(items), at, std::move(link));
+}
+std::unique_ptr<Overlay> makeChoiceOverlay(const std::string& message, std::vector<std::string> buttons, std::function<void(int)> onPick) {
+  return std::make_unique<ChoiceOverlay>(message, std::move(buttons), std::move(onPick));
+}
+std::unique_ptr<Overlay> makeFolderOverlay(const std::string& title, const std::string& initial, std::function<void(const std::string&)> onOk) {
+  return std::make_unique<FileOverlay>(true, title, std::vector<std::string>{}, initial, std::move(onOk), true);
+}
 std::unique_ptr<Overlay> makePromptOverlay(const std::string& title, const std::string& initial, std::function<void(const std::string&)> onOk) {
   return std::make_unique<PromptOverlay>(title, initial, std::move(onOk));
 }
