@@ -14,7 +14,7 @@ int runGui(Shell& shell, int quitAfterMs);
 //   script: file path or inline text; one op per line or ';'-separated:
 //     click X Y [ctrl|shift|alt]   rclick X Y   dclick X Y   move X Y   down X Y   up X Y
 //     drag X1 Y1 X2 Y2 [mods]      wheel X Y NOTCHES [mods]   key NAME [mods]   char C [mods]
-//     type TEXT   run Cat.Name k=v ...   idle MS   shot FILE.png   print
+//     type TEXT   run Cat.Name k=v ...   idle MS   shot FILE.png   print   drop X Y PATH (file drop on the arrange)
 //   coordinates in DIPs (window pixels at scale 1).
 struct GuiRunOptions {
   std::string screenshot;  // final screenshot (optional)

@@ -3,6 +3,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "gui_context.hpp"
 
@@ -30,5 +31,12 @@ std::vector<MenuItem> buildMainMenu(GuiContext& ctx, const std::string& title);
 // Global keyboard shortcuts not consumed by a focused panel (gui_menubar.cpp). True if handled.
 bool handleShortcutKey(GuiContext& ctx, Key k, unsigned mods);
 bool handleShortcutChar(GuiContext& ctx, uint32_t ch, unsigned mods);
+
+// File drop onto the arrange view (gui_arrange.cpp), called by the browser on mouse up over the
+// arrange widget (root->findByName("arrange")). Audio files become a clip at the snapped position on
+// the audio track under the point (or a new audio track); .mid files are imported as a MIDI clip.
+bool arrangeDropFile(Widget* arrange, float x, float y, const std::string& path);  // x,y in DIPs (tree coords); true if consumed
+// Optional hover feedback while a browser file is dragged over the arrange (x,y in DIPs).
+void arrangeDragOver(Widget* arrange, float x, float y);
 
 }  // namespace sq::app::gui
