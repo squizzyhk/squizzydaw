@@ -58,6 +58,7 @@ class Splitter final : public Widget {
   std::string giveName;
   float giveMin = 120;
   float sign = 1, minSize = 80, maxSize = 2000;
+  std::function<void(float)> onSize;  // the size a drag chose
   void paint(Canvas& c) override {
     const Rect& f = frame();
     c.fillRect(f, ctx_.palette().border);
@@ -84,6 +85,7 @@ class Splitter final : public Widget {
           const float sz = std::clamp(startSize_ + d, std::min(minSize, hi), hi);
           if (vertical_) t->style.width = Dim::pt(sz);
           else t->style.height = Dim::pt(sz);
+          if (onSize) onSize(sz);
           ctx_.invalidate();
         }
         return true;
@@ -206,6 +208,7 @@ class Gui final : public GuiContext {
   uint64_t serial_ = 1;
   BottomPanel bottom_ = BottomPanel::Mixer;
   bool bottomVisible_ = true;
+  float bottomPref_ = -1;  // bottom panel height chosen by a splitter drag (-1 = automatic)
   bool browserVisible_ = true;
   sq_guid editorClip_{};
   std::string dragged_;
@@ -373,6 +376,7 @@ class Gui final : public GuiContext {
         s->maxSize = 2000;
         s->giveName = "middle";
         s->giveMin = 180;  // toolbar + ruler + one track row stay visible
+        s->onSize = [this](float v) { bottomPref_ = v; };
         return s;
       });
       skin->registerWidget("VSplitter", [this] {
@@ -418,6 +422,18 @@ class Gui final : public GuiContext {
   }
 
   static float measureDip(std::string_view t, float size);
+
+  // Bottom panel height for a window hBody DIPs tall: the dragged size, else 380 DIP but at most
+  // 55% of the space under the transport, and never so tall that the arrange view drops below
+  // its 180 DIP minimum (small windows, 150-200% scaling).
+  void fitBottomPanel(float h) {
+    Widget* b = tree.findByName("bottom");
+    if (!b) return;
+    const float avail = h - 28 - 52 - 24 - 4;  // menu bar, transport, status bar, splitter
+    float want = bottomPref_ > 0 ? bottomPref_ : std::min(380.0f, avail * 0.55f);
+    want = std::min(want, std::max(120.0f, avail - 180.0f));
+    b->style.height = Dim::pt(std::max(want, 28.0f));
+  }
 
   void applyPanels() {
     if (!tree.root()) return;
@@ -505,6 +521,7 @@ class Gui final : public GuiContext {
   // ---- input ----
   void layoutAndPaint(IRenderer& r) {
     tree.setScale(r.scale());
+    fitBottomPanel(static_cast<float>(r.size().height) / r.scale());
     tree.layout(static_cast<float>(r.size().width), static_cast<float>(r.size().height));
     viewW_ = static_cast<float>(r.size().width) / r.scale();
     viewH_ = static_cast<float>(r.size().height) / r.scale();
