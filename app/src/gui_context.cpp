@@ -167,6 +167,8 @@ sq_guid GuiContext::selectedTrack() {
   sq_guid t = editState().track;
   if (sq_guid_is_null(&t)) {
     auto ts = tracks();
+    for (const auto& tv : ts)
+      if (tv.info.kind != SQ_TRACK_MASTER) return tv.id;
     if (!ts.empty()) t = ts.front().id;
   }
   return t;
