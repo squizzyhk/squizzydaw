@@ -166,8 +166,8 @@ SQ_TEST("convert: float32/float64 in both byte orders") {
 
 SQ_TEST("convert: interleaved stride touches only its channel") {
   // 3 interleaved channels of i16; write channel 1 only.
-  int16_t frame[3 * 4];
-  for (auto& s : frame) s = 0x1111;
+  // Heap buffer: MSVC's static buffer-overrun check (C4789) misjudges the strided writes on a stack array.
+  std::vector<int16_t> frame(3 * 4, int16_t(0x1111));
   const float ch[4] = {0.5f, -0.5f, 0.25f, 0.0f};
   fromFloat(SampleLayout{SampleKind::I16, false}, ch, &frame[1], 3 * 2, 4);
   for (int i = 0; i < 4; ++i) {
