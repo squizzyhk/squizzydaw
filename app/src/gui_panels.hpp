@@ -19,6 +19,12 @@ std::unique_ptr<Widget> makeDeviceRack(GuiContext& ctx);    // <DeviceRack>   gu
 // Drop of a browser file onto the arrange view (x, y in DIPs, tree coordinates). True if consumed.
 bool arrangeDropFile(Widget* arrange, float x, float y, const std::string& path);
 
+// "Add insert" menu for a track: built-in effects by category + scanned plugin effects
+// (gui_browser_devices.cpp).
+std::vector<MenuItem> buildInsertMenu(GuiContext& ctx, const sq_guid& track);
+// "Choose instrument" menu for an instrument track (gui_browser_devices.cpp).
+std::vector<MenuItem> buildInstrumentMenu(GuiContext& ctx, const sq_guid& track);
+
 // Menu entries shared by the menu bar and context menus (gui_menubar.cpp).
 std::vector<MenuItem> buildMainMenu(GuiContext& ctx, const std::string& title);
 // Global keyboard shortcuts not consumed by a focused panel (gui_menubar.cpp). True if handled.

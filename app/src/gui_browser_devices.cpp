@@ -13,4 +13,13 @@ std::vector<DeviceEntry> browserDeviceEntries() { return {}; }
 
 void browserUseDevice(GuiContext& ctx, const DeviceEntry& d) { ctx.setStatus("cannot add " + d.name); }
 
+std::vector<MenuItem> buildInsertMenu(GuiContext& ctx, const sq_guid& track) {
+  (void)ctx, (void)track;
+  return {};
+}
+std::vector<MenuItem> buildInstrumentMenu(GuiContext& ctx, const sq_guid& track) {
+  (void)ctx, (void)track;
+  return {};
+}
+
 }  // namespace sq::app::gui

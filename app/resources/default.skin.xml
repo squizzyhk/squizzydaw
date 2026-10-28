@@ -19,7 +19,7 @@
         <Arrange name="arrange" grow="1" shrink="1"/>
       </View>
       <HSplitter name="bottomSplit" height="4"/>
-      <View name="bottom" direction="column" height="320">
+      <View name="bottom" direction="column" height="380">
         <PanelTabs name="tabs" height="28"/>
         <Mixer name="mixer" grow="1"/>
         <ClipEditor name="editor" grow="1"/>
