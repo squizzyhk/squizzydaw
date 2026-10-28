@@ -262,6 +262,8 @@ bool carriesGeneration(CmdType t) noexcept {
     case CmdType::Record:
     case CmdType::LowLatency:
     case CmdType::MasterVolume:
+    case CmdType::MasterPan:
+    case CmdType::MasterMute:
     case CmdType::MidiCapture: return false;
     default: return true;
   }
@@ -359,6 +361,12 @@ void EngineCore::apply(const Command& c) noexcept {
     case CmdType::MasterVolume:
       if (cur_) cur_->setMasterVolume(static_cast<float>(c.value));
       break;
+    case CmdType::MasterPan:
+      if (cur_) cur_->setMasterPan(static_cast<float>(c.value));
+      break;
+    case CmdType::MasterMute:
+      if (cur_) cur_->setMasterMute(c.value != 0.0);
+      break;
     default: {
       if (!cur_ || c.generation != cur_->generation()) break;
       if (c.type == CmdType::MasterParam) {
@@ -368,11 +376,15 @@ void EngineCore::apply(const Command& c) noexcept {
       if (c.index < 0) break;
       const size_t i = static_cast<size_t>(c.index);
       if (c.type == CmdType::BusVolume || c.type == CmdType::BusMute || c.type == CmdType::BusPan || c.type == CmdType::BusParam ||
-          c.type == CmdType::BusSendLevel) {
+          c.type == CmdType::BusSendLevel || c.type == CmdType::BusSolo) {
         if (i >= cur_->busCount()) break;
         if (c.type == CmdType::BusVolume) cur_->bus(i).setVolume(static_cast<float>(c.value));
         else if (c.type == CmdType::BusMute) cur_->bus(i).setMute(c.value != 0.0);
         else if (c.type == CmdType::BusPan) cur_->bus(i).setPan(static_cast<float>(c.value));
+        else if (c.type == CmdType::BusSolo) {
+          cur_->bus(i).setSolo(c.value != 0.0);
+          cur_->updateSolo();
+        }
         else if (c.type == CmdType::BusParam) cur_->setBusParam(i, static_cast<int32_t>(c.a), static_cast<uint32_t>(c.b), static_cast<float>(c.value));
         else cur_->setBusSendLevel(i, static_cast<size_t>(c.a), static_cast<float>(c.value));
         break;
@@ -818,6 +830,7 @@ bool AudioEngine::applyMixChanges(const GraphDesc& next) {
     if (o.volume != n.volume) add(CmdType::BusVolume, static_cast<int64_t>(b), n.volume);
     if (o.mute != n.mute) add(CmdType::BusMute, static_cast<int64_t>(b), n.mute ? 1.0 : 0.0);
     if (o.pan != n.pan) add(CmdType::BusPan, static_cast<int64_t>(b), n.pan);
+    if (o.solo != n.solo) add(CmdType::BusSolo, static_cast<int64_t>(b), n.solo ? 1.0 : 0.0);
     if (!params(CmdType::BusParam, static_cast<int64_t>(b), o.insertParams, n.insertParams, n.inserts)) return false;
     for (size_t k = 0; k < n.sends.size(); ++k)
       if (o.sends[k].level != n.sends[k].level) add(CmdType::BusSendLevel, static_cast<int64_t>(b), n.sends[k].level, static_cast<int64_t>(k));
@@ -827,6 +840,18 @@ bool AudioEngine::applyMixChanges(const GraphDesc& next) {
     Command c;
     c.type = CmdType::MasterVolume;
     c.value = next.masterVolume;
+    cmds.push_back(c);
+  }
+  if (desc_.masterPan != next.masterPan) {
+    Command c;
+    c.type = CmdType::MasterPan;
+    c.value = next.masterPan;
+    cmds.push_back(c);
+  }
+  if (desc_.masterMute != next.masterMute) {
+    Command c;
+    c.type = CmdType::MasterMute;
+    c.value = next.masterMute ? 1.0 : 0.0;
     cmds.push_back(c);
   }
   const bool autoChanged = !sameAutomation(desc_.automation.get(), next.automation.get());

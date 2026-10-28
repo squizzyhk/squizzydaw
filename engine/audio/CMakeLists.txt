@@ -5,6 +5,7 @@ sq_add_library(NAME sqengine_audio
   SOURCES
     src/processor.cpp
     src/nodes.cpp
+    src/resample.cpp
     src/graph.cpp
     src/render_thread.cpp
     src/devices.cpp
@@ -50,3 +51,4 @@ sq_add_test(NAME engine_audio_instruments SOURCES tests/test_instruments.cpp LIB
 sq_add_test(NAME engine_audio_builtin SOURCES tests/test_builtin.cpp LIBS ${_ea_libs})
 sq_add_test(NAME engine_audio_builtin_dsp SOURCES tests/test_builtin_dsp.cpp LIBS ${_ea_libs})
 sq_add_test(NAME engine_audio_builtin_rtsafety SOURCES tests/test_builtin_rtsafety.cpp LIBS ${_ea_libs})
+sq_add_test(NAME engine_audio_mixfix SOURCES tests/test_mixfix.cpp LIBS ${_ea_libs})

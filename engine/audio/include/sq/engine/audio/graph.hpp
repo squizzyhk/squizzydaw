@@ -168,6 +168,7 @@ struct BusDesc {
   float volume = 1.0f;
   float pan = 0.0f;
   bool mute = false;
+  bool solo = false;                   // see SOLO in Graph::updateSolo
   int32_t output = -1;                 // bus index, -1 = master
   int32_t meterSlot = -1;
 };
@@ -179,6 +180,8 @@ struct GraphDesc {
   std::vector<ProcessorProto> masterInserts;
   std::vector<ParamList> masterInsertParams;
   float masterVolume = 1.0f;
+  float masterPan = 0.0f;              // -1..1 (stereo balance law, like a bus)
+  bool masterMute = false;             // silences the mix (not the metronome click)
   int32_t masterMeterSlot = 0;
   std::vector<TempoSegment> tempo;     // empty = 120 bpm from frame 0
   uint32_t numerator = 4;
@@ -238,9 +241,11 @@ class TrackProcessor final : public AudioProcessor {
   bool solo() const noexcept { return solo_; }
   bool monitor() const noexcept { return monitor_; }
   bool liveMidi() const noexcept { return liveMidi_; }
-  // False when muted (static or automated) or silenced by another track's solo (applies to the
-  // fast lane and to sends too).
-  bool audible() const noexcept { return !(hasAutoMute_ ? autoMute_ : mute_) && !soloSilenced_; }
+  // Main output (and fast lane): false when muted (static or automated) or silenced by a solo
+  // elsewhere (Graph::updateSolo).
+  bool audible() const noexcept { return unmuted() && !soloSilenced_; }
+  // Not muted (static or automated): gates the sends (each send has its own solo gate).
+  bool unmuted() const noexcept { return !(hasAutoMute_ ? autoMute_ : mute_); }
   const TrackDesc& desc() const noexcept { return desc_; }
   uint32_t channels() const noexcept { return desc_.channels; }
   // Post-insert, pre-fader buffer of the last process() call.
@@ -305,14 +310,23 @@ class SubMixProcessor final : public AudioProcessor {
   void setVolume(float v) noexcept { volume_ = v; }
   void setPan(float p) noexcept { pan_ = p; }
   void setMute(bool m) noexcept { mute_ = m; }
+  void setSolo(bool s) noexcept { solo_ = s; }
+  // Main output silenced by a solo elsewhere (Graph::updateSolo); sends are gated per edge.
+  void setSoloSilenced(bool s) noexcept { soloSilenced_ = s; }
   void setAutoVolume(float v) noexcept { autoVolume_ = v, hasAutoVolume_ = true; }
   void setAutoPan(float p) noexcept { autoPan_ = p, hasAutoPan_ = true; }
   void setAutoMute(bool m) noexcept { autoMute_ = m, hasAutoMute_ = true; }
   void clearAutomation() noexcept { hasAutoVolume_ = hasAutoPan_ = hasAutoMute_ = false; }
   float volume() const noexcept { return volume_; }
+  float pan() const noexcept { return pan_; }
+  bool mute() const noexcept { return mute_; }
+  bool solo() const noexcept { return solo_; }
   float effectiveVolume() const noexcept { return hasAutoVolume_ ? autoVolume_ : volume_; }
   float effectivePan() const noexcept { return hasAutoPan_ ? autoPan_ : pan_; }
-  bool audible() const noexcept { return !(hasAutoMute_ ? autoMute_ : mute_); }
+  // Not muted (static or automated): gates the sends (with their own solo gate).
+  bool unmuted() const noexcept { return !(hasAutoMute_ ? autoMute_ : mute_); }
+  // Main output audible: not muted and not silenced by a solo.
+  bool audible() const noexcept { return unmuted() && !soloSilenced_; }
   uint32_t channels() const noexcept { return channels_; }
   void setMix64(bool on) noexcept { mix64_ = on; }
   // Post-insert, pre-fader buffer of the last process() call (bus sends).
@@ -325,6 +339,7 @@ class SubMixProcessor final : public AudioProcessor {
   ProcessorChain chain_;
   float volume_, pan_;
   bool mute_;
+  bool solo_ = false, soloSilenced_ = false;
   bool mix64_ = false;
   float autoVolume_ = 1.0f, autoPan_ = 0.0f;
   bool autoMute_ = false, hasAutoVolume_ = false, hasAutoPan_ = false, hasAutoMute_ = false;
@@ -384,7 +399,16 @@ class Graph {
   int32_t findTrack(const sq_guid& id) const noexcept;
   int32_t findBus(const sq_guid& id) const noexcept;
   void setMasterVolume(float v) noexcept { masterVolume_ = v; }
-  void updateSolo() noexcept;  // RT: re-evaluates solo-silencing after solo changes
+  void setMasterPan(float p) noexcept { master_->setPan(p); }
+  void setMasterMute(bool m) noexcept { master_->setMute(m); }
+  // SOLO (RT, allocation-free; call after any track/bus solo change). With nothing soloed every
+  // strip plays. Otherwise an edge (a strip's main output or one of its sends) X -> Y carries
+  // signal only when X is soloed or fed (directly or through buses/sends) by a soloed strip, or
+  // Y is soloed or feeds a soloed bus. So a soloed track is heard with the buses it reaches
+  // (solo-in-place through sends: its FX returns stay audible), a soloed bus is heard with every
+  // track/bus feeding it (only the paths into it: their dry outputs elsewhere are silenced), and
+  // everything else is silent.
+  void updateSolo() noexcept;
   int64_t contentEnd() const noexcept;
   uint32_t maxTail() const noexcept;
   const TempoMapRt& tempo() const noexcept { return tempo_; }
@@ -443,6 +467,7 @@ class Graph {
     std::vector<float*> ptrs;
     float cur[kMaxChannels] = {};
     bool init = false;
+    bool soloSilenced = false;  // updateSolo
   };
   void runSend(Send& s, const float* const* src, uint32_t srcCh, float faderVolume, float pan, bool audible, uint32_t frames) noexcept;
 
@@ -471,6 +496,7 @@ class Graph {
   std::vector<std::vector<float*>> busOutPtrs_;
   std::vector<int32_t> busMeter_;
   std::vector<sq_guid> busIds_;
+  std::vector<uint8_t> busDown_, busUp_;  // updateSolo scratch (fed by / feeds a soloed strip)
 
   std::unique_ptr<SubMixProcessor> master_;
   std::vector<float> masterBuf_;

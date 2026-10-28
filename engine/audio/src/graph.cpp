@@ -379,6 +379,7 @@ SubMixProcessor::SubMixProcessor(uint32_t channels, std::vector<ProcessorProto> 
 ProcessorPtr SubMixProcessor::clone() const {
   auto p = std::make_unique<SubMixProcessor>(channels_, protos_, volume_, pan_, mute_);
   p->setMix64(mix64_);
+  p->setSolo(solo_);
   return p;
 }
 bool SubMixProcessor::prepare(double sr, uint32_t maxFrames, uint32_t outChannels) {
@@ -550,13 +551,17 @@ std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& 
   for (auto& bd : desc.buses) {
     auto bp = std::make_unique<SubMixProcessor>(bd.channels, bd.inserts, bd.volume, bd.pan, bd.mute);
     bp->setMix64(cfg.mix64);
+    bp->setSolo(bd.solo);
     if (!bp->prepare(g->sr_, cfg.maxBlock, destChannels(bd.output))) return fail("bus prepare failed");
     g->buses_.push_back(std::move(bp));
     g->busDest_.push_back(bd.output);
     g->busMeter_.push_back(bd.meterSlot);
     g->busIds_.push_back(bd.id);
   }
-  g->master_ = std::make_unique<SubMixProcessor>(cfg.outputChannels, desc.masterInserts, desc.masterVolume, 0.0f, false);
+  g->busDown_.assign(desc.buses.size(), 0);
+  g->busUp_.assign(desc.buses.size(), 0);
+  g->master_ = std::make_unique<SubMixProcessor>(cfg.outputChannels, desc.masterInserts, desc.masterVolume,
+                                                 std::clamp(desc.masterPan, -1.0f, 1.0f), desc.masterMute);
   g->master_->setMix64(cfg.mix64);
   if (!g->master_->prepare(g->sr_, cfg.maxBlock, cfg.outputChannels)) return fail("master prepare failed");
   g->masterVolume_ = desc.masterVolume;
@@ -699,7 +704,45 @@ int32_t Graph::findBus(const sq_guid& id) const noexcept {
 void Graph::updateSolo() noexcept {
   bool any = false;
   for (auto& t : tracks_) any = any || t->solo();
-  for (auto& t : tracks_) t->setSoloSilenced(any && !t->solo());
+  for (auto& b : buses_) any = any || b->solo();
+  if (!any) {
+    for (auto& t : tracks_) t->setSoloSilenced(false);
+    for (auto& b : buses_) b->setSoloSilenced(false);
+    for (auto& s : sends_) s->soloSilenced = false;
+    return;
+  }
+  const size_t nb = buses_.size();
+  // down: fed by a soloed strip (or soloed). Tracks have no inputs: down(track) = solo.
+  for (size_t b = 0; b < nb; ++b) busDown_[b] = buses_[b]->solo() ? 1 : 0;
+  for (size_t i = 0; i < tracks_.size(); ++i) {
+    if (!tracks_[i]->solo()) continue;
+    if (trackDest_[i] >= 0) busDown_[static_cast<size_t>(trackDest_[i])] = 1;
+    for (uint32_t si : trackSends_[i]) busDown_[static_cast<size_t>(sends_[si]->dest)] = 1;
+  }
+  for (uint32_t b : busOrder_) {  // inputs before consumers
+    if (!busDown_[b]) continue;
+    if (busDest_[b] >= 0) busDown_[static_cast<size_t>(busDest_[b])] = 1;
+    for (uint32_t si : busSends_[b]) busDown_[static_cast<size_t>(sends_[si]->dest)] = 1;
+  }
+  // up: feeds a soloed bus (or soloed); consumers before inputs.
+  for (size_t k = nb; k-- > 0;) {
+    const uint32_t b = busOrder_[k];
+    uint8_t u = buses_[b]->solo() ? 1 : 0;
+    if (busDest_[b] >= 0) u = static_cast<uint8_t>(u | busUp_[static_cast<size_t>(busDest_[b])]);
+    for (uint32_t si : busSends_[b]) u = static_cast<uint8_t>(u | busUp_[static_cast<size_t>(sends_[si]->dest)]);
+    busUp_[b] = u;
+  }
+  auto destUp = [&](int32_t d) { return d >= 0 && busUp_[static_cast<size_t>(d)] != 0; };
+  for (size_t i = 0; i < tracks_.size(); ++i) {
+    const bool src = tracks_[i]->solo();
+    tracks_[i]->setSoloSilenced(!(src || destUp(trackDest_[i])));
+    for (uint32_t si : trackSends_[i]) sends_[si]->soloSilenced = !(src || destUp(sends_[si]->dest));
+  }
+  for (size_t b = 0; b < nb; ++b) {
+    const bool src = busDown_[b] != 0;
+    buses_[b]->setSoloSilenced(!(src || destUp(busDest_[b])));
+    for (uint32_t si : busSends_[b]) sends_[si]->soloSilenced = !(src || destUp(sends_[si]->dest));
+  }
 }
 
 int64_t Graph::contentEnd() const noexcept {
@@ -848,7 +891,7 @@ void Graph::sumInto(int32_t dest, float* const* src, uint32_t ch, uint32_t frame
 
 void Graph::runSend(Send& s, const float* const* src, uint32_t srcCh, float faderVolume, float pan, bool audible, uint32_t frames) noexcept {
   const float level = s.hasAuto ? s.autoLevel : s.level;
-  const float vol = audible ? level * (s.pre ? 1.0f : faderVolume) : 0.0f;
+  const float vol = audible && !s.soloSilenced ? level * (s.pre ? 1.0f : faderVolume) : 0.0f;
   const uint32_t ch = static_cast<uint32_t>(s.ptrs.size());
   applyFaderPan(src, srcCh, s.ptrs.data(), ch, frames, vol, s.pre ? 0.0f : pan, s.cur, &s.init);
   s.comp.process(s.ptrs.data(), ch, frames);
@@ -863,6 +906,8 @@ void Graph::process(const ProcessContext& ctx, float* const* out, uint32_t outCh
   if (!ctx.timelineExplicit) c2.timelineFrame = ctx.outputFrame + static_cast<int64_t>(latency_);
   c2.midi = nullptr;
   c2.midiCount = 0;
+  // song tempo at the block start (read position: what sources and inserts process)
+  c2.tempo = tempo_.bpmAt(c2.timelineFrame);
 
   if (ctx.playing) applyAutomation(c2);
   else if (automating_) endAutomation();
@@ -883,7 +928,7 @@ void Graph::process(const ProcessContext& ctx, float* const* out, uint32_t outCh
       for (uint32_t c = 0; c < stemChannels_[i]; ++c) std::memcpy(stemPtrs_[i][c], src[c], sizeof(float) * n);
       stemDelay_[i].process(stemPtrs_[i].data(), stemChannels_[i], n);
     }
-    for (uint32_t si : trackSends_[i]) runSend(*sends_[si], t.preFader(), t.channels(), t.effectiveVolume(), t.effectivePan(), t.audible(), n);
+    for (uint32_t si : trackSends_[i]) runSend(*sends_[si], t.preFader(), t.channels(), t.effectiveVolume(), t.effectivePan(), t.unmuted(), n);
     trackComp_[i].process(to, ch, n);
     sumInto(trackDest_[i], to, ch, n);
   }
@@ -894,7 +939,7 @@ void Graph::process(const ProcessContext& ctx, float* const* out, uint32_t outCh
     const uint32_t ch = static_cast<uint32_t>(busOutPtrs_[b].size());
     bus.process(c2, bo, ch);
     meterBlock(meters_, busMeter_[b], bo, ch, n);
-    for (uint32_t si : busSends_[b]) runSend(*sends_[si], bus.preFader(), bus.channels(), bus.effectiveVolume(), bus.effectivePan(), bus.audible(), n);
+    for (uint32_t si : busSends_[b]) runSend(*sends_[si], bus.preFader(), bus.channels(), bus.effectiveVolume(), bus.effectivePan(), bus.unmuted(), n);
     busComp_[b].process(bo, ch, n);
     sumInto(busDest_[b], bo, ch, n);
   }
@@ -908,7 +953,11 @@ void Graph::process(const ProcessContext& ctx, float* const* out, uint32_t outCh
   meterBlock(meters_, masterMeter_, out, nMaster, n);
 
   if (metronome) metronome_.render(ctx.outputFrame, n, out, nOut);
-  if (lowLatencyMonitoring) processFastLane(ctx, out, nOut);
+  if (lowLatencyMonitoring) {
+    ProcessContext fc = ctx;
+    fc.tempo = c2.tempo;
+    processFastLane(fc, out, nOut);
+  }
 }
 
 void Graph::processFastLane(const ProcessContext& ctx, float* const* out, uint32_t outChannels) noexcept {
@@ -935,9 +984,13 @@ void Graph::processFastLane(const ProcessContext& ctx, float* const* out, uint32
     // fast lane is toggled); the gain ramps per track across blocks like the main fader.
     const float vol = t.audible() ? t.effectiveVolume() : 0.0f;
     applyFaderPan(fb, ch, fo, oc, n, vol, t.effectivePan(), &fastGain_[i * kMaxChannels], &fastGainInit_[i]);
-    const float mv = masterVolume_;
-    for (uint32_t c = 0; c < oc; ++c)
-      for (uint32_t k = 0; k < n; ++k) out[c][k] += fo[c][k] * mv;
+    const float mv = master_->audible() ? masterVolume_ : 0.0f;
+    float ml = 1.0f, mr = 1.0f;  // master balance (same law as the master strip)
+    if (oc >= 2) panGainsStereo(master_->pan(), &ml, &mr);
+    for (uint32_t c = 0; c < oc; ++c) {
+      const float g = mv * (c == 0 ? ml : (c == 1 ? mr : 1.0f));
+      for (uint32_t k = 0; k < n; ++k) out[c][k] += fo[c][k] * g;
+    }
   }
 }
 

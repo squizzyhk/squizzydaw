@@ -10,6 +10,7 @@
 #include "sq/cpp/attributes.hpp"
 #include "sq/engine/audio/automation.hpp"
 #include "sq/engine/audio/builtin.hpp"
+#include "sq/engine/audio/resample.hpp"
 
 namespace sq::engine::audio {
 
@@ -24,6 +25,26 @@ sq_result MediaCache::get(IClassRegistry* reg, const std::string& path, MediaPtr
   if (SQ_FAILED(r)) return r;
   map_[path] = m;
   *out = std::move(m);
+  return SQ_OK;
+}
+
+sq_result MediaCache::get(IClassRegistry* reg, const std::string& path, double rate, MediaPtr* out) {
+  MediaPtr m;
+  const sq_result r = get(reg, path, &m);
+  if (SQ_FAILED(r)) return r;
+  if (!(rate > 0.0) || !m || std::fabs(m->sampleRate - rate) < 1e-9) {
+    *out = std::move(m);
+    return SQ_OK;
+  }
+  const auto key = std::make_pair(path, rate);
+  auto it = converted_.find(key);
+  if (it != converted_.end()) {
+    *out = it->second;
+    return SQ_OK;
+  }
+  MediaPtr c = resampleMedia(m, rate);
+  converted_[key] = c;
+  *out = std::move(c);
   return SQ_OK;
 }
 
@@ -252,6 +273,7 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
         b.volume = dbToGain(ti.volume_db);
         b.pan = static_cast<float>(ti.pan);
         b.mute = (ti.flags & SQ_TRACK_MUTE) != 0;
+        b.solo = (ti.flags & SQ_TRACK_SOLO) != 0;
         ChainBuild cb;
         buildChain(sq::getAttrString(props.get(), "user.inserts"), inserts, cb, key, info);
         b.inserts = std::move(cb.protos);
@@ -265,6 +287,8 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
       }
       case SQ_TRACK_MASTER: {
         d.masterVolume = dbToGain(ti.volume_db);
+        d.masterPan = static_cast<float>(std::clamp(ti.pan, -1.0, 1.0));
+        d.masterMute = (ti.flags & SQ_TRACK_MUTE) != 0;
         key += "M:";
         ChainBuild cb;
         buildChain(sq::getAttrString(props.get(), "user.inserts"), inserts, cb, key, info);
@@ -345,7 +369,7 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
             keyNum(key, ci.fade_in_seconds);
             keyNum(key, ci.fade_out_seconds);
             MediaPtr media;
-            if (path.empty() || SQ_FAILED(cache.get(reg, path, &media))) {
+            if (path.empty() || SQ_FAILED(cache.get(reg, path, sr, &media))) {
               key += "miss;";
               if (info) info->warnings.push_back("missing media: " + path);
               continue;
@@ -353,6 +377,7 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
             ClipParams p;
             p.start = s;
             p.length = e - s;
+            // media is at the engine rate (converted by the cache); the offset is source seconds
             p.sourceOffset = static_cast<int64_t>(std::llround(ci.source_offset_seconds * media->sampleRate));
             p.gain = dbToGain(ci.gain_db);
             p.fadeIn = static_cast<int64_t>(std::llround(ci.fade_in_seconds * sr));
