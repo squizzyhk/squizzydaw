@@ -52,6 +52,12 @@ class AudioProcessor {
   // Algorithmic latency in frames (plugin delay compensation). Must be stable after prepare().
   virtual uint32_t latency() const noexcept { return 0; }
   virtual uint32_t tail() const noexcept { return 0; }
+  // Live parameters (built-in devices, plugins). Plain values (ParamInfo ranges, builtin.hpp).
+  // setParameter is RT safe and may be called from the thread that owns the graph between
+  // process() calls; out-of-range indices are ignored.
+  virtual uint32_t parameterCount() const noexcept { return 0; }
+  virtual void setParameter(uint32_t index, float plainValue) noexcept { (void)index, (void)plainValue; }
+  virtual float parameter(uint32_t index) const noexcept { (void)index; return 0.0f; }
 };
 using ProcessorPtr = std::unique_ptr<AudioProcessor>;
 using ProcessorProto = std::shared_ptr<const AudioProcessor>;
