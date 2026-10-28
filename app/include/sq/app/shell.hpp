@@ -24,7 +24,7 @@
 //   Plugins.Rescan full?:bool                    (async; IPluginRegistry::isScanning)
 //   Browser.IndexFolder folder / Browser.Search text? tags? kind? limit?  -> result "count", "first"
 //   Script.Evaluate source / Script.LoadPackage path
-//   Audio.ListDevices driver?:"wasapi|asio|null"  -> result "count", "devices" (id<TAB>name lines);
+//   Audio.ListDevices driver?:"wasapi|asio|alsa|pulse|null"  -> result "count", "devices" (id<TAB>name lines);
 //                                                the message carries the ASIO status reason
 //   Audio.SelectDevice driver device?            writes Devices.Audio.Driver/Device and reopens
 //   UI.SetTheme name                             writes UI.Theme (the resolver follows the setting)
@@ -67,7 +67,7 @@ namespace sq::app {
 struct ShellOptions {
   std::string servicesDir;     // "" = <exe dir>/services
   bool loadServices = true;
-  // Overrides Devices.Audio.Driver: "" (settings) | "none" | "null" | "offline" | "wasapi" | "asio".
+  // Overrides Devices.Audio.Driver: "" (settings) | "none" | "null" | "offline" | "wasapi" | "asio" | "alsa" | "pulse" (Linux).
   std::string audioDriver;
   bool gui = false;            // "auto" driver choice: GUI opens WASAPI, batch modes open nothing
 };

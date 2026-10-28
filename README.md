@@ -36,7 +36,7 @@ SquizzyStudio.exe --audio-driver none --run File.New --run "Track.AddAudio name=
 SquizzyStudio.exe --selftest | --list-classes | --reload-test 25 | --new-guid 3 | --version
 ```
 
-Options: `--audio-driver none|null|offline|wasapi|asio` (default: WASAPI for the window, none for batch modes; also `Devices.Audio.Driver` / `Devices.Audio.Device`), `--settings FILE`, `--services-dir DIR`, `--log-level LEVEL`, `--quit-after MS`.
+Options: `--audio-driver none|null|offline|wasapi|asio|alsa|pulse` (default: WASAPI for the window on Windows, ALSA then Pulse then null on Linux, none for batch modes; also `Devices.Audio.Driver` / `Devices.Audio.Device`), `--settings FILE`, `--services-dir DIR`, `--log-level LEVEL`, `--quit-after MS`.
 
 Window keys: Space play/stop, R record, S split at cursor, L loop, Q quantize, G glue, Delete delete, arrows cursor/track, Ctrl+arrows nudge, Tab next clip, Ctrl+N/S/Z/Y/D/A new/save/undo/redo/duplicate/select all, Home go to start, F5 reload every service module, Esc quit. Every button, key and fader goes through the same command system (`Shell::execute`) the CLI and scripts use.
 
