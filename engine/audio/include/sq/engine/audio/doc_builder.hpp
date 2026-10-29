@@ -24,7 +24,10 @@
 //                           InsertResolver (plugin_fx.hpp); unresolvable specs become warnings. A
 //                           line starting with '!' is BYPASSED (left out of the chain, keeps its
 //                           slot number). Slots (commands, automation "insert.<slot>.<p>") count
-//                           every non-empty line.
+//                           every non-empty line. Every line records its identity
+//                           (TrackDesc::lineKeys: the spec without the bypass marker, canonical,
+//                           state text as a digest; the instrument's in TrackDesc::instrumentKey)
+//                           for the engine's plugin state carry-over (AudioEngine).
 //   sends                -> track property "user.sends": one send per line
 //                           "<bus guid> <level dB> [pre]" (post-fader unless "pre") to a bus/FX
 //                           track, from audio/instrument tracks and buses. Missing destinations and

@@ -37,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sq/sdk.hpp"
@@ -66,6 +67,8 @@ struct Command {
                                 // *Param: a = chain slot (-1 = instrument), b = parameter;
                                 // *SendLevel: a = send index
   void* ptr = nullptr;          // SetAutomation: AutomationData* (ownership passes to the core)
+  bool fastLaneOnly = false;    // TrackParam: the main-chain instance already holds the value
+                                // (AudioEngine::notePluginValues); only the fast-lane copy gets it
 };
 
 // Live MIDI event (short channel message).
@@ -275,6 +278,43 @@ class AudioEngine final : public sq::Object<AudioEngine, IAudioEngine, ITranspor
     sq::Ptr<IPluginInstance> instance;
   };
   std::vector<PluginSlot> pluginSlots();
+  // The plugin instance `inst` (hosted by the newest graph) already holds `values`: it reported
+  // them itself (editor edits, values re-read from it) and the caller is about to write them into
+  // its spec line. The document update that follows then does not send them back to `inst` (an
+  // echo is applied in a later block, after and over a newer edit the plugin made meanwhile),
+  // neither as parameter commands nor through the automation swap that restores an automated
+  // parameter to its lane's new static value (AutoLane::mainHolds); the fast-lane copy of a track
+  // insert, which did not see the edit, still gets them. The installed lanes keep the new static
+  // value, so a later automation stop restores it to every copy as usual. Holds for the next
+  // document update only (any rebuild clears it; so does forgetPluginValues). Instances the newest
+  // graph does not host are ignored.
+  void notePluginValues(IPluginInstance* inst, const ParamList& values);
+  void forgetPluginValues() noexcept { heldValues_.clear(); }
+  // Plugin state carry-over: a recompile hands each plugin's live state to the instance that
+  // replaces it (lines matched by spec identity, see captureStatesInto; never across a switch to
+  // another document), and offline renders start from the live states too. The live state of a
+  // bypassed insert is kept with its line until it is enabled again; that of a removed / replaced
+  // plugin is kept (bounded) for an undo / redo that brings the same line back. Kept count (tests).
+  size_t parkedPluginStates() const noexcept { return parked_.size(); }
+  // Every live state kept with a line that is still in the document but hosts no instance
+  // (bypassed, or its plugin unavailable; only attached states, not those kept for an undo /
+  // redo): what that line's plugin starts from when it is enabled again. node / slot as in
+  // PluginSlot (track / bus id, null = master; slot = the line's index in the node's
+  // "user.inserts"; an instrument is never bypassed, so never listed). Writing these states into
+  // their lines' "s=" tokens (File.Save; the '!' marker kept) is a mix-only edit, after which each
+  // stays kept with its line (re-keyed): enabling the line still restores it.
+  struct KeptPluginState {
+    sq_guid node{};
+    int32_t slot = 0;
+    PluginState state;
+  };
+  std::vector<KeptPluginState> keptPluginStates() const;
+  // Fills d's insertStates / instrumentState / masterInsertStates from the live plugin states for
+  // an OFFLINE graph compiled from `d` (startRender; tests), pairing lines like a recompile but
+  // consuming / parking nothing. Does nothing while the live graph belongs to the previous document.
+  void captureRenderStates(GraphDesc& d) {
+    if (carryNext_) captureStatesInto(d, nullptr);
+  }
 
   // Turns track insert specs (track property "user.inserts") into processors; see plugin_fx.hpp.
   // Takes effect at the next rebuild.
@@ -329,8 +369,13 @@ class AudioEngine final : public sq::Object<AudioEngine, IAudioEngine, ITranspor
   sq_result SQ_CALL addObserver(IObserver* observer) override;
   sq_result SQ_CALL removeObserver(IObserver* observer) override;
 
-  // Called by the document observer (main thread).
-  void onDocumentChanged();
+  // Called by the document observer (main thread) with the kind of the change ("document.changed"
+  // reason "commit" / "undo" / "redo"; any other reason, e.g. "relink", is Other). Only an undo /
+  // redo may give a line coming back the live state its plugin had when the line went away: an
+  // undo the state a commit / redo kept (it reverses that step), a redo the state an undo kept. A
+  // commit drops the states kept for a redo (the document's redo history is gone).
+  enum class DocChange : uint8_t { Commit, Undo, Redo, Other };
+  void onDocumentChanged(DocChange change = DocChange::Other);
 
  private:
   struct NodeLatency {
@@ -338,9 +383,89 @@ class AudioEngine final : public sq::Object<AudioEngine, IAudioEngine, ITranspor
     uint32_t compensation = 0;
   };
   sq_result compileAndInstall();
-  // Captures the plugin states of the newest graph into `d` (keyed by node + slot) so the graph
-  // compiled from `d` starts where the old one left off.
-  void carryPluginStates(GraphDesc& d);
+  // ---- plugin state carry-over (main thread) ----
+  // A node of the graph: track / bus by id, the master (null id). The kind keeps id-less nodes of
+  // descs built without a document apart.
+  enum class NodeKind : uint8_t { Track, Bus, Master };
+  using NodeKey = std::pair<NodeKind, sq_guid>;
+  // One "user.inserts" line of a node as the carry sees it: its identity (TrackDesc::lineKeys),
+  // the chain position of its processor (-1: bypassed / unavailable) and, for a line without one,
+  // the kept state that belongs to it (ParkedState::id, 0 = none). A desc without lineKeys yields
+  // one keyless line per chain entry (they pair in order).
+  struct LineIdent {
+    std::string key;
+    int32_t entry = -1;
+    uint64_t parked = 0;
+  };
+  struct NodeIdent {
+    std::vector<LineIdent> lines;
+    bool hasInstrument = false;
+    std::string instrument;  // TrackDesc::instrumentKey
+  };
+  // The lines and instrument of every node `d` compiles into (no kept states attached).
+  static std::map<NodeKey, NodeIdent> identify(const GraphDesc& d);
+  // Pairs the lines of one node across an edit: result[new line] = old line index or -1. Leading
+  // and trailing runs of identical lines pair by position (a bypass toggle or an edit of one line
+  // leaves every other line, duplicates included, with its own partner); in between, a new line
+  // takes the first unpaired old line with the identical identity, then the first one with the
+  // same specStructure (same plugin, other values / state).
+  static std::vector<int32_t> alignLines(const std::vector<LineIdent>& olds, const std::vector<LineIdent>& news);
+  // Live state of a plugin instance that left the graph. Attached: it belongs to a bypassed /
+  // unavailable line of the installed graph (LineIdent::parked) and returns when that line is
+  // enabled again, whatever edits the line saw meanwhile. Detached: its line was removed (or the
+  // instrument replaced, the node deleted); only an undo / redo that puts the identical line back
+  // at the same index takes it, and only one that reverses the step that detached it: an undo
+  // takes what a commit / redo detached, a redo what an undo detached (byUndo). The undo history
+  // is a stack, so the newest such entry is the one of the step being reversed; an entry detached
+  // by the opposite move (the same line leaving again on the way back) never stands for it.
+  struct ParkedState {
+    uint64_t id = 0;        // increasing: a higher id is newer
+    NodeKey node{};
+    bool instrument = false;
+    bool attached = false;
+    bool byUndo = false;    // detached: by an undo (waits for a redo), else by a commit / redo
+    std::string line;       // identity of the line (instrument spec) it stands for
+    int32_t at = -1;        // detached insert: the line index it left
+    PluginState state;      // carries the plugin id
+  };
+  // Changes to the kept states by one recompile, committed only when its graph is installed.
+  struct ParkMove {         // an existing entry re-attached / detached / re-keyed
+    uint64_t id = 0;
+    bool attached = false;
+    bool byUndo = false;
+    std::string line;
+    int32_t at = -1;
+  };
+  struct ParkPlan {
+    std::vector<uint64_t> consumed;      // handed to the new graph
+    std::vector<ParkMove> moves;
+    std::vector<ParkedState> parks;      // live states of old instances that have no partner
+    std::map<NodeKey, NodeIdent> ident;  // identity of the new graph, kept states attached
+  };
+  // Fills d's insertStates / instrumentState / masterInsertStates so that the graph compiled from
+  // `d` starts where the newest graph left off. Per node the new lines are paired with the
+  // installed ones (alignLines); a new chain entry takes the live state of its partner's instance,
+  // or the state kept for its partner's bypassed line. An instrument takes the old instrument's
+  // state when their specStructures match. Every state handed out gets the new entry's spec values
+  // as PluginState::params, applied over the carried bytes (the document's values win).
+  //   plan != null (recompile): a partner instance whose line is bypassed now is kept attached to
+  //   that line; old instances / kept states without a partner are kept detached; during an undo /
+  //   redo (applying_) an unpaired new line takes the newest detached state of the same node,
+  //   identity and line index that the opposite move detached (ParkedState::byUndo). `plan`
+  //   collects all of it; commitParkPlan applies it once the new graph is installed.
+  //   plan == null (offline render): reads only (saveState of the live instances, kept states);
+  //   nothing is consumed or kept, so a render does not change what the next recompile carries.
+  void captureStatesInto(GraphDesc& d, ParkPlan* plan);
+  void commitParkPlan(ParkPlan&& plan);
+  ParkedState* findParked(uint64_t id);
+  // A document edit applied without a recompile (same structure: the same lines in the same
+  // places): the installed identity becomes `d`'s; kept states stay with their bypassed lines and
+  // follow those lines' value edits.
+  void refreshIdentity(const GraphDesc& d);
+  // true when a node's lines are the installed ones in another order (Track.MoveInsert of lines
+  // that differ only in values): such an edit is recompiled so that every state moves with its
+  // line instead of being applied as parameter commands to the instances in place.
+  bool insertsReordered(const GraphDesc& next) const;
   void notify(const char* topic);
   int32_t trackIndex(const sq_guid& id) const;
   int32_t meterSlotFor(const sq_guid& id);
@@ -394,9 +519,29 @@ class AudioEngine final : public sq::Object<AudioEngine, IAudioEngine, ITranspor
   uint32_t graphLatency_ = 0;
   std::string structureKey_;   // DocBuildResult::structureKey of the installed document graph
   uint64_t compileCount_ = 0;
-  // Slot maps the newest graph's buses / master were compiled with (carryPluginStates).
-  std::vector<std::vector<int32_t>> prevBusSlotMaps_;
-  std::vector<int32_t> prevMasterSlotMap_;
+  // Plugin state carry-over (captureStatesInto). carryNext_ is false from a setDocument() that
+  // switches to another document (or to none) until a graph of it is installed: the newest graph
+  // then belongs to another song, so its states are neither carried, kept nor rendered.
+  // Re-binding the document already bound keeps carrying.
+  bool carryNext_ = true;
+  // The document change being applied (onDocumentChanged); Other outside one (rebuild(), a
+  // setDocument() rebuild): detached states are looked up only during an Undo / Redo.
+  DocChange applying_ = DocChange::Other;
+  // Identity of the installed graph (identify(), kept states attached to its bypassed lines): set
+  // when a graph is installed and refreshed by a document edit applied without a recompile, so it
+  // always names the lines the live instances stand for.
+  std::map<NodeKey, NodeIdent> liveIdent_;
+  // Kept states, oldest first, at most kMaxParked entries and kMaxParkedBytes of state bytes. Over
+  // either bound the detached ones go first, oldest first (each waits only for an undo / redo);
+  // attached ones (a line still in the document) only when no detached one is left. Cleared by a
+  // setDocument() that switches documents.
+  static constexpr size_t kMaxParked = 64;
+  static constexpr size_t kMaxParkedBytes = size_t(256) << 20;
+  std::vector<ParkedState> parked_;
+  uint64_t nextParkId_ = 1;
+  // notePluginValues: (node, inserts[] index or -1 = instrument) -> values its main-chain instance
+  // already holds. Read by the next applyMixChanges, cleared by every rebuildFromDocument.
+  std::map<std::pair<NodeKey, int32_t>, ParamList> heldValues_;
 
   // Meter slot directory. Append-only table published with a release store of the count, so
   // getMeter (any non-RT thread, wait-free per audioengine.h) scans it without a lock. Entries

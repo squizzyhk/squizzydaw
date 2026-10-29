@@ -127,15 +127,37 @@ float staticParam(const ParamList& params, const ProcessorProto& proto, uint32_t
   return proto->parameter(index);
 }
 
+// Identity of an insert line / instrument spec for the engine's state carry-over
+// (TrackDesc::lineKeys / instrumentKey): the spec without its bypass marker in canonical form
+// (formatSpec), its "s=" state text replaced by a 64-bit digest (FNV-1a) because state texts can be
+// large. Equal identities stand for the same insert as far as the document can tell. Unparsable
+// specs stay as they are.
+std::string specIdentity(const std::string& line) {
+  const std::string spec = specWithoutBypass(line);
+  SpecParts p;
+  if (!parseSpec(spec, &p)) return spec;
+  if (!p.state.empty()) {
+    uint64_t h = 1469598103934665603ull;
+    for (const char c : p.state) h = (h ^ static_cast<uint8_t>(c)) * 1099511628211ull;
+    char buf[24];
+    std::snprintf(buf, sizeof buf, "#%016llx", static_cast<unsigned long long>(h));
+    p.state = buf;
+  }
+  return formatSpec(p);
+}
+
 // One insert chain from "user.inserts" text. slotToChain[line] = chain index or -1 (bypassed /
-// unavailable).
+// unavailable). lineKeys[line] = the line's identity (specIdentity, TrackDesc::lineKeys), for
+// every line.
 struct ChainBuild {
   std::vector<ProcessorProto> protos;
   std::vector<ParamList> params;
   std::vector<int32_t> slotToChain;
+  std::vector<std::string> lineKeys;
 };
 void buildChain(const std::string& text, const InsertResolver* inserts, ChainBuild& cb, std::string& key, DocBuildResult* info) {
   for (const std::string& line : specLines(text)) {
+    cb.lineKeys.push_back(specIdentity(line));
     if (specBypassed(line)) {
       key += "B:";
       keyStr(key, specStructure(specWithoutBypass(line)));
@@ -278,6 +300,7 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
         buildChain(sq::getAttrString(props.get(), "user.inserts"), inserts, cb, key, info);
         b.inserts = std::move(cb.protos);
         b.insertParams = std::move(cb.params);
+        b.lineKeys = std::move(cb.lineKeys);
         b.slotToChain = cb.slotToChain;
         extra.slotToChain = std::move(cb.slotToChain);
         busIndex[id] = static_cast<int32_t>(d.buses.size());
@@ -295,6 +318,7 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
         buildChain(sq::getAttrString(props.get(), "user.inserts"), inserts, cb, key, info);
         d.masterInserts = std::move(cb.protos);
         d.masterInsertParams = std::move(cb.params);
+        d.masterLineKeys = std::move(cb.lineKeys);
         d.masterSlotToChain = std::move(cb.slotToChain);
         break;
       }
@@ -315,6 +339,7 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
         buildChain(sq::getAttrString(props.get(), "user.inserts"), inserts, cb, key, info);
         td.inserts = std::move(cb.protos);
         td.insertParams = std::move(cb.params);
+        td.lineKeys = std::move(cb.lineKeys);
         td.slotToChain = cb.slotToChain;
         extra.slotToChain = std::move(cb.slotToChain);
         if (ti.kind == SQ_TRACK_INSTRUMENT) {
@@ -342,6 +367,7 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
           }
           key += "INS:";
           keyStr(key, specStructure(used));
+          td.instrumentKey = specIdentity(used);
           td.instrument = std::move(synth);
         }
         if (inCh < 0) inCh = 0;

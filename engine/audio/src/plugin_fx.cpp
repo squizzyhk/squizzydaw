@@ -10,7 +10,11 @@ namespace sq::engine::audio {
 
 // ---- PluginHostCore ----
 PluginHostCore::~PluginHostCore() {
-  if (inst_) inst_->closeEditor();  // an editor window may still be attached (the GUI re-attaches to the new instance)
+  // An editor still open on this instance is not closed here: whoever opened it holds its own
+  // reference and closes it (the GUI's PluginEditorHost, at its next pump, outside any plugin call),
+  // and the adapters close a view that is still open when they are destroyed. A graph can be retired
+  // from a message loop the plugin runs inside one of its own editor calls (setEditorSize,
+  // closeEditor), where closing that view would pull it out from under the running call.
   if (inst_ && active_) inst_->deactivate();
   inst_ = nullptr;
 }
@@ -26,10 +30,25 @@ std::string pluginIdOf(IPluginInstance* inst) {
 }  // namespace
 
 void PluginHostCore::loadState(const PluginState& state) {
-  if (!inst_ || state.bytes.empty()) return;
+  if (!inst_ || state.empty()) return;
   if (!state.pluginId.empty() && pluginIdOf(inst_.get()) != state.pluginId) return;
-  auto in = sq::makeMemoryStream(state.bytes.data(), state.bytes.size(), false);
-  inst_->loadState(in.get());
+  if (!state.bytes.empty()) {
+    auto in = sq::makeMemoryStream(state.bytes.data(), state.bytes.size(), false);
+    inst_->loadState(in.get());
+  }
+  // The document's "i=v" values win over the carried bytes (PluginState::params): main thread,
+  // before activation, so no process() runs in between. parameter() reports them too.
+  for (const auto& [id, v] : state.params) {
+    inst_->setParamValue(id, v);
+    const float f = static_cast<float>(v);
+    bool known = false;
+    for (uint32_t i = 0; i < valueCount_; ++i)
+      if (values_[i].first == id) {
+        values_[i].second = f;
+        known = true;
+      }
+    if (!known && valueCount_ < kMaxParamChanges) values_[valueCount_++] = {id, f};
+  }
 }
 
 bool PluginHostCore::saveState(PluginState* out) const {

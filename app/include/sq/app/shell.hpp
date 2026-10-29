@@ -9,8 +9,10 @@
 // Commands ("Category.Name"; args/result are IAttributes, both nullable):
 //   File.New                                     new song, becomes active, engine plays it
 //   File.Open        path                        open a .song archive
-//   File.Save        path?                       save (path required for a new document); captures the
-//                                                live state of every hosted plugin first (capturePluginStates)
+//   File.Save        path?                       save (path required for a new document); first pumps the
+//                                                hosted plugins, writes their queued editor edits and
+//                                                captures their live states (capturePluginStates), so
+//                                                the next idle() leaves the saved document unmodified
 //   File.Close
 //   File.ExportAudio path tail?:double start?:double end?:double   mixdown via engine render +
 //                                                codec chosen by the file extension (wav, flac, ...)
@@ -70,11 +72,32 @@
 // Live MIDI: every input of the MIDI drivers is opened at startup in the window
 // (Devices.Midi.Enabled; batch modes only with Devices.Midi.LiveInputHeadless or Midi.OpenInputs)
 // and forwarded to AudioEngine::pushLiveMidi; port hot-plug re-scans on driver notification.
-// Hosted plugins: the shell is every plugin instance's IPluginHostCallback (pluginhost.h). Editor
-// edits (onParamEdited) are written into the owning track's spec line from idle() as merged
-// "Plugin Parameter" undo steps; latency / restart requests rebuild the graph from idle(); editor
-// resize requests go to the GUI through PluginHostHooks. The opaque plugin state travels in the
-// spec's "s=<base64>" token (builtin.hpp), written by capturePluginStates (File.Save does it).
+// Hosted plugins: the shell is every plugin instance's IPluginHostCallback (pluginhost.h). Adapters
+// deliver callbacks only from inside a main-thread call into the instance, so idle() makes one cheap
+// call (getLatencyFrames) per instance of the newest graph (the list is re-read when the engine
+// compiles; the engine's fast-lane clones and offline-render instances are not in it). Editor edits
+// (onParamEdited) are written into the owning track's spec line from idle() as "Plugin Parameter"
+// undo steps: the edits of one editor gesture (GESTURE_BEGIN .. END, a gesture idle for 500 ms no
+// longer holds) of one instance merge into one step, edits outside a gesture make one step per
+// idle tick. onParamsChanged (preset / state loaded inside the plugin) re-reads the "i=v" values
+// the spec line already holds where the plugin moved them (not automated ones, nor while a
+// host-side value change has not reached the plugin: idle() watches the song's changes and makes
+// each such value the new agreement point once the plugin holds it). Values written this way are
+// not sent back to the instance that reported them (AudioEngine::notePluginValues; an echo would
+// undo a newer edit made meanwhile), only to its fast-lane copy. Restart requests, and a latency
+// that differs from the one read at the first pump after the compile (the engine does not expose
+// the compiled one, so a change before that pump goes unnoticed), rebuild the graph from idle();
+// restart requests raised before that first pump (by the compile itself: state loads, values,
+// activation) or by offline-render instances are ignored, and the same latency move, or a restart
+// request of a slot whose spec line did not change, right after such a rebuild of that slot does
+// not rebuild again until a compile made by anything else. Editor resize requests go to the GUI
+// through PluginHostHooks. The opaque plugin state travels in the spec's "s=<base64>" token
+// (builtin.hpp), written by capturePluginStates (File.Save does it). An instance whose stored state
+// could not be loaded (malformed token, loadState failed) keeps that stored state on capture until
+// the user edits the plugin (onParamEdited / onStateDirty after the first idle() pump of the
+// instance); the next idle() then writes the live state into that instance's own line (a "Plugin
+// State" undo step), so other lines holding the same stored token (Duplicate Track, a duplicated
+// device) keep theirs.
 #pragma once
 
 #include <cstdint>
@@ -140,8 +163,9 @@ class Shell {
   bool hasEngine() const;  // false in builds where engine/doc|edit|audio were filtered out
   const std::string& servicesDir() const { return servicesDir_; }
 
-  // Main-loop pump: engine idle (retired graphs, bounce edits), script timers, autosave, control-
-  // surface pump (ISurfacePump), queued OSC commands.
+  // Main-loop pump: hosted plugins (callbacks, editor edits -> spec lines, latency rebuilds), engine
+  // idle (retired graphs, bounce edits), script timers, autosave, control-surface pump
+  // (ISurfacePump), queued OSC commands.
   void idle();
 
   // Services (borrowed; null when unavailable).
@@ -165,9 +189,18 @@ class Shell {
   // Writes the live state (IPluginInstance::saveState, base64) of every hosted plugin of the active
   // song - or only the plugin at (node, slot) when `node` is given; a null guid is the master
   // track, slot -1 an instrument track's instrument - into its spec line as "|s=<base64>" in ONE
-  // undo step titled "Plugin State". Lines whose stored state already matches are left alone and
-  // no undo step is created when nothing changed. Returns the number of spec lines that changed
-  // (0: nothing changed, no engine, no document).
+  // undo step titled "Plugin State". The "i=v" values the line already holds are re-read from the
+  // plugin where the plugin moved them since plugin and line last agreed (they are applied over the
+  // state at instantiation); values an automation lane of the line drives, and values changed on
+  // the host side that have not reached the plugin yet, keep the line's value. Pumps every hosted
+  // plugin and writes the editor edits still queued first
+  // (their own "Plugin Parameter" step). A plugin whose stored state could not be loaded keeps its
+  // line (WARN log) until the user edits it. A bypassed line (no instance) gets the live state the
+  // engine keeps for it (AudioEngine::keptPluginStates: what enabling it restores) in the same
+  // step, its '!' marker and "i=v" values unchanged, unless its stored state could not be loaded.
+  // Lines that already match are left alone and no undo step is created when nothing changed.
+  // Returns the number of spec lines that changed by the capture (0: nothing changed, no engine,
+  // no document).
   size_t capturePluginStates(const sq_guid* node = nullptr, int32_t slot = INT32_MIN);
 
   // ---- commands ----

@@ -183,12 +183,12 @@ bool TrackProcessor::prepare(double sr, uint32_t maxFrames, uint32_t outChannels
     const auto& p = desc_.inserts[i];
     if (!p) continue;
     ProcessorPtr c = p->clone();
-    if (i < desc_.insertStates.size() && !desc_.insertStates[i].bytes.empty()) c->loadInitialState(desc_.insertStates[i]);
+    if (i < desc_.insertStates.size() && !desc_.insertStates[i].empty()) c->loadInitialState(desc_.insertStates[i]);
     chain_.add(std::move(c));
   }
   if (!chain_.prepare(sr, maxFrames, desc_.channels)) return false;
   instrument_ = desc_.instrument ? desc_.instrument->clone() : nullptr;
-  if (instrument_ && !desc_.instrumentState.bytes.empty()) instrument_->loadInitialState(desc_.instrumentState);
+  if (instrument_ && !desc_.instrumentState.empty()) instrument_->loadInitialState(desc_.instrumentState);
   if (instrument_ && !instrument_->prepare(sr, maxFrames, desc_.channels)) return false;
   // sequenced events of one block (bounded) + live events + note-offs of a stop/jump + live
   // note releases + controller resets
@@ -397,7 +397,7 @@ bool SubMixProcessor::prepare(double sr, uint32_t maxFrames, uint32_t outChannel
     const auto& p = protos_[i];
     if (!p) continue;
     ProcessorPtr c = p->clone();
-    if (i < states_.size() && !states_[i].bytes.empty()) c->loadInitialState(states_[i]);
+    if (i < states_.size() && !states_[i].empty()) c->loadInitialState(states_[i]);
     chain_.add(std::move(c));
   }
   if (!chain_.prepare(sr, maxFrames, channels_)) return false;
@@ -654,9 +654,12 @@ std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& 
     const TrackDesc& td = desc.tracks[i];
     const uint32_t ch = g->tracks_[i]->channels();
     maxTrackCh = std::max(maxTrackCh, ch);
-    for (auto& proto : td.inserts) {
+    for (size_t k = 0; k < td.inserts.size(); ++k) {
+      const ProcessorProto& proto = td.inserts[k];
       if (!proto) continue;  // TrackProcessor skips null prototypes as well
       ProcessorPtr p = proto->clone();
+      // the same carried state as the main chain's instance (TrackDesc::insertStates)
+      if (k < td.insertStates.size() && !td.insertStates[k].empty()) p->loadInitialState(td.insertStates[k]);
       if (!p->prepare(g->sr_, cfg.maxBlock, ch)) return fail("fast lane prepare failed");
       if (p->latency() == 0) {
         g->fastSlot_[i].push_back(static_cast<int32_t>(g->fastChains_[i].size()));
@@ -780,9 +783,17 @@ void Graph::setTrackParam(size_t track, int32_t slot, uint32_t param, float valu
     return;
   }
   if (AudioProcessor* p = t.insert(static_cast<size_t>(slot))) p->setParameter(param, value);
+  setTrackFastParam(track, slot, param, value);
+}
+void Graph::setTrackFastParam(size_t track, int32_t slot, uint32_t param, float value) noexcept {
+  if (slot < 0) return;
+  if (AudioProcessor* p = fastInsert(track, static_cast<size_t>(slot))) p->setParameter(param, value);
+}
+AudioProcessor* Graph::fastInsert(size_t track, size_t slot) const noexcept {
+  if (track >= fastSlot_.size() || track >= fastChains_.size()) return nullptr;
   const auto& fs = fastSlot_[track];
-  if (static_cast<size_t>(slot) < fs.size() && fs[static_cast<size_t>(slot)] >= 0)
-    if (AudioProcessor* p = fastChains_[track].at(static_cast<size_t>(fs[static_cast<size_t>(slot)]))) p->setParameter(param, value);
+  if (slot >= fs.size() || fs[slot] < 0) return nullptr;
+  return fastChains_[track].at(static_cast<size_t>(fs[slot]));
 }
 void Graph::setBusParam(size_t bus, int32_t slot, uint32_t param, float value) noexcept {
   if (bus >= buses_.size() || slot < 0) return;
@@ -810,12 +821,13 @@ void Graph::routeLiveMidi(const uint8_t* bytes, uint8_t size) noexcept {
 AutomationData* Graph::swapAutomation(AutomationData* data) noexcept {
   // Restore static values for whatever the old lanes drove (a removed or retargeted lane must
   // not leave its parameter at the last automated value), then for the new lanes; the new lanes
-  // apply from the next block (only while playing).
-  endAutomation();
+  // apply from the next block (only while playing). Neither pass sends a main-chain processor the
+  // value `data` says it already holds (mainHolds).
+  endAutomation(data);
   AutomationData* old = extAutomation_;
   extAutomation_ = data;
   automation_ = data ? data : automationKeep_.get();
-  endAutomation();
+  endAutomation(data);
   return old;
 }
 
@@ -881,19 +893,34 @@ void Graph::applyAutomation(const ProcessContext& ctx) noexcept {
   automating_ = true;
 }
 
-void Graph::endAutomation() noexcept {
+namespace {
+// true when `strips` (one side of the data a swap installs) marks the parameter that lane `l` of
+// strip `i` drives as held by its main-chain processor (AutoLane::mainHolds).
+bool mainHolds(const std::vector<std::vector<AutoLane>>* strips, size_t i, const AutoLane& l) noexcept {
+  if (!strips || i >= strips->size()) return false;
+  for (const AutoLane& h : (*strips)[i])
+    if (h.mainHolds && h.target == l.target && h.slot == l.slot && h.param == l.param) return true;
+  return false;
+}
+}  // namespace
+
+void Graph::endAutomation(const AutomationData* swapIn) noexcept {
   for (auto& t : tracks_) t->clearAutomation();
   for (auto& b : buses_) b->clearAutomation();
   for (auto& s : sends_) s->hasAuto = false;
   // automated parameters go back to their static (document) values
   if (const AutomationData* a = automation_) {
     for (size_t i = 0; i < std::min(tracks_.size(), a->tracks.size()); ++i)
-      for (const AutoLane& l : a->tracks[i])
-        if ((l.target == AutoTarget::Insert || l.target == AutoTarget::Instrument) && !std::isnan(l.staticValue))
-          setTrackParam(i, l.target == AutoTarget::Instrument ? -1 : l.slot, l.param, l.staticValue);
+      for (const AutoLane& l : a->tracks[i]) {
+        if ((l.target != AutoTarget::Insert && l.target != AutoTarget::Instrument) || std::isnan(l.staticValue)) continue;
+        const int32_t slot = l.target == AutoTarget::Instrument ? -1 : l.slot;
+        if (mainHolds(swapIn ? &swapIn->tracks : nullptr, i, l)) setTrackFastParam(i, slot, l.param, l.staticValue);
+        else setTrackParam(i, slot, l.param, l.staticValue);
+      }
     for (size_t b = 0; b < std::min(buses_.size(), a->buses.size()); ++b)
       for (const AutoLane& l : a->buses[b])
-        if (l.target == AutoTarget::Insert && !std::isnan(l.staticValue)) setBusParam(b, l.slot, l.param, l.staticValue);
+        if (l.target == AutoTarget::Insert && !std::isnan(l.staticValue) && !mainHolds(swapIn ? &swapIn->buses : nullptr, b, l))
+          setBusParam(b, l.slot, l.param, l.staticValue);
   }
   automating_ = false;
 }

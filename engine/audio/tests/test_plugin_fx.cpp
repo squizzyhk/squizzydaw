@@ -16,7 +16,7 @@ using namespace sq::engine::audio;
 
 namespace {
 
-std::atomic<int> g_alive{0}, g_active{0};
+std::atomic<int> g_alive{0}, g_active{0}, g_closeEditor{0};
 // Thread probe: lifecycle calls (create/activate/deactivate/destroy) must stay on g_main.
 std::atomic<bool> g_checkThreads{false};
 std::thread::id g_main;
@@ -78,7 +78,10 @@ class FakeGain final : public sq::Object<FakeGain, sq::IPluginInstance> {
   sq_result SQ_CALL loadState(sq::IByteStream*) override { return SQ_E_NOTIMPL; }
   sq_bool SQ_CALL hasEditor() override { return SQ_FALSE; }
   sq_result SQ_CALL openEditor(void*, const char*, uint32_t*, uint32_t*) override { return SQ_E_NOTIMPL; }
-  sq_result SQ_CALL closeEditor() override { return SQ_E_NOTIMPL; }
+  sq_result SQ_CALL closeEditor() override {
+    ++g_closeEditor;
+    return SQ_E_NOTIMPL;
+  }
   sq_result SQ_CALL setEditorSize(uint32_t, uint32_t) override { return SQ_E_NOTIMPL; }
 };
 
@@ -127,6 +130,26 @@ SQ_TEST("plugin_fx: clone instantiates, prepare activates, process maps buses, r
   }
   CHECK_EQ(g_alive.load(), 0);
   CHECK_EQ(g_active.load(), 0);
+}
+
+SQ_TEST("plugin_fx: a retired processor deactivates its plugin but leaves an open editor to its opener") {
+  // The GUI's editor host holds its own reference while a view is open and closes it itself; the
+  // processor (a retired graph's, possibly freed inside the plugin's own editor call) must not.
+  g_closeEditor = 0;
+  auto proto = std::make_shared<PluginFx>([](std::string*) { return sq::Ptr<sq::IPluginInstance>::adopt(new FakeGain()); }, "fake");
+  sq::Ptr<sq::IPluginInstance> held;
+  {
+    ProcessorPtr p = proto->clone();
+    REQUIRE(p->prepare(48000.0, 64, 2));
+    CHECK_EQ(g_active.load(), 1);
+    held = sq::Ptr<sq::IPluginInstance>(p->pluginInstance());
+    REQUIRE(held);
+  }
+  CHECK_EQ(g_active.load(), 0);       // deactivated with its graph
+  CHECK_EQ(g_alive.load(), 1);        // still alive through the opener's reference
+  CHECK_EQ(g_closeEditor.load(), 0);  // the view is the opener's to close
+  held = nullptr;
+  CHECK_EQ(g_alive.load(), 0);
 }
 
 SQ_TEST("plugin_fx: a failing factory yields a pass-through processor with an error") {
@@ -341,4 +364,41 @@ SQ_TEST("plugin_fx: clone + loadInitialState restores a captured state into the 
   ProcessorPtr plain = noneProto->clone();
   CHECK(plain->pluginInstance() == nullptr);
   plain->loadInitialState(st);  // no instance: a no-op, must not crash
+}
+
+SQ_TEST("plugin_fx: loadState loads the carried bytes, then applies the document's values over them") {
+  const PluginFactory factory = stateFactory("fake.state", 7);
+  PluginHostCore core(factory, "fake");
+  core.instantiate();
+  fakes::StatePlugin* inst = statePlugin(core.instance());
+  REQUIRE(inst);
+  PluginState st;
+  st.pluginId = "fake.state";
+  st.bytes = fakes::StatePlugin::encode(55, {{3, 0.9}, {4, 0.1}});  // carried: parameter 3 at 0.9
+  st.params = {{3, 0.25}};                                          // the document says 0.25
+  CHECK(!st.empty());
+  core.loadState(st);
+  CHECK_EQ(inst->loads(), 1);
+  CHECK_EQ(inst->value(), 55);
+  CHECK_EQ(inst->param(3), 0.25);       // the spec value over the carried one
+  CHECK_EQ(inst->param(4), 0.1);        // not in the spec: the carried value
+  CHECK_EQ(core.parameter(3), 0.25f);   // parameter() reports what was applied
+
+  // Values alone (a plugin whose state could not be captured) still apply, without a loadState.
+  PluginState values;
+  values.pluginId = "fake.state";
+  values.params = {{5, 0.5}};
+  core.loadState(values);
+  CHECK_EQ(inst->param(5), 0.5);
+  CHECK_EQ(core.parameter(5), 0.5f);
+  CHECK_EQ(inst->loads(), 1);
+  // Another plugin's state applies nothing at all (the factory already applied the spec values).
+  PluginState other;
+  other.pluginId = "fake.other";
+  other.bytes = fakes::StatePlugin::encode(1);
+  other.params = {{3, 0.75}};
+  core.loadState(other);
+  CHECK_EQ(inst->param(3), 0.25);
+  CHECK_EQ(inst->value(), 55);
+  CHECK(PluginState().empty());
 }

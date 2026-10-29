@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "sq/cpp/attributes.hpp"
+#include "sq/engine/audio/builtin.hpp"
 #include "sq/platform.h"
 #include "sq/platform.hpp"
 
@@ -424,7 +425,13 @@ void EngineCore::apply(const Command& c) noexcept {
           break;
         case CmdType::TrackMonitor: t.setMonitor(c.value != 0.0); break;
         case CmdType::TrackLiveMidi: t.setLiveMidi(c.value != 0.0); break;
-        case CmdType::TrackParam: cur_->setTrackParam(i, static_cast<int32_t>(c.a), static_cast<uint32_t>(c.b), static_cast<float>(c.value)); break;
+        case CmdType::TrackParam: {
+          const int32_t slot = static_cast<int32_t>(c.a);
+          const uint32_t param = static_cast<uint32_t>(c.b);
+          if (c.fastLaneOnly) cur_->setTrackFastParam(i, slot, param, static_cast<float>(c.value));
+          else cur_->setTrackParam(i, slot, param, static_cast<float>(c.value));
+          break;
+        }
         case CmdType::TrackSendLevel: cur_->setTrackSendLevel(i, static_cast<size_t>(c.a), static_cast<float>(c.value)); break;
         default: break;
       }
@@ -552,8 +559,14 @@ class DocObserver final : public sq::Object<DocObserver, IObserver> {
  public:
   explicit DocObserver(AudioEngine* e) : engine_(e) {}
   void detach() { engine_ = nullptr; }
-  void SQ_CALL onNotify(IUnknown*, const char* topic, IAttributes*) override {
-    if (engine_ && topic && std::strcmp(topic, "document.changed") == 0) engine_->onDocumentChanged();
+  void SQ_CALL onNotify(IUnknown*, const char* topic, IAttributes* args) override {
+    if (!engine_ || !topic || std::strcmp(topic, "document.changed") != 0) return;
+    const std::string reason = args ? sq::getAttrString(args, "reason") : std::string();  // document.h
+    using Change = AudioEngine::DocChange;
+    engine_->onDocumentChanged(reason == "commit" ? Change::Commit
+                               : reason == "undo" ? Change::Undo
+                               : reason == "redo" ? Change::Redo
+                                                  : Change::Other);
   }
 
  private:
@@ -692,7 +705,9 @@ sq_result AudioEngine::compileAndInstall() {
   cfg.meters = &core_->meters();
   std::string err;
   ++compileCount_;
-  carryPluginStates(d);
+  const bool carry = carryNext_;  // not across a document switch (the newest graph is another song's)
+  ParkPlan plan;
+  if (carry) captureStatesInto(d, &plan);
   std::unique_ptr<Graph> g = Graph::compile(d, cfg, &err);
   if (!g) {
     // invalid bus routing (e.g. a cycle from the document): fall back to routing buses to master
@@ -724,6 +739,13 @@ sq_result AudioEngine::compileAndInstall() {
   tempo_.set(d.tempo, d.sampleRate);
   core_->collectGarbage();
   core_->setGraph(std::move(g));
+  // The installed graph is now what the next carry pairs with; a failed compile above keeps the
+  // previous graph, its identity, the kept states and carryNext_ as they were.
+  if (carry)
+    commitParkPlan(std::move(plan));
+  else
+    liveIdent_ = identify(d);
+  carryNext_ = true;
   if (changed) notify("engine.latency");
   return SQ_OK;
 }
@@ -807,80 +829,418 @@ bool AudioEngine::locatePlugin(IPluginInstance* inst, sq_guid* node, int32_t* sl
   return false;
 }
 
-void AudioEngine::carryPluginStates(GraphDesc& d) {
-  Graph* g = core_->newestGraph();
-  // The slot maps `d` is compiled with are what the NEXT carry reads back, so they are recorded on
-  // every compile, including the first one (no graph to capture from yet).
-  std::vector<std::vector<int32_t>> busMaps;
-  for (const auto& b : d.buses) busMaps.push_back(b.slotToChain);
-  const std::vector<int32_t> oldMasterMap = std::exchange(prevMasterSlotMap_, d.masterSlotToChain);
-  const std::vector<std::vector<int32_t>> oldBusMaps = std::exchange(prevBusSlotMaps_, std::move(busMaps));
-  if (!g) return;
-  // (node, slot) -> state of the instance that runs now; desc_ is already the NEXT description,
-  // so the old slot maps come from the graph's own descs (tracks) and the previous bus/master maps.
-  struct Key {
-    sq_guid node;
-    int32_t slot;
-    bool operator<(const Key& o) const noexcept {
-      const int c = std::memcmp(&node, &o.node, sizeof node);
-      return c != 0 ? c < 0 : slot < o.slot;
+void AudioEngine::notePluginValues(IPluginInstance* inst, const ParamList& values) {
+  if (!inst || values.empty() || !haveDesc_) return;
+  sq_guid node{};
+  int32_t slot = 0;
+  if (!locatePlugin(inst, &node, &slot)) return;
+  // desc_ describes the newest graph (installed from it, or brought up to date by mix commands),
+  // so its slot maps resolve the line to the inserts[] index the next applyMixChanges diffs.
+  const auto sameId = [&](const auto& d) { return d.id == node; };
+  std::pair<NodeKey, int32_t> key{};
+  if (sq_guid_is_null(&node)) {
+    const int32_t c = chainOf(desc_.masterSlotToChain, slot);
+    if (c < 0) return;
+    key = {NodeKey{NodeKind::Master, node}, c};
+  } else if (auto t = std::find_if(desc_.tracks.begin(), desc_.tracks.end(), sameId); t != desc_.tracks.end()) {
+    const int32_t c = slot < 0 ? -1 : chainOf(t->slotToChain, slot);
+    if (slot >= 0 && c < 0) return;
+    key = {NodeKey{NodeKind::Track, node}, c};
+  } else if (auto b = std::find_if(desc_.buses.begin(), desc_.buses.end(), sameId);
+             b != desc_.buses.end() && slot >= 0) {
+    const int32_t c = chainOf(b->slotToChain, slot);
+    if (c < 0) return;
+    key = {NodeKey{NodeKind::Bus, node}, c};
+  } else {
+    return;
+  }
+  ParamList& held = heldValues_[key];
+  for (const auto& [id, v] : values) {
+    bool known = false;
+    for (auto& [hid, hv] : held)
+      if (hid == id) {
+        hv = v;
+        known = true;
+      }
+    if (!known) held.emplace_back(id, v);
+  }
+}
+
+namespace {
+// Processor (chain) position of every inserts[] entry, -1 for a null prototype (TrackProcessor /
+// SubMixProcessor skip those).
+std::vector<int32_t> chainPositions(const std::vector<ProcessorProto>& inserts) {
+  std::vector<int32_t> pos(inserts.size(), -1);
+  int32_t n = 0;
+  for (size_t c = 0; c < inserts.size(); ++c)
+    if (inserts[c]) pos[c] = n++;
+  return pos;
+}
+}  // namespace
+
+std::map<AudioEngine::NodeKey, AudioEngine::NodeIdent> AudioEngine::identify(const GraphDesc& d) {
+  auto lines = [](const std::vector<ProcessorProto>& inserts, const std::vector<int32_t>& slotToChain,
+                  const std::vector<std::string>& keys) {
+    std::vector<LineIdent> out;
+    const std::vector<int32_t> pos = chainPositions(inserts);
+    std::vector<bool> listed(inserts.size(), false);
+    for (size_t s = 0; s < keys.size(); ++s) {  // a document desc: every line, bypassed ones too
+      LineIdent l;
+      l.key = keys[s];
+      const int32_t c = s < slotToChain.size() ? slotToChain[s] : -1;
+      const size_t ci = static_cast<size_t>(c);
+      if (c >= 0 && ci < inserts.size() && pos[ci] >= 0 && !listed[ci]) {
+        l.entry = pos[ci];
+        listed[ci] = true;
+      }
+      out.push_back(std::move(l));
     }
+    for (size_t c = 0; c < inserts.size(); ++c)  // no keys (or an entry no line names): keyless, in order
+      if (pos[c] >= 0 && !listed[c]) {
+        LineIdent l;
+        l.entry = pos[c];
+        out.push_back(std::move(l));
+      }
+    return out;
   };
-  std::map<Key, PluginState> states;
-  auto grab = [&](const sq_guid& node, int32_t slot, const AudioProcessor* p) {
+  std::map<NodeKey, NodeIdent> out;
+  for (const TrackDesc& t : d.tracks) {
+    NodeIdent& n = out[NodeKey{NodeKind::Track, t.id}];
+    n.lines = lines(t.inserts, t.slotToChain, t.lineKeys);
+    n.hasInstrument = t.instrument != nullptr;
+    if (n.hasInstrument) n.instrument = t.instrumentKey;
+  }
+  for (const BusDesc& b : d.buses)
+    out[NodeKey{NodeKind::Bus, b.id}].lines = lines(b.inserts, b.slotToChain, b.lineKeys);
+  out[NodeKey{NodeKind::Master, sq_guid{}}].lines = lines(d.masterInserts, d.masterSlotToChain, d.masterLineKeys);
+  return out;
+}
+
+std::vector<int32_t> AudioEngine::alignLines(const std::vector<LineIdent>& olds, const std::vector<LineIdent>& news) {
+  const size_t no = olds.size(), nn = news.size();
+  std::vector<int32_t> partner(nn, -1);
+  std::vector<bool> taken(no, false);
+  auto pair = [&](size_t j, size_t i) {
+    partner[j] = static_cast<int32_t>(i);
+    taken[i] = true;
+  };
+  size_t head = 0;
+  while (head < no && head < nn && olds[head].key == news[head].key) {
+    pair(head, head);
+    ++head;
+  }
+  size_t tail = 0;
+  while (tail < no - head && tail < nn - head && olds[no - 1 - tail].key == news[nn - 1 - tail].key) {
+    pair(nn - 1 - tail, no - 1 - tail);
+    ++tail;
+  }
+  // In between (moved, added, removed, replaced or several edited lines): the identical identity
+  // first, then the same structure; the first unpaired old line each time, so duplicates keep
+  // their order.
+  std::vector<std::string> oldStructure(no), newStructure(nn);
+  for (size_t i = head; i < no - tail; ++i) oldStructure[i] = specStructure(olds[i].key);
+  for (size_t j = head; j < nn - tail; ++j) newStructure[j] = specStructure(news[j].key);
+  for (int pass = 0; pass < 2; ++pass)
+    for (size_t j = head; j < nn - tail; ++j) {
+      if (partner[j] >= 0) continue;
+      for (size_t i = head; i < no - tail; ++i)
+        if (!taken[i] && (pass == 0 ? olds[i].key == news[j].key : oldStructure[i] == newStructure[j])) {
+          pair(j, i);
+          break;
+        }
+    }
+  return partner;
+}
+
+AudioEngine::ParkedState* AudioEngine::findParked(uint64_t id) {
+  if (id == 0) return nullptr;
+  for (ParkedState& p : parked_)
+    if (p.id == id) return &p;
+  return nullptr;
+}
+
+std::vector<AudioEngine::KeptPluginState> AudioEngine::keptPluginStates() const {
+  // liveIdent_ names the lines of the installed graph (brought up to date by mix-only edits), one
+  // per "user.inserts" line in order, with the attached kept state of each line that hosts nothing.
+  std::vector<KeptPluginState> out;
+  for (const auto& [node, ident] : liveIdent_)
+    for (size_t s = 0; s < ident.lines.size(); ++s) {
+      const LineIdent& l = ident.lines[s];
+      if (l.entry >= 0 || l.parked == 0) continue;
+      for (const ParkedState& p : parked_)
+        if (p.id == l.parked && p.attached) {
+          out.push_back(KeptPluginState{node.second, static_cast<int32_t>(s), p.state});
+          break;
+        }
+    }
+  return out;
+}
+
+void AudioEngine::captureStatesInto(GraphDesc& d, ParkPlan* plan) {
+  std::map<NodeKey, NodeIdent> next = identify(d);
+  // The newest graph's processors per node, with the lines they stand for (liveIdent_; a graph
+  // compiled without one gets a keyless line per processor). Instances are captured lazily.
+  struct OldNode {
+    std::vector<const AudioProcessor*> procs;  // chain position -> processor
+    const AudioProcessor* instrument = nullptr;
+    NodeIdent ident;
+    std::vector<bool> used;                    // per line: paired with a new line
+    bool instrumentUsed = false;
+  };
+  std::map<NodeKey, OldNode> old;
+  auto collect = [&](const NodeKey& key, const auto& proc, const AudioProcessor* instrument) {
+    OldNode& n = old[key];
+    for (size_t c = 0; c < proc.insertCount(); ++c) n.procs.push_back(proc.insert(c));
+    n.instrument = instrument;
+    const auto it = liveIdent_.find(key);
+    if (it != liveIdent_.end()) {
+      n.ident = it->second;
+    } else {
+      for (size_t c = 0; c < n.procs.size(); ++c) {
+        LineIdent l;
+        l.entry = static_cast<int32_t>(c);
+        n.ident.lines.push_back(std::move(l));
+      }
+      n.ident.hasInstrument = instrument != nullptr;
+    }
+    n.used.assign(n.ident.lines.size(), false);
+  };
+  if (Graph* g = core_->newestGraph()) {
+    for (size_t i = 0; i < g->trackCount(); ++i) {
+      const TrackProcessor& t = g->track(i);
+      collect(NodeKey{NodeKind::Track, t.desc().id}, t, t.instrument());
+    }
+    for (size_t b = 0; b < g->busCount(); ++b) collect(NodeKey{NodeKind::Bus, g->busId(b)}, g->bus(b), nullptr);
+    collect(NodeKey{NodeKind::Master, sq_guid{}}, g->master(), nullptr);
+  }
+  auto procOf = [](const OldNode& o, const LineIdent& l) -> const AudioProcessor* {
+    const size_t c = static_cast<size_t>(l.entry);
+    return l.entry >= 0 && c < o.procs.size() ? o.procs[c] : nullptr;
+  };
+
+  std::vector<uint64_t> handed;  // kept states this pass handed out (consumed / re-attached)
+  auto isHanded = [&](uint64_t id) { return std::find(handed.begin(), handed.end(), id) != handed.end(); };
+  // A kept state for a new chain entry: read (render) or consumed (recompile).
+  auto takeKept = [&](uint64_t id, PluginState* out) {
+    const ParkedState* p = findParked(id);
+    if (!p || isHanded(id)) return false;
+    *out = p->state;
+    handed.push_back(id);
+    if (plan) plan->consumed.push_back(id);
+    return true;
+  };
+  // Recompile during an undo / redo only: the newest detached state of the node with this identity
+  // that left from this line index (an undo puts a line back exactly where it was) by the opposite
+  // move: an undo takes what a commit / redo detached, a redo what an undo detached. The history is
+  // a stack, so that is the one of the step being reversed. (Without the direction, "remove B, add
+  // B again, undo, undo" would hand B the re-added copy's state: the first undo detaches that copy
+  // under the same identity and index, newer than B's own.)
+  const bool byUndo = applying_ == DocChange::Undo;
+  auto detached = [&](const NodeKey& node, bool instrument, const std::string& key, int32_t at) -> uint64_t {
+    if (!plan || (applying_ != DocChange::Undo && applying_ != DocChange::Redo) || key.empty()) return 0;
+    uint64_t best = 0;
+    for (const ParkedState& p : parked_)
+      if (!p.attached && p.byUndo != byUndo && p.instrument == instrument && p.node == node && p.line == key &&
+          p.at == at && p.id > best && !isHanded(p.id))
+        best = p.id;
+    return best;
+  };
+  // Recompile only: keeps the live state of an old instance (keyless lines: nothing could ask).
+  auto keep = [&](const NodeKey& node, bool instrument, bool attached, const std::string& key, int32_t at,
+                  const AudioProcessor* proc) -> uint64_t {
     PluginState st;
-    if (slot != INT32_MIN && captureInto(p, &st)) states[Key{node, slot}] = std::move(st);
+    if (!plan || key.empty() || !captureInto(proc, &st)) return 0;
+    ParkedState p;
+    p.id = nextParkId_++;
+    p.node = node;
+    p.instrument = instrument;
+    p.attached = attached;
+    p.byUndo = !attached && byUndo;
+    p.line = key;
+    p.at = at;
+    p.state = std::move(st);
+    plan->parks.push_back(std::move(p));
+    return plan->parks.back().id;
   };
-  for (size_t i = 0; i < g->trackCount(); ++i) {
-    TrackProcessor& t = g->track(i);
-    grab(t.desc().id, -1, t.instrument());
-    for (size_t c = 0; c < t.insertCount(); ++c) grab(t.desc().id, slotOf(t.desc().slotToChain, c) < 0 ? INT32_MIN : slotOf(t.desc().slotToChain, c), t.insert(c));
-  }
-  for (size_t b = 0; b < g->busCount() && b < oldBusMaps.size(); ++b)
-    for (size_t c = 0; c < g->bus(b).insertCount(); ++c) {
-      const int32_t s = slotOf(oldBusMaps[b], c);
-      grab(g->busId(b), s < 0 ? INT32_MIN : s, g->bus(b).insert(c));
+
+  auto fillChain = [&](const NodeKey& node, const std::vector<ProcessorProto>& protos,
+                       const std::vector<ParamList>& params, std::vector<PluginState>& states) {
+    states.assign(protos.size(), PluginState{});
+    NodeIdent& now = next[node];
+    const auto on = old.find(node);
+    OldNode* o = on == old.end() ? nullptr : &on->second;
+    static const std::vector<LineIdent> kNoLines;
+    const std::vector<int32_t> partner = alignLines(o ? o->ident.lines : kNoLines, now.lines);
+    std::vector<size_t> index;  // chain position -> inserts[] index
+    for (size_t c = 0; c < protos.size(); ++c)
+      if (protos[c]) index.push_back(c);
+    for (size_t j = 0; j < now.lines.size(); ++j) {
+      LineIdent& line = now.lines[j];
+      PluginState st;
+      bool have = false;
+      if (o && partner[j] >= 0) {
+        const size_t i = static_cast<size_t>(partner[j]);
+        o->used[i] = true;
+        const LineIdent& was = o->ident.lines[i];
+        const AudioProcessor* proc = procOf(*o, was);
+        if (line.entry >= 0) {
+          if (proc) have = captureInto(proc, &st);                 // the same insert, recompiled
+          else if (was.parked) have = takeKept(was.parked, &st);   // enabled again
+        } else if (plan) {
+          if (proc) {
+            line.parked = keep(node, false, true, line.key, -1, proc);  // bypassed now: kept with its line
+          } else if (findParked(was.parked)) {
+            line.parked = was.parked;  // still bypassed: the kept state stays with the line
+            plan->moves.push_back(ParkMove{was.parked, true, false, line.key, -1});
+          }
+        }
+      } else if (const uint64_t id = detached(node, false, line.key, static_cast<int32_t>(j))) {
+        if (line.entry >= 0) {
+          have = takeKept(id, &st);
+        } else {
+          line.parked = id;  // a bypassed line put back: its state waits with it again
+          handed.push_back(id);
+          plan->moves.push_back(ParkMove{id, true, false, line.key, -1});
+        }
+      }
+      if (!have || line.entry < 0 || static_cast<size_t>(line.entry) >= index.size()) continue;
+      const size_t c = index[static_cast<size_t>(line.entry)];
+      st.params = c < params.size() ? params[c] : ParamList{};  // the document's values win
+      states[c] = std::move(st);
     }
-  for (size_t c = 0; c < g->master().insertCount(); ++c) {
-    const int32_t s = slotOf(oldMasterMap, c);
-    grab(sq_guid{}, s < 0 ? INT32_MIN : s, g->master().insert(c));
-  }
-  if (states.empty()) return;
-  auto take = [&](const sq_guid& node, int32_t slot) -> PluginState {
-    auto it = states.find(Key{node, slot});
-    return it == states.end() ? PluginState{} : it->second;
   };
-  for (auto& t : d.tracks) {
-    if (t.instrument) t.instrumentState = take(t.id, -1);
-    t.insertStates.assign(t.inserts.size(), PluginState{});
-    for (size_t s = 0; s < t.slotToChain.size(); ++s)
-      if (t.slotToChain[s] >= 0 && static_cast<size_t>(t.slotToChain[s]) < t.insertStates.size())
-        t.insertStates[static_cast<size_t>(t.slotToChain[s])] = take(t.id, static_cast<int32_t>(s));
+  for (TrackDesc& t : d.tracks) {
+    const NodeKey node{NodeKind::Track, t.id};
+    fillChain(node, t.inserts, t.insertParams, t.insertStates);
+    t.instrumentState = PluginState{};
+    if (!t.instrument) continue;
+    const auto on = old.find(node);
+    OldNode* o = on == old.end() ? nullptr : &on->second;
+    PluginState st;
+    bool have = false;
+    if (o && o->instrument && specStructure(o->ident.instrument) == specStructure(t.instrumentKey)) {
+      o->instrumentUsed = true;
+      have = captureInto(o->instrument, &st);
+    } else if (const uint64_t id = detached(node, true, t.instrumentKey, -1)) {
+      have = takeKept(id, &st);
+    }
+    if (!have) continue;
+    st.params = t.instrumentParams;
+    t.instrumentState = std::move(st);
   }
-  for (auto& b : d.buses) {
-    b.insertStates.assign(b.inserts.size(), PluginState{});
-    for (size_t s = 0; s < b.slotToChain.size(); ++s)
-      if (b.slotToChain[s] >= 0 && static_cast<size_t>(b.slotToChain[s]) < b.insertStates.size())
-        b.insertStates[static_cast<size_t>(b.slotToChain[s])] = take(b.id, static_cast<int32_t>(s));
+  for (BusDesc& b : d.buses) fillChain(NodeKey{NodeKind::Bus, b.id}, b.inserts, b.insertParams, b.insertStates);
+  fillChain(NodeKey{NodeKind::Master, sq_guid{}}, d.masterInserts, d.masterInsertParams, d.masterInsertStates);
+
+  if (!plan) return;  // offline render: nothing consumed, nothing kept
+  // Old lines without a partner: removed (or their node deleted). Their live states / the states
+  // kept for them wait detached for an undo / redo; so does a replaced instrument's.
+  for (auto& [node, o] : old) {
+    for (size_t i = 0; i < o.ident.lines.size(); ++i) {
+      if (o.used[i]) continue;
+      const LineIdent& was = o.ident.lines[i];
+      const int32_t at = static_cast<int32_t>(i);
+      if (const AudioProcessor* proc = procOf(o, was))
+        keep(node, false, false, was.key, at, proc);
+      else if (findParked(was.parked))
+        plan->moves.push_back(ParkMove{was.parked, false, byUndo, was.key, at});
+    }
+    if (o.instrument && !o.instrumentUsed) keep(node, true, false, o.ident.instrument, -1, o.instrument);
   }
-  d.masterInsertStates.assign(d.masterInserts.size(), PluginState{});
-  for (size_t s = 0; s < d.masterSlotToChain.size(); ++s)
-    if (d.masterSlotToChain[s] >= 0 && static_cast<size_t>(d.masterSlotToChain[s]) < d.masterInsertStates.size())
-      d.masterInsertStates[static_cast<size_t>(d.masterSlotToChain[s])] = take(sq_guid{}, static_cast<int32_t>(s));
+  plan->ident = std::move(next);
+}
+
+void AudioEngine::commitParkPlan(ParkPlan&& plan) {
+  liveIdent_ = std::move(plan.ident);
+  for (const uint64_t id : plan.consumed) {
+    auto gone = std::remove_if(parked_.begin(), parked_.end(), [id](const ParkedState& p) { return p.id == id; });
+    parked_.erase(gone, parked_.end());
+  }
+  for (const ParkMove& m : plan.moves)
+    if (ParkedState* p = findParked(m.id)) {
+      p->attached = m.attached;
+      p->byUndo = m.byUndo;
+      p->line = m.line;
+      p->at = m.at;
+    }
+  for (ParkedState& p : plan.parks) parked_.push_back(std::move(p));
+  // At most kMaxParked entries and kMaxParkedBytes of state (a few sampler states can be large).
+  // Detached states go first, oldest first: each waits only for an undo / redo that may never
+  // come, while an attached one is needed whenever its line (still in the document) is enabled
+  // again; attached states go, oldest first, only when no detached one is left. A line whose kept
+  // state went simply has none any more.
+  size_t count = parked_.size(), bytes = 0;
+  for (const ParkedState& p : parked_) bytes += p.state.bytes.size();
+  std::vector<bool> drop(parked_.size(), false);
+  for (const bool attached : {false, true})
+    for (size_t k = 0; k < parked_.size() && (count > kMaxParked || bytes > kMaxParkedBytes); ++k)
+      if (parked_[k].attached == attached) {
+        drop[k] = true;
+        --count;
+        bytes -= parked_[k].state.bytes.size();
+      }
+  if (count == parked_.size()) return;
+  size_t kept = 0;
+  for (size_t k = 0; k < parked_.size(); ++k)
+    if (!drop[k]) {
+      if (kept != k) parked_[kept] = std::move(parked_[k]);
+      ++kept;
+    }
+  parked_.erase(parked_.begin() + static_cast<std::ptrdiff_t>(kept), parked_.end());
+}
+
+void AudioEngine::refreshIdentity(const GraphDesc& d) {
+  std::map<NodeKey, NodeIdent> next = identify(d);
+  for (auto& [node, now] : next) {
+    const auto it = liveIdent_.find(node);
+    if (it == liveIdent_.end()) continue;
+    const std::vector<LineIdent>& was = it->second.lines;
+    for (size_t i = 0; i < now.lines.size() && i < was.size(); ++i) {
+      if (now.lines[i].entry >= 0) continue;
+      ParkedState* p = findParked(was[i].parked);
+      if (!p) continue;
+      now.lines[i].parked = p->id;
+      p->line = now.lines[i].key;  // a value edit of the bypassed line: its kept state follows it
+    }
+  }
+  liveIdent_ = std::move(next);
+}
+
+bool AudioEngine::insertsReordered(const GraphDesc& next) const {
+  for (const auto& [node, now] : identify(next)) {
+    const auto it = liveIdent_.find(node);
+    if (it == liveIdent_.end()) continue;
+    std::vector<std::string> a, b;
+    for (const LineIdent& l : it->second.lines) a.push_back(l.key);
+    for (const LineIdent& l : now.lines) b.push_back(l.key);
+    if (a == b) continue;
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+    if (a == b) return true;
+  }
+  return false;
 }
 
 sq_result AudioEngine::rebuildFromDocument(bool allowMixOnly) {
+  // notePluginValues holds for this update only (applyMixChanges reads it; a recompile makes new
+  // instances, which take their values from the spec).
+  struct ForgetHeld {
+    AudioEngine* e;
+    ~ForgetHeld() { e->forgetPluginValues(); }
+  } forgetHeld{this};
   if (doc_) {
     GraphDesc d;
     DocBuildResult info;
     const sq_result r = buildGraphDesc(doc_.get(), reg_, media_, device_ ? sampleRate_ : 0.0, &d, &info, &inserts_, &instruments_);
     if (SQ_FAILED(r)) return r;
     // Same structure as the installed graph: apply the edit as mixer commands (no recompile, no
-    // new plugin instances, no reset of delay lines / fader ramps / plugin state).
-    if (allowMixOnly && haveDesc_ && !structureKey_.empty() && info.structureKey == structureKey_ && applyMixChanges(d)) {
+    // new plugin instances, no reset of delay lines / fader ramps / plugin state). Inserts moved
+    // among equal-structure lines are recompiled instead (their states move with their lines).
+    if (allowMixOnly && haveDesc_ && !structureKey_.empty() && info.structureKey == structureKey_ &&
+        !insertsReordered(d) && applyMixChanges(d)) {
       buildWarnings_ = std::move(info.warnings);
       for (size_t i = 0; i < d.tracks.size() && i < desc_.tracks.size(); ++i) d.tracks[i].liveMidi = desc_.tracks[i].liveMidi;
       desc_ = std::move(d);
+      refreshIdentity(desc_);  // same lines, new values / state text
       updateLiveTargets(true);  // arm state may have changed
       return SQ_OK;
     }
@@ -960,13 +1320,31 @@ bool AudioEngine::applyMixChanges(const GraphDesc& next) {
     c.b = b;
     cmds.push_back(c);
   };
-  auto params = [&](CmdType type, int64_t index, const std::vector<ParamList>& oldL, const std::vector<ParamList>& newL,
-                    const std::vector<ProcessorProto>& protos) {
+  // A changed value the main-chain instance already holds (notePluginValues: the plugin reported
+  // it) is not sent back to it: a track insert's command goes to its fast-lane copy only, any
+  // other is dropped.
+  auto held = [&](const NodeKey& node, int64_t k, uint32_t id, double v) {
+    auto it = heldValues_.find({node, static_cast<int32_t>(k)});
+    if (it == heldValues_.end()) return false;
+    for (const auto& [hid, hv] : it->second)
+      if (hid == id) return hv == v;
+    return false;
+  };
+  auto params = [&](CmdType type, int64_t index, const NodeKey& node, const std::vector<ParamList>& oldL,
+                    const std::vector<ParamList>& newL, const std::vector<ProcessorProto>& protos) {
     if (oldL.size() != newL.size()) return false;
     for (size_t k = 0; k < newL.size(); ++k) {
       std::vector<std::pair<uint32_t, double>> diff;
       if (!paramDiff(oldL[k], newL[k], k < protos.size() ? protos[k] : nullptr, &diff)) return false;
-      for (const auto& [id, v] : diff) add(type, index, v, static_cast<int64_t>(k), id);
+      for (const auto& [id, v] : diff) {
+        if (held(node, static_cast<int64_t>(k), id, v)) {
+          if (type != CmdType::TrackParam) continue;
+          add(type, index, v, static_cast<int64_t>(k), id);
+          cmds.back().fastLaneOnly = true;
+          continue;
+        }
+        add(type, index, v, static_cast<int64_t>(k), id);
+      }
     }
     return true;
   };
@@ -980,11 +1358,14 @@ bool AudioEngine::applyMixChanges(const GraphDesc& next) {
     if (o.solo != n.solo) add(CmdType::TrackSolo, static_cast<int64_t>(i), n.solo ? 1.0 : 0.0);
     if (monitorOverride_.find(n.id) == monitorOverride_.end() && o.monitor != n.monitor)
       add(CmdType::TrackMonitor, static_cast<int64_t>(i), n.monitor ? 1.0 : 0.0);
-    if (!params(CmdType::TrackParam, static_cast<int64_t>(i), o.insertParams, n.insertParams, n.inserts)) return false;
+    const NodeKey trackNode{NodeKind::Track, n.id};
+    if (!params(CmdType::TrackParam, static_cast<int64_t>(i), trackNode, o.insertParams, n.insertParams, n.inserts))
+      return false;
     if (n.instrument) {
       std::vector<std::pair<uint32_t, double>> diff;
       if (!paramDiff(o.instrumentParams, n.instrumentParams, n.instrument, &diff)) return false;
-      for (const auto& [id, v] : diff) add(CmdType::TrackParam, static_cast<int64_t>(i), v, -1, id);
+      for (const auto& [id, v] : diff)  // an instrument has no fast-lane copy
+        if (!held(trackNode, -1, id, v)) add(CmdType::TrackParam, static_cast<int64_t>(i), v, -1, id);
     }
     for (size_t k = 0; k < n.sends.size(); ++k)
       if (o.sends[k].level != n.sends[k].level) add(CmdType::TrackSendLevel, static_cast<int64_t>(i), n.sends[k].level, static_cast<int64_t>(k));
@@ -997,11 +1378,15 @@ bool AudioEngine::applyMixChanges(const GraphDesc& next) {
     if (o.mute != n.mute) add(CmdType::BusMute, static_cast<int64_t>(b), n.mute ? 1.0 : 0.0);
     if (o.pan != n.pan) add(CmdType::BusPan, static_cast<int64_t>(b), n.pan);
     if (o.solo != n.solo) add(CmdType::BusSolo, static_cast<int64_t>(b), n.solo ? 1.0 : 0.0);
-    if (!params(CmdType::BusParam, static_cast<int64_t>(b), o.insertParams, n.insertParams, n.inserts)) return false;
+    const NodeKey busNode{NodeKind::Bus, n.id};
+    if (!params(CmdType::BusParam, static_cast<int64_t>(b), busNode, o.insertParams, n.insertParams, n.inserts))
+      return false;
     for (size_t k = 0; k < n.sends.size(); ++k)
       if (o.sends[k].level != n.sends[k].level) add(CmdType::BusSendLevel, static_cast<int64_t>(b), n.sends[k].level, static_cast<int64_t>(k));
   }
-  if (!params(CmdType::MasterParam, -1, desc_.masterInsertParams, next.masterInsertParams, next.masterInserts)) return false;
+  if (!params(CmdType::MasterParam, -1, NodeKey{NodeKind::Master, sq_guid{}}, desc_.masterInsertParams,
+              next.masterInsertParams, next.masterInserts))
+    return false;
   if (desc_.masterVolume != next.masterVolume) {
     Command c;
     c.type = CmdType::MasterVolume;
@@ -1026,12 +1411,30 @@ bool AudioEngine::applyMixChanges(const GraphDesc& next) {
     if (!core_->post(c)) return false;  // queue full: a recompile installs the new values anyway
   if (autoChanged) {
     core_->collectGarbage();  // keeps the automation retire queue drained (it never overflows)
+    auto* data = next.automation ? new AutomationData(*next.automation) : new AutomationData();
+    // The swap restores every automated parameter to its lane's static value (the spec value): one
+    // whose main-chain instance already holds that value (notePluginValues, as `held` above) is
+    // restored on the fast-lane copy only, by neither the old lanes' restore nor the new lanes'.
+    auto markHeld = [&](std::vector<std::vector<AutoLane>>& strips, size_t i, const NodeKey& node) {
+      if (i >= strips.size()) return;
+      for (AutoLane& l : strips[i]) {
+        if ((l.target != AutoTarget::Insert && l.target != AutoTarget::Instrument) || std::isnan(l.staticValue)) continue;
+        const auto it = heldValues_.find({node, l.target == AutoTarget::Instrument ? -1 : l.slot});
+        if (it == heldValues_.end()) continue;
+        for (const auto& [hid, hv] : it->second)
+          if (hid == l.param) l.mainHolds = static_cast<float>(hv) == l.staticValue;
+      }
+    };
+    if (!heldValues_.empty()) {
+      for (size_t i = 0; i < next.tracks.size(); ++i) markHeld(data->tracks, i, NodeKey{NodeKind::Track, next.tracks[i].id});
+      for (size_t b = 0; b < next.buses.size(); ++b) markHeld(data->buses, b, NodeKey{NodeKind::Bus, next.buses[b].id});
+    }
     Command c;
     c.type = CmdType::SetAutomation;
     c.generation = gen;
-    c.ptr = next.automation ? new AutomationData(*next.automation) : new AutomationData();
+    c.ptr = data;
     if (!core_->post(c)) {
-      delete static_cast<AutomationData*>(c.ptr);
+      delete data;
       return false;
     }
   }
@@ -1093,7 +1496,17 @@ sq_result AudioEngine::setGraphDesc(GraphDesc desc) {
   return compileAndInstall();
 }
 
-void AudioEngine::onDocumentChanged() { rebuildFromDocument(true); }
+void AudioEngine::onDocumentChanged(DocChange change) {
+  // A commit clears the document's redo history: the states an undo detached (each waits for the
+  // redo of the step it undid) can never be asked for again.
+  if (change == DocChange::Commit) {
+    auto gone = std::remove_if(parked_.begin(), parked_.end(), [](const ParkedState& p) { return !p.attached && p.byUndo; });
+    parked_.erase(gone, parked_.end());
+  }
+  applying_ = change;
+  rebuildFromDocument(true);
+  applying_ = DocChange::Other;
+}
 
 void AudioEngine::notify(const char* topic) {
   std::vector<sq::Ptr<IObserver>> obs = observers_;
@@ -1260,7 +1673,18 @@ sq_result AudioEngine::getStatus(sq_engine_status* out) {
 }
 
 sq_result AudioEngine::setDocument(IDocument* doc) {
+  // Re-binding the document already bound (the shell re-binds the active song after File.Open of
+  // an open file, a failed import, a background document closing) is no switch: the rebuild below
+  // carries every live state and the kept ones stay. doc_ holds a reference, so another document
+  // cannot have the same address.
+  const bool same = doc != nullptr && doc_.get() == doc;
   detachDocument();
+  if (!same) {
+    // Another song (or none): the live plugin states belong to the previous one. No carry, no
+    // capture at all (File.Close does not saveState every plugin), and the kept states go too.
+    carryNext_ = false;
+    parked_.clear();
+  }
   if (!doc) {
     desc_ = GraphDesc{};
     haveDesc_ = false;
@@ -1727,6 +2151,9 @@ sq_result AudioEngine::startRender(const sq_render_request* request, IRenderObse
       plan.push_back(Out{t, ch, path});
     }
   }
+  // The offline instances start from the live plugin states like a recompile would (an export
+  // sounds like playback); nothing is consumed or kept. The click render hosts no plugins.
+  if (kind != kRenderClick) captureRenderStates(d);
   // Plugin inserts are instantiated/activated by compile and released by ~Graph: both happen on
   // this (main) thread. The worker only runs process(); idle() destroys the graphs afterwards.
   auto graphs = std::make_shared<OfflineGraphSet>();

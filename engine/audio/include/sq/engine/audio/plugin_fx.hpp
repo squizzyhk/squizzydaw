@@ -63,7 +63,9 @@ class PluginHostCore {
   void setParameter(uint32_t id, float value) noexcept;
   float parameter(uint32_t id) const noexcept;
   IPluginInstance* instance() const noexcept { return inst_.get(); }
-  // Main thread, before activate(): IPluginInstance::loadState when the plugin id matches.
+  // Main thread, before activate(): IPluginInstance::loadState(state.bytes) when the plugin id
+  // matches (and the bytes are non-empty), then setParamValue for every (id, value) in
+  // state.params (processor.hpp PluginState). Nothing happens for an empty state.
   void loadState(const PluginState& state);
   // Main thread: captures the instance state (false when there is no instance / no state).
   bool saveState(PluginState* out) const;

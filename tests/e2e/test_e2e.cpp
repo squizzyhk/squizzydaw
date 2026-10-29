@@ -12,6 +12,9 @@
 //       bundled script command works against the real engine
 //   M7  export WAV + FLAC (identical audio), MIDI file (read back), DAWproject (reimported)
 //   M4 (VST3)  the VST3 test plugin scanned and inserted like the CLAP one, PDC exact
+//   M4 (plugin host)  editor edits of an active CLAP plugin, in-plugin preset loads and plugin
+//              states reach the song from Shell::idle(); save leaves it clean; unloadable states kept
+//              until edited; automated and not yet delivered host-side values kept
 //   M5/M8      stock themes + theme switch, remote pages, control surfaces, OSC -> commands,
 //              audio device listing/selection, optional services (account, tempo sync, video)
 #include <cmath>
@@ -22,6 +25,7 @@
 
 #include "sq/app/shell.hpp"
 #include "sq/cpp/attributes.hpp"
+#include "sq/cpp/bytestream.hpp"
 #include "sq/engine/audio/devices.hpp"
 #include "sq/engine/audio/engine.hpp"
 #include "sq/interfaces/codec.h"
@@ -1021,4 +1025,314 @@ SQ_TEST("M7: import audio (44.1 kHz into a 48 kHz song) + MIDI, mixer commands, 
   CHECK_EQ(ce.length, 1.0);
   CHECK_EQ(int(ce.bytes[0]), 0x90);
   CHECK_EQ(int(ce.bytes[1]), 60);
+}
+
+// ------------------------------------------------------------------------------------------------
+SQ_TEST("M4 (plugin host): editor edits, in-plugin preset loads and plugin states reach the song from idle()") {
+  const std::string gain = joinPath(joinPath(specialDir(SQ_DIR_EXE), "testplugins"), "sq-test-gain.clap");
+  REQUIRE(sq_fs_exists(gain.c_str()));
+  TestShell t("m4p");
+  REQUIRE_OK(t.run("File.New"));
+  engine::audio::NullDeviceOptions o;
+  o.offline = true;  // dev->pump(n) runs n audio blocks on this thread: no timing in this test
+  o.blockFrames = 64;
+  o.sampleRate = 48000;
+  auto dev = Ptr<engine::audio::NullDevice>::adopt(new engine::audio::NullDevice(o));
+  REQUIRE_OK(t.sh.audio()->openDeviceObject(dev.get(), nullptr));
+  auto res = makeAttributes();
+  REQUIRE_OK(t.run("Track.AddAudio", [](IAttributes* a) {
+    a->setString("name", "Fx");
+    a->setInt("channels", 2);
+  }, res.get()));
+  sq_guid track{};
+  res->getGuid("node", &track);
+  const std::string base = "clap|studio.squizzy.test.gain|" + gain;
+  REQUIRE_OK(t.run("Track.AddInsert", [&](IAttributes* a) { a->setString("spec", (base + "|1=-6").c_str()); }));
+  auto insertsOf = [&](const sq_guid& node) {
+    Ptr<INode> n;
+    REQUIRE_OK(t.doc()->findNode(&node, n.put()));
+    auto props = makeAttributes();
+    REQUIRE_OK(n->getProperties(props.get()));
+    return getAttrString(props.get(), "user.inserts");
+  };
+  auto inserts = [&]() { return insertsOf(track); };
+  auto has = [&](const std::string& token) { return inserts().find(token) != std::string::npos; };
+  auto modified = [&]() {
+    sq_document_info di{};
+    di.struct_size = sizeof di;
+    t.doc()->getDocumentInfo(&di);
+    return di.modified != SQ_FALSE;
+  };
+  // The instance hosted at `slot` now (a recompile replaces instances, so never keep one across commands).
+  auto hosted = [&](int32_t slot) {
+    Ptr<IPluginInstance> p = t.sh.audio()->pluginInstance(track, slot);
+    REQUIRE(p);
+    return p;
+  };
+
+  // An editor drag while the plugin is active: the test plugin's hidden "Edit Probe" (5) makes it
+  // report GESTURE_BEGIN / PARAM_VALUE / GESTURE_END of "Sidechain Mix" (2) from process(). The
+  // engine passes no params_out; idle() pumps the instance and writes the value into the spec line.
+  REQUIRE_OK(hosted(0)->setParamValue(5, 0.25));
+  dev->pump(2);
+  CHECK(!has("|2="));
+  t.sh.idle();
+  CHECK(has("|2=0.25"));
+
+  // Save first pumps the plugins and writes what they queued (an editor edit no idle() has seen
+  // yet), then the states: the saved song holds the edit and stays unmodified afterwards. The
+  // engine does not echo the first edit's spec value back to the plugin: that command would reach
+  // it in the same block as this newer edit and undo it.
+  REQUIRE_OK(hosted(0)->setParamValue(5, 0.75));
+  dev->pump(2);
+  CHECK(!has("|2=0.75"));
+  const std::string path = joinPath(t.dir, "plugin.song");
+  REQUIRE_OK(t.run("File.Save", [&](IAttributes* a) { a->setString("path", path.c_str()); }));
+  CHECK(has("|2=0.75|"));
+  CHECK(has("|s="));
+  CHECK(!modified());
+  for (int i = 0; i < 4; ++i) {
+    dev->pump(2);
+    t.sh.idle();
+  }
+  CHECK(!modified());
+  double mix = 0;
+  REQUIRE_OK(hosted(0)->getParamValue(2, &mix));
+  CHECK(std::fabs(mix - 0.75) < 1e-9);  // the plugin keeps its newest edit
+
+  // A value the plugin changed without reporting an edit is re-read into the spec on capture...
+  REQUIRE_OK(hosted(0)->setParamValue(1, -12.0));
+  dev->pump(2);
+  REQUIRE_OK(t.run("Plugin.CaptureState"));
+  CHECK(has("|1=-12|"));
+  dev->pump(2);  // (the plugin already holds the new spec value: the engine does not send it back)
+  // ...and at the next idle() when the plugin announces it (a state load inside the plugin).
+  auto preset = makeMemoryStream();
+  REQUIRE_OK(hosted(0)->saveState(preset.get()));
+  REQUIRE_OK(hosted(0)->setParamValue(1, -3.0));
+  dev->pump(2);
+  REQUIRE_OK(t.run("Plugin.CaptureState"));
+  CHECK(has("|1=-3|"));
+  REQUIRE_OK(preset->seek(0, SQ_SEEK_SET, nullptr));
+  REQUIRE_OK(hosted(0)->loadState(preset.get()));
+  t.sh.idle();
+  CHECK(has("|1=-12|"));
+  // A parameter command the engine has not delivered to the plugin yet is not reverted by a capture.
+  REQUIRE_OK(t.run("Track.SetInsertParam", [](IAttributes* a) {
+    a->setInt("slot", 0);
+    a->setInt("param", 1);
+    a->setDouble("value", -9.0);
+  }));
+  REQUIRE_OK(t.run("Plugin.CaptureState"));
+  CHECK(has("|1=-9|"));
+  // Nor is a newer one while the plugin holds an older host-side value (-9 delivered, -7 not yet).
+  dev->pump(2);
+  REQUIRE_OK(t.run("Track.SetInsertParam", [](IAttributes* a) {
+    a->setInt("slot", 0);
+    a->setInt("param", 1);
+    a->setDouble("value", -7.0);
+  }));
+  REQUIRE_OK(t.run("Plugin.CaptureState"));
+  CHECK(has("|1=-7|"));
+
+  // Once the plugin holds a value changed on the host side, plugin and spec agree again: a preset
+  // loaded inside the plugin afterwards moves that parameter in the spec too. An editor edit, its
+  // undo (delivered to the plugin), then a preset holding the edited value:
+  REQUIRE_OK(hosted(0)->setParamValue(5, 0.4));
+  dev->pump(2);
+  t.sh.idle();
+  CHECK(has("|2=0.4|"));
+  auto preset2 = makeMemoryStream();
+  REQUIRE_OK(hosted(0)->saveState(preset2.get()));
+  REQUIRE_OK(t.run("Edit.Undo"));
+  CHECK(has("|2=0.75|"));
+  dev->pump(2);
+  t.sh.idle();
+  double held = 0;
+  REQUIRE_OK(hosted(0)->getParamValue(2, &held));
+  CHECK(std::fabs(held - 0.75) < 1e-9);
+  REQUIRE_OK(preset2->seek(0, SQ_SEEK_SET, nullptr));
+  REQUIRE_OK(hosted(0)->loadState(preset2.get()));
+  t.sh.idle();
+  CHECK(has("|2=0.4|"));
+  // The same after Track.SetInsertParam.
+  REQUIRE_OK(t.run("Track.SetInsertParam", [](IAttributes* a) {
+    a->setInt("slot", 0);
+    a->setInt("param", 2);
+    a->setDouble("value", 0.6);
+  }));
+  dev->pump(2);
+  t.sh.idle();
+  REQUIRE_OK(preset2->seek(0, SQ_SEEK_SET, nullptr));
+  REQUIRE_OK(hosted(0)->loadState(preset2.get()));
+  t.sh.idle();
+  CHECK(has("|2=0.4|"));
+
+  // A stored state the plugin cannot load is kept on capture until the user edits the plugin...
+  REQUIRE_OK(t.run("Track.AddInsert", [&](IAttributes* a) { a->setString("spec", (base + "|s=AAAA").c_str()); }));
+  // (another track holds a copy of that line, as Duplicate Track makes it: the same stored token)
+  auto added = makeAttributes();
+  REQUIRE_OK(t.run("Track.AddAudio", [](IAttributes* a) { a->setString("name", "Copy"); }, added.get()));
+  sq_guid copy{};
+  added->getGuid("node", &copy);
+  REQUIRE_OK(t.run("Track.AddInsert", [&](IAttributes* a) {
+    a->setGuid("track", &copy);
+    a->setString("spec", (base + "|s=AAAA").c_str());
+  }));
+  auto copyHas = [&](const std::string& token) { return insertsOf(copy).find(token) != std::string::npos; };
+  REQUIRE_OK(t.run("Plugin.CaptureState"));
+  CHECK(has("|s=AAAA"));
+  CHECK(copyHas("|s=AAAA"));
+  REQUIRE_OK(hosted(1)->setParamValue(5, 0.5));
+  dev->pump(2);
+  t.sh.idle();
+  // ...and from then on the live state replaces it in that line (written at once), so the instance
+  // the next compile makes from that line loads it (a new track recompiles the graph). The copy
+  // the user never touched keeps its stored state through that compile and the captures.
+  CHECK(!has("|s=AAAA"));
+  CHECK(copyHas("|s=AAAA"));
+  REQUIRE_OK(t.run("Track.AddAudio", [](IAttributes* a) { a->setString("name", "Other"); }));
+  REQUIRE_OK(t.run("Plugin.CaptureState"));
+  CHECK(!has("|s=AAAA"));
+  CHECK(has("|2=0.5|"));
+  CHECK(copyHas("|s=AAAA"));
+
+  // A parameter an automation lane drives keeps its static value in the spec: during playback the
+  // plugin holds the automation's value, which a capture must not take for a plugin move.
+  REQUIRE_OK(t.run("Automation.SetLane", [&](IAttributes* a) {
+    a->setGuid("track", &track);
+    a->setString("target", "insert.0.1");
+    a->setString("points", "0:-20 1000:-20");
+  }));
+  REQUIRE_OK(t.run("Transport.Play"));
+  dev->pump(4);
+  double automated = 0;
+  REQUIRE_OK(hosted(0)->getParamValue(1, &automated));
+  CHECK(std::fabs(automated + 20.0) < 1e-6);  // the lane drives the plugin
+  REQUIRE_OK(t.run("Plugin.CaptureState"));
+  CHECK(has("|1=-7|"));
+  REQUIRE_OK(t.run("Transport.Stop"));
+  dev->pump(2);
+  t.sh.idle();
+  REQUIRE_OK(t.run("Plugin.CaptureState"));
+  CHECK(has("|1=-7|"));
+
+  // A bypassed insert hosts no instance: the engine keeps its live state with the line (enabling it
+  // restores it), and a capture writes that state into the line's "s=" (File.Save captures), so
+  // the saved song has it too. The plugin moves a value no "i=v" covers (its own Bypass, 3).
+  REQUIRE_OK(hosted(0)->setParamValue(3, 1.0));
+  dev->pump(2);
+  auto bypass = [&](bool on) {
+    REQUIRE_OK(t.run("Track.BypassInsert", [&](IAttributes* a) {
+      a->setGuid("track", &track);
+      a->setInt("slot", 0);
+      a->setBool("bypass", on ? SQ_TRUE : SQ_FALSE);
+    }));
+  };
+  auto line0 = [&]() {
+    const std::string s = inserts();
+    return s.substr(0, s.find('\n'));
+  };
+  bypass(true);
+  CHECK(!t.sh.audio()->pluginInstance(track, 0));
+  const std::string beforeCapture = line0();
+  CHECK(beforeCapture.rfind('!', 0) == 0);
+  auto captured = makeAttributes();
+  REQUIRE_OK(t.run("Plugin.CaptureState", {}, captured.get()));
+  CHECK_EQ(captured->getInt("count", -1), int64_t(1));
+  const std::string afterCapture = line0();
+  CHECK(afterCapture.rfind('!', 0) == 0);           // still bypassed
+  CHECK(afterCapture != beforeCapture);             // the kept state replaced the token...
+  CHECK(afterCapture.find("|1=-7|") != std::string::npos);  // ...and left the "i=v" values alone
+  REQUIRE_OK(t.run("Plugin.CaptureState", {}, captured.get()));
+  CHECK_EQ(captured->getInt("count", -1), int64_t(0));  // the line holds it already: nothing to write
+  const std::string bypassedPath = joinPath(t.dir, "bypassed.song");
+  REQUIRE_OK(t.run("File.Save", [&](IAttributes* a) { a->setString("path", bypassedPath.c_str()); }));
+  CHECK(!modified());
+  REQUIRE_OK(t.run("File.Close"));
+  REQUIRE_OK(t.run("File.Open", [&](IAttributes* a) { a->setString("path", bypassedPath.c_str()); }));
+  bypass(false);
+  double pluginBypass = 0;
+  REQUIRE_OK(hosted(0)->getParamValue(3, &pluginBypass));
+  CHECK(pluginBypass > 0.5);  // the reopened song's plugin starts from the state it had when bypassed
+
+  // Restart requests. The VST3 test plugin asks for one (kIoChanged) whenever "Extra Out" (8)
+  // changes sides of 0.5, also when the compile that makes an instance applies the spec's "8=1".
+  const std::string vst3 = joinPath(joinPath(specialDir(SQ_DIR_EXE), "testplugins-vst3"), "sq-test-gain.vst3");
+  if (!sq_fs_exists(vst3.c_str())) {
+    std::printf("    restart requests not checked: VST3 test plugin not built (filtered build)\n");
+    return;
+  }
+  REQUIRE_OK(t.run("Track.AddAudio", [](IAttributes* a) { a->setString("name", "Io"); }, added.get()));
+  sq_guid io{};
+  added->getGuid("node", &io);
+  auto ioPlugin = [&]() {
+    Ptr<IPluginInstance> p = t.sh.audio()->pluginInstance(io, 0);
+    REQUIRE(p);
+    return p;
+  };
+  auto compiles = [&]() { return t.sh.audio()->compileCount(); };
+  auto idle = [&](int n) {
+    for (int i = 0; i < n; ++i) {
+      dev->pump(2);
+      t.sh.idle();
+    }
+  };
+  // A request raised by the compile itself does not compile again (that compile would raise the
+  // next one: a rebuild per idle()).
+  REQUIRE_OK(t.run("Track.AddInsert", [&](IAttributes* a) {
+    a->setGuid("track", &io);
+    a->setString("spec", ("vst3|6D2F880BA9134121A830C04A1A7D830E|" + vst3 + "|8=1").c_str());
+  }));
+  ioPlugin();
+  uint64_t cc = compiles();
+  idle(4);
+  CHECK_EQ(compiles(), cc);
+  // A listed instance's request rebuilds the graph once...
+  REQUIRE_OK(ioPlugin()->setParamValue(8, 0.0));
+  idle(1);
+  CHECK_EQ(compiles(), cc + 1);
+  // ...but the same slot asking again right after that rebuild, on the instance it made (the spec's
+  // "8=1" again) with its line unchanged, echoes the activation: no rebuild (a plugin that asks
+  // after every activation would rebuild forever). Here: switched off and back on at once.
+  idle(1);  // (lists the new instance)
+  cc = compiles();
+  REQUIRE_OK(ioPlugin()->setParamValue(8, 0.0));
+  REQUIRE_OK(ioPlugin()->setParamValue(8, 1.0));
+  idle(2);
+  CHECK_EQ(compiles(), cc);
+  // A request once that instance is no longer new is the user's (the option switched off again)
+  // and rebuilds, its line still unchanged. (The shell's echo window: 8 pumps and 500 ms.)
+  idle(10);
+  sq_thread_sleep_ms(600);
+  REQUIRE_OK(ioPlugin()->setParamValue(8, 0.0));
+  idle(1);
+  CHECK_EQ(compiles(), cc + 1);
+  // Right after that rebuild, a request is new as well once the line changed (a mix-only edit: no
+  // compile of its own)...
+  idle(1);
+  cc = compiles();
+  REQUIRE_OK(t.run("Track.SetInsertParam", [&](IAttributes* a) {
+    a->setGuid("track", &io);
+    a->setInt("slot", 0);
+    a->setInt("param", 1);
+    a->setDouble("value", -3.0);
+  }));
+  CHECK_EQ(compiles(), cc);
+  REQUIRE_OK(ioPlugin()->setParamValue(8, 0.0));
+  idle(1);
+  CHECK_EQ(compiles(), cc + 1);
+  idle(1);
+  cc = compiles();
+  REQUIRE_OK(ioPlugin()->setParamValue(8, 0.0));
+  REQUIRE_OK(ioPlugin()->setParamValue(8, 1.0));
+  idle(2);
+  CHECK_EQ(compiles(), cc);
+  // ...or a compile made by anything else happened since.
+  REQUIRE_OK(t.run("Track.AddAudio", [](IAttributes* a) { a->setString("name", "Later"); }));
+  idle(1);
+  cc = compiles();
+  REQUIRE_OK(ioPlugin()->setParamValue(8, 0.0));
+  idle(1);
+  CHECK_EQ(compiles(), cc + 1);
 }

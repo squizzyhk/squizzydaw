@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sq/media.h"
@@ -26,9 +27,14 @@ namespace sq::engine::audio {
 
 // Opaque plugin state captured from one instance (IPluginInstance::saveState) to be handed to the
 // next instance of the SAME plugin (pluginId = sq_plugin_desc.id) when a graph is recompiled.
+// params: the "i=v" values of the document spec the new instance is built from. They are applied
+// (IPluginInstance::setParamValue, main thread, before activation) AFTER `bytes` is loaded, so a
+// parameter edit in the document is not reverted by the carried state.
 struct PluginState {
   std::string pluginId;
   std::vector<uint8_t> bytes;
+  std::vector<std::pair<uint32_t, double>> params;
+  bool empty() const noexcept { return bytes.empty() && params.empty(); }
 };
 
 // Per-block information handed to processors and source nodes.
@@ -77,7 +83,8 @@ class AudioProcessor {
   // thread only (editor windows, state capture); the pointer lives as long as this processor.
   virtual sq::IPluginInstance* pluginInstance() const noexcept { return nullptr; }
   // Control thread, after clone() and before prepare(): restores state captured from an earlier
-  // instance of the same plugin (ignored by built-ins and when the plugin id differs).
+  // instance of the same plugin (ignored by built-ins and when the plugin id differs), then
+  // applies state.params (PluginState).
   virtual void loadInitialState(const PluginState& state) { (void)state; }
 };
 using ProcessorPtr = std::unique_ptr<AudioProcessor>;

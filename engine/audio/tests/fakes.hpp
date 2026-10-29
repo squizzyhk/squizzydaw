@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sq/sdk.hpp"
@@ -435,10 +436,17 @@ class MDoc final : public NodeBase<MDoc, sq::IDocument>, public sq::ISubject {
       }
     return SQ_E_NOTFOUND;
   }
-  void fireChanged() {
+  // reason: the "document.changed" reason argument ("commit" / "undo" / "redo", document.h);
+  // null sends no arguments at all.
+  void fireChanged(const char* reason = nullptr) {
     ++changedFired;
+    sq::Ptr<sq::IAttributes> args;
+    if (reason) {
+      args = sq::makeAttributes();
+      args->setString("reason", reason);
+    }
     auto obs = observers;
-    for (auto& o : obs) o->onNotify(static_cast<sq::IDocument*>(this), "document.changed", nullptr);
+    for (auto& o : obs) o->onNotify(static_cast<sq::IDocument*>(this), "document.changed", args.get());
   }
 };
 
@@ -450,35 +458,68 @@ inline sq_result MEditor::commitTransaction() {
 }
 
 // ---------------------------------------------------------------- stateful plugin instance
-// IPluginInstance (pluginhost.h) whose whole state is one int32 `value`: saveState writes the tag
-// "SQST" followed by the little-endian value, loadState accepts exactly that form (anything else
-// is rejected and leaves the value alone). One stereo bus in and one out (as a synth it gets
-// silence in and writes silence out), no latency, no tail, no parameters, no editor. getDesc
-// reports `pluginId` as the class id, so PluginState (processor.hpp) round trips can match or
-// mismatch on it. Main-thread bookkeeping for tests: loads() / saves() count the state calls,
-// active() mirrors activate() / deactivate().
+// IPluginInstance (pluginhost.h) whose state is one int32 `value` (opaque, think "the loaded
+// sample") plus the parameters set so far: saveState writes the tag "SQST", the little-endian value
+// and then, per parameter in the order they were first set, its id (u32 LE) and value (IEEE double
+// bits, u64 LE); loadState accepts exactly that form (anything else is rejected and leaves the
+// plugin alone) and replaces the value AND the whole parameter table. Parameters: any id can be
+// set (setParamValue); getParamValue reports SQ_E_NOTFOUND for ids never set; getParamCount() is 0
+// (the engine does not enumerate). One stereo bus in and one out (as a synth it gets silence in
+// and writes silence out), no latency, no tail, no editor. getDesc reports `pluginId` as the class
+// id, so PluginState (processor.hpp) round trips can match or mismatch on it. Main-thread
+// bookkeeping for tests: loads() / saves() count the state calls, active() mirrors activate() /
+// deactivate().
 class StatePlugin final : public sq::Object<StatePlugin, sq::IPluginInstance> {
  public:
+  using Params = std::vector<std::pair<uint32_t, double>>;
   explicit StatePlugin(std::string pluginId, int32_t value = 0) : pluginId_(std::move(pluginId)), value_(value) {}
   int32_t value() const noexcept { return value_; }
   void setValue(int32_t v) noexcept { value_ = v; }
+  // Current value of parameter `id`, or `def` when it was never set.
+  double param(uint32_t id, double def = -1.0) const noexcept {
+    for (const auto& [pid, v] : params_)
+      if (pid == id) return v;
+    return def;
+  }
+  const Params& params() const noexcept { return params_; }
   int loads() const noexcept { return loads_; }
   int saves() const noexcept { return saves_; }
   bool active() const noexcept { return active_; }
   const std::string& pluginId() const noexcept { return pluginId_; }
 
-  // The serialised form of one value (exactly what saveState writes / loadState reads).
-  static std::vector<uint8_t> encode(int32_t v) {
+  // The serialised form of one value and a parameter table (exactly what saveState writes /
+  // loadState reads); without parameters it is the 8 bytes "SQST" + value.
+  static std::vector<uint8_t> encode(int32_t v, const Params& params = {}) {
     std::vector<uint8_t> b = {'S', 'Q', 'S', 'T'};
     const uint32_t u = static_cast<uint32_t>(v);
     for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>((u >> (8 * i)) & 0xFFu));
+    for (const auto& [id, pv] : params) {
+      for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>((id >> (8 * i)) & 0xFFu));
+      uint64_t bits = 0;
+      std::memcpy(&bits, &pv, sizeof bits);
+      for (int i = 0; i < 8; ++i) b.push_back(static_cast<uint8_t>((bits >> (8 * i)) & 0xFFu));
+    }
     return b;
   }
-  static bool decode(const std::vector<uint8_t>& b, int32_t* v) {
-    if (b.size() != 8 || b[0] != 'S' || b[1] != 'Q' || b[2] != 'S' || b[3] != 'T') return false;
+  // Decodes a state WITHOUT parameters (exactly 8 bytes).
+  static bool decode(const std::vector<uint8_t>& b, int32_t* v) { return b.size() == 8 && decode(b, v, nullptr); }
+  // Decodes any state (value + parameter table).
+  static bool decode(const std::vector<uint8_t>& b, int32_t* v, Params* params) {
+    if (b.size() < 8 || (b.size() - 8) % 12 != 0 || b[0] != 'S' || b[1] != 'Q' || b[2] != 'S' || b[3] != 'T') return false;
     uint32_t u = 0;
     for (int i = 0; i < 4; ++i) u |= static_cast<uint32_t>(b[4 + static_cast<size_t>(i)]) << (8 * i);
+    Params p;
+    for (size_t at = 8; at < b.size(); at += 12) {
+      uint32_t id = 0;
+      for (size_t i = 0; i < 4; ++i) id |= static_cast<uint32_t>(b[at + i]) << (8 * i);
+      uint64_t bits = 0;
+      for (size_t i = 0; i < 8; ++i) bits |= static_cast<uint64_t>(b[at + 4 + i]) << (8 * i);
+      double pv = 0.0;
+      std::memcpy(&pv, &bits, sizeof pv);
+      p.emplace_back(id, pv);
+    }
     if (v) *v = static_cast<int32_t>(u);
+    if (params) *params = std::move(p);
     return true;
   }
 
@@ -517,12 +558,28 @@ class StatePlugin final : public sq::Object<StatePlugin, sq::IPluginInstance> {
   uint32_t SQ_CALL getTailFrames() override { return 0; }
   uint32_t SQ_CALL getParamCount() override { return 0; }
   sq_result SQ_CALL getParamInfo(uint32_t, sq_param_info*) override { return SQ_E_NOTFOUND; }
-  sq_result SQ_CALL getParamValue(uint32_t, double*) override { return SQ_E_NOTFOUND; }
-  sq_result SQ_CALL setParamValue(uint32_t, double) override { return SQ_E_NOTFOUND; }
+  sq_result SQ_CALL getParamValue(uint32_t id, double* out) override {
+    if (!out) return SQ_E_INVALIDARG;
+    for (const auto& [pid, v] : params_)
+      if (pid == id) {
+        *out = v;
+        return SQ_OK;
+      }
+    return SQ_E_NOTFOUND;
+  }
+  sq_result SQ_CALL setParamValue(uint32_t id, double nv) override {
+    for (auto& [pid, v] : params_)
+      if (pid == id) {
+        v = nv;
+        return SQ_OK;
+      }
+    params_.emplace_back(id, nv);
+    return SQ_OK;
+  }
   sq_result SQ_CALL paramValueToText(uint32_t, double, char*, uint32_t, uint32_t*) override { return SQ_E_NOTFOUND; }
   sq_result SQ_CALL saveState(sq::IByteStream* out) override {
     if (!out) return SQ_E_INVALIDARG;
-    const std::vector<uint8_t> b = encode(value_);
+    const std::vector<uint8_t> b = encode(value_, params_);
     uint32_t written = 0;
     const sq_result r = out->write(b.data(), static_cast<uint32_t>(b.size()), &written);
     if (SQ_SUCCEEDED(r)) ++saves_;
@@ -530,13 +587,20 @@ class StatePlugin final : public sq::Object<StatePlugin, sq::IPluginInstance> {
   }
   sq_result SQ_CALL loadState(sq::IByteStream* in) override {
     if (!in) return SQ_E_INVALIDARG;
-    std::vector<uint8_t> b(16);  // more than a valid state: a longer stream is rejected by decode
-    uint32_t got = 0;
-    if (SQ_FAILED(in->read(b.data(), static_cast<uint32_t>(b.size()), &got))) return SQ_E_FAIL;
-    b.resize(got);
+    std::vector<uint8_t> b;
+    uint8_t chunk[256];
+    for (;;) {  // the whole stream (bounded: a huge one is not a valid state anyway)
+      uint32_t got = 0;
+      if (SQ_FAILED(in->read(chunk, static_cast<uint32_t>(sizeof chunk), &got))) return SQ_E_FAIL;
+      if (got == 0) break;
+      b.insert(b.end(), chunk, chunk + got);
+      if (b.size() > 65536) return SQ_E_INVALIDARG;
+    }
     int32_t v = 0;
-    if (!decode(b, &v)) return SQ_E_INVALIDARG;
+    Params p;
+    if (!decode(b, &v, &p)) return SQ_E_INVALIDARG;
     value_ = v;
+    params_ = std::move(p);
     ++loads_;
     return SQ_OK;
   }
@@ -548,6 +612,7 @@ class StatePlugin final : public sq::Object<StatePlugin, sq::IPluginInstance> {
  private:
   std::string pluginId_;
   int32_t value_ = 0;
+  Params params_;
   int loads_ = 0, saves_ = 0;
   bool active_ = false;
 };

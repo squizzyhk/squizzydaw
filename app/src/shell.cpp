@@ -222,29 +222,37 @@ struct Shell::Impl {
 
 #if SQ_SHELL_ENGINE
   // The IPluginHostCallback handed to every plugin instance the shell instantiates (pluginFactory).
-  // Adapters call it on the main thread (pluginhost.h). Nothing is edited from inside a callback:
-  // edits are queued on the Impl and written to the document from Shell::idle(), so a plugin that
-  // reports a hundred edits per drag costs one spec write per idle tick and one merged undo step.
+  // Adapters call it on the main thread (pluginhost.h), from inside the next main-thread call into
+  // the instance: pumpPlugins() makes one per instance per idle tick. Nothing is edited from inside
+  // a callback: edits are queued on the Impl and written to the document from Shell::idle(), so a
+  // plugin that reports a hundred edits per drag costs one spec write per idle tick and one merged
+  // undo step per editor gesture.
   class PluginHostCb final : public sq::Object<PluginHostCb, IPluginHostCallback> {
    public:
     explicit PluginHostCb(Impl* o) : owner(o) {}
     Impl* owner;  // cleared when the Impl dies (instances may outlive it briefly during shutdown)
-    void SQ_CALL onLatencyChanged(IPluginInstance*) override {
-      if (owner) owner->pluginRebuildWanted = true;
+    // pumpPlugins() compares every instance's latency with its baseline and rebuilds on a real
+    // change (a plugin re-announcing an unchanged latency after each activation would otherwise
+    // recompile forever). The baseline is the latency read at the first pump after the compile:
+    // the engine does not expose the latency a slot was compiled with, so a change announced
+    // between the compile and that pump becomes the baseline and rebuilds nothing.
+    void SQ_CALL onLatencyChanged(IPluginInstance*) override {}
+    // The plugin changed values itself (preset or state load inside the plugin): the "i=v" values
+    // of its spec are re-read at the next flush. The GUI re-reads the parameter list on its own.
+    void SQ_CALL onParamsChanged(IPluginInstance* plugin) override {
+      if (owner && plugin) owner->pendingFor(plugin).refresh = true;
     }
-    void SQ_CALL onParamsChanged(IPluginInstance*) override {}  // the GUI re-reads the parameter list on its own
     void SQ_CALL onParamEdited(IPluginInstance* plugin, const sq_param_change* change) override {
-      if (!owner || !plugin || !change || !std::isfinite(change->value)) return;
-      if (change->flags & SQ_PARAM_GESTURE_BEGIN) ++owner->pluginGesture;
-      PendingEdits& pe = owner->pendingEdits[plugin];
-      if (!pe.instance) pe.instance = sq::Ptr<IPluginInstance>(plugin);
-      pe.values[change->param_id] = change->value;
-      pe.gesture = owner->pluginGesture;
+      if (owner && plugin && change && std::isfinite(change->value)) owner->notePluginEdit(plugin, *change);
     }
-    void SQ_CALL onRestartRequested(IPluginInstance*) override {
-      if (owner) owner->pluginRebuildWanted = true;
+    void SQ_CALL onRestartRequested(IPluginInstance* plugin) override {
+      if (owner && plugin) owner->noteRestartRequest(plugin);
     }
-    void SQ_CALL onStateDirty(IPluginInstance*) override {}  // the state is captured on save (capturePluginStates)
+    // The state is captured on save (capturePluginStates); from now on also when the song's stored
+    // state could not be loaded into this instance (the user works with it, takeOverStoredState).
+    void SQ_CALL onStateDirty(IPluginInstance* plugin) override {
+      if (owner && plugin) owner->takeOverStoredState(plugin);
+    }
     sq_bool SQ_CALL onEditorResize(IPluginInstance* plugin, uint32_t width, uint32_t height) override {
       if (!owner || !owner->hooks.onEditorResize) return SQ_FALSE;
       return owner->hooks.onEditorResize(plugin, width, height) ? SQ_TRUE : SQ_FALSE;
@@ -254,11 +262,75 @@ struct Shell::Impl {
   struct PendingEdits {
     sq::Ptr<IPluginInstance> instance;  // keeps the instance alive until the flush looks it up
     std::map<uint32_t, double> values;  // param id -> plain value
-    uint64_t gesture = 0;               // merge tag: edits of one editor gesture form one undo step
+    std::string mergeTag;               // the newest edit's gesture tag; "" = no open gesture (fresh tag per flush)
+    bool refresh = false;               // onParamsChanged: re-read the spec's "i=v" values from the plugin
+    bool takeOver = false;              // takeOverStoredState: write the live state into the line ("s=")
   };
   std::map<IPluginInstance*, PendingEdits> pendingEdits;
-  uint64_t pluginGesture = 0;        // bumped by every SQ_PARAM_GESTURE_BEGIN
-  bool pluginRebuildWanted = false;  // onLatencyChanged / onRestartRequested: rebuild once from idle()
+  // A spec'd parameter at the last point the plugin and its spec line were known to agree: the
+  // plugin's value and the spec's (refreshSpecParams).
+  struct ParamSync {
+    double seen = 0;  // the plugin's value
+    double spec = 0;  // the spec line's value
+  };
+  // Bookkeeping per hosted instance. pluginFactory (re)sets the entry of every instance it creates,
+  // so a recycled address never inherits a dead instance's entry; entries of instances the newest
+  // graph no longer hosts are pruned whenever the engine compiles (refreshLivePlugins).
+  struct PluginInfo {
+    uint64_t id = 0;                            // merge tags "plugin:<id>:<gesture>"
+    uint64_t gesture = 0;                       // bumped by a GESTURE_BEGIN that opens a new gesture
+    std::map<uint32_t, int64_t> openGestures;  // parameters between GESTURE_BEGIN and END -> last edit (ms)
+    bool stateLoadFailed = false;  // the spec's "s=" state could not be loaded and the user has not taken over
+    std::map<uint32_t, ParamSync> synced;  // spec'd parameters
+    // Spec values changed on the host side (undo / redo, Track.Set*Param, scripts) that the plugin
+    // does not hold yet: param id -> spec value. The engine delivers them on the audio thread;
+    // pumpPlugins() makes each the new agreement point (synced) once the plugin reports it.
+    std::map<uint32_t, double> awaiting;
+  };
+  std::map<IPluginInstance*, PluginInfo> pluginInfo;
+  uint64_t nextPluginId = 0;
+  uint64_t pluginFlushSerial = 0;  // fresh merge tags for edits outside a gesture
+  // Digests of the stored "s=" tokens a plugin could not load in the bound song (pluginFactory; per
+  // bound document, bindEngine). The live state the engine keeps for a bypassed line holding one of
+  // them is that failed instance's defaults, so capturePluginStates leaves such a token alone.
+  std::set<uint64_t> failedStoredStates;
+  sq_guid boundDoc{};  // the document bindEngine last bound (null: none)
+  // document.changed of the bound song: pumpPlugins() then looks for spec values the hosted plugins
+  // have not reached yet (PluginInfo::awaiting).
+  sq::Ptr<ISubject> watchedDoc;
+  sq::Ptr<IObserver> specObserver;
+  bool specsChanged = false;
+  // The newest graph's plugin instances, re-read only when the engine compiled (compileCount), with
+  // their slot and the latency each reported at the first pump after that compile (the baseline).
+  struct LivePlugin {
+    sq::Ptr<IPluginInstance> instance;
+    sq_guid node{};
+    int32_t slot = 0;
+    uint32_t latency = 0;
+  };
+  std::vector<LivePlugin> livePlugins;
+  uint64_t livePluginsCompile = UINT64_MAX;
+  int64_t livePluginsListedMs = 0;  // when refreshLivePlugins listed them (monotonic ms)
+  uint64_t livePluginsPumps = 0;    // pumpPlugins() calls since
+  // The last latency rebuild of each (node, slot): baseline -> new latency. The same move again on
+  // the instance that rebuild made (pluginRebuildCompile) means the plugin always changes its
+  // latency after activation; a rebuild cannot help it (every compile makes new instances), so it
+  // is not repeated: at most one latency rebuild per compile made by anything else.
+  std::map<std::pair<sq_guid, int32_t>, std::pair<uint32_t, uint32_t>> latencyRebuilds;
+  // Restart requests of listed instances (noteRestartRequest) waiting for idle(), made for the graph
+  // of compile restartRequestCompile: (node, slot) -> every request of the slot came while that
+  // graph was new (restartEcho).
+  std::map<std::pair<sq_guid, int32_t>, bool> restartRequests;
+  uint64_t restartRequestCompile = UINT64_MAX;
+  // The slots whose restart requests rebuilt the graph since the last compile made by anything else,
+  // with their spec line at that rebuild (restartPending: those of the rebuild idle() is about to
+  // make). The same slot asking again with the same line while the instance such a rebuild made is
+  // new echoes its activation, as a plugin that asks on every activation does; a rebuild cannot
+  // help it, so it is not repeated (takeRestartRequests). Later requests are new (the user switched
+  // an option again, automation) and rebuild.
+  std::map<std::pair<sq_guid, int32_t>, std::string> restartRebuilds, restartPending;
+  bool pluginRebuildWanted = false;  // latency change / restart request: rebuild once from idle()
+  uint64_t pluginRebuildCompile = UINT64_MAX;  // compileCount after the last rebuild idle() made for a plugin
   edoc::DocumentManagerImpl* docs = nullptr;  // borrowed from the host service table
   sq::Ptr<PluginHostCb> pluginCb;  // declared BEFORE audio: plugin instances hold it, so it must outlive the engine
   sq::Ptr<engine::audio::AudioEngine> audio;
@@ -317,10 +389,35 @@ struct Shell::Impl {
   }
   void bindEngine() {
 #if SQ_SHELL_ENGINE
-    if (audio) audio->setDocument(active().get());
+    const sq::Ptr<IDocument> d = active();
+    const sq_guid id = d ? nodeId(d.get()) : sq_guid{};
+    if (!(id == boundDoc)) {
+      // Another song: its instances start from its own stored states (the engine carries nothing
+      // across the switch), so neither a failed stored state nor a latency rebuild applies to it.
+      boundDoc = id;
+      failedStoredStates.clear();
+      latencyRebuilds.clear();
+    }
+    watchDocument(d ? d.as<ISubject>() : sq::Ptr<ISubject>());
+    if (audio) audio->setDocument(d.get());
     applyLoopFromDocument();
 #endif
   }
+#if SQ_SHELL_ENGINE
+  // Observes document.changed of `subj` (the bound song; null: none) for pumpPlugins().
+  void watchDocument(const sq::Ptr<ISubject>& subj) {
+    if (subj.get() == watchedDoc.get()) return;
+    if (watchedDoc && specObserver) watchedDoc->removeObserver(specObserver.get());
+    watchedDoc = subj;
+    if (!watchedDoc) return;
+    if (!specObserver) {
+      specObserver = sq::Ptr<IObserver>::adopt(new FnObserver([this](const char* topic, IAttributes*) {
+        if (std::strcmp(topic, "document.changed") == 0) specsChanged = true;
+      }));
+    }
+    watchedDoc->addObserver(specObserver.get());
+  }
+#endif
 
   // ---- built-in commands ---------------------------------------------------------------------
   void add(const char* cat, const char* name, const char* title, Fn fn, std::function<bool()> en = {}) {
@@ -359,7 +456,9 @@ struct Shell::Impl {
     add("File", "Save", "Save", [this](IAttributes* a, IAttributes* res) {
       auto d = active();
       if (!d || !docs) return SQ_E_NOTFOUND;
-      capturePluginStates(nullptr, INT32_MIN);  // plugin GUI edits travel in the spec lines ("s=")
+      // Pump the plugins, write their queued edits, then their states ("s=") into the spec lines,
+      // so the document saved is final and the next idle() leaves it unmodified.
+      capturePluginStates(nullptr, INT32_MIN);
       std::string path = str(a, "path");
       if (path.empty()) {
         char buf[4096];
@@ -1605,13 +1704,17 @@ struct Shell::Impl {
     IHostContext* hostCtx = &sh.host;
     IClassRegistry* creg = &sh.registry;
     const auto params = sp.params;
-    // Saved state ("s=" token): decoded once here; a malformed token is logged and ignored.
+    // Saved state ("s=" token): decoded once here; a malformed token is logged and not loaded (the
+    // instance then counts as one whose state could not be loaded, see below).
     std::vector<uint8_t> state;
-    if (!sp.state.empty() && !base64Decode(sp.state, &state))
+    const bool stateMalformed = !sp.state.empty() && !base64Decode(sp.state, &state);
+    if (stateMalformed)
       sq_log_printf(SQ_LOG_WARN, kTag, "plugin %s|%s: malformed state token ignored", sp.format.c_str(), sp.id.c_str());
+    const uint64_t digest = stateDigest(sp.state);
     // The callback object outlives every instance made here (Impl member declared before the engine).
     const sq::Ptr<PluginHostCb> cb = pluginCb;
-    return [desc, params, state, hostCtx, creg, cb](std::string* e) -> sq::Ptr<IPluginInstance> {
+    return [desc, params, state, stateMalformed, digest, hostCtx, creg, cb](std::string* e)
+               -> sq::Ptr<IPluginInstance> {
       sq::Ptr<IPluginInstance> inst;
       sq::Ptr<IPluginRegistry> reg;
       sq_result r = SQ_E_NOTFOUND;
@@ -1632,12 +1735,26 @@ struct Shell::Impl {
         return inst;
       }
       // State first, then the explicit "i=v" values on top of it (they are the newer edits).
+      bool stateFailed = stateMalformed;
       if (!state.empty()) {
         auto in = sq::makeMemoryStream(state.data(), state.size(), false);
         const sq_result sr = inst->loadState(in.get());
-        if (SQ_FAILED(sr)) sq_log_printf(SQ_LOG_WARN, kTag, "plugin %s: loadState failed: %s", desc.id, sq_result_string(sr));
+        if (SQ_FAILED(sr)) {
+          sq_log_printf(SQ_LOG_WARN, kTag, "plugin %s: loadState failed: %s", desc.id, sq_result_string(sr));
+          stateFailed = true;
+        }
       }
       for (const auto& [id, v] : params) inst->setParamValue(id, v);
+      // Callbacks the load itself caused (rescans, dirty flags) are delivered before the outcome is
+      // recorded: only later edits / dirty notifications mean the user worked with the plugin. A
+      // failed load keeps the song's stored state from being overwritten by these defaults on save.
+      inst->getLatencyFrames();
+      std::map<uint32_t, ParamSync> synced;  // what the plugin made of the spec'd values (refreshSpecParams)
+      for (const auto& [id, v] : params) {
+        double now = 0;
+        if (SQ_SUCCEEDED(inst->getParamValue(id, &now)) && std::isfinite(now)) synced[id] = ParamSync{now, v};
+      }
+      if (cb->owner) cb->owner->notePluginCreated(inst.get(), stateFailed ? digest : 0, stateFailed, std::move(synced));
       return inst;
     };
   }
@@ -1711,7 +1828,7 @@ struct Shell::Impl {
     bool linesLoaded = false, linesDirty = false;
     std::string instrument;  // "user.instrument"
     bool instrumentDirty = false;
-    uint64_t gesture = 0;
+    std::string mergeTag;  // writeSpecEdits(merge=true): the merge_tag of this track's writes
   };
   // Rewrites the spec of (track, slot) through fn(spec without bypass marker) -> new spec; the
   // bypass marker and every token fn leaves alone (incl. the state) survive. false = no such slot /
@@ -1759,7 +1876,7 @@ struct Shell::Impl {
         auto setter = [&](const char* key, const std::string& value) {
           return setTrackProp(te.track.get(), key, [&](IAttributes* p) {
             p->setString("value", value.c_str());
-            if (merge) p->setString("merge_tag", ("plugin:" + std::to_string(te.gesture)).c_str());
+            if (merge) p->setString("merge_tag", te.mergeTag.empty() ? "plugin" : te.mergeTag.c_str());
           }, merge);
         };
         if (te.linesDirty) {
@@ -1774,55 +1891,426 @@ struct Shell::Impl {
       return SQ_OK;
     });
   }
+  // ---- per-instance bookkeeping (PluginHostCb, pluginFactory) ----
+  PendingEdits& pendingFor(IPluginInstance* plugin) {
+    PendingEdits& pe = pendingEdits[plugin];
+    if (!pe.instance) pe.instance = sq::Ptr<IPluginInstance>(plugin);
+    return pe;
+  }
+  PluginInfo& infoFor(IPluginInstance* plugin) {
+    auto [it, added] = pluginInfo.try_emplace(plugin);
+    if (added) it->second.id = ++nextPluginId;
+    return it->second;
+  }
+  // Identity of a stored "s=" token (FNV-1a, 64 bit); 0 for none.
+  static uint64_t stateDigest(const std::string& token) {
+    if (token.empty()) return 0;
+    uint64_t h = 1469598103934665603ull;
+    for (const char ch : token) {
+      h ^= static_cast<uint8_t>(ch);
+      h *= 1099511628211ull;
+    }
+    return h ? h : 1;
+  }
+  // pluginFactory: a new instance (a recycled address starts over). failedState = digest of the
+  // stored state it could not load (0: none / loaded); `synced` = its spec'd values as read back.
+  // A line whose stored state the user took over in an earlier instance holds that instance's live
+  // state by now (takeOverStoredState), so a failed load always counts.
+  void notePluginCreated(IPluginInstance* plugin, uint64_t failedState, bool loadFailed,
+                         std::map<uint32_t, ParamSync> synced) {
+    PluginInfo& info = pluginInfo[plugin];
+    info = PluginInfo{};
+    info.id = ++nextPluginId;
+    info.stateLoadFailed = loadFailed;
+    if (loadFailed && failedState) failedStoredStates.insert(failedState);
+    info.synced = std::move(synced);
+  }
+  bool stateLoadFailed(IPluginInstance* plugin) const {
+    auto it = pluginInfo.find(plugin);
+    return it != pluginInfo.end() && it->second.stateLoadFailed;
+  }
+  // Hosted by the newest graph and pumped since its compile (refreshLivePlugins lists an instance
+  // only after its first pump there); null otherwise.
+  const LivePlugin* listedPlugin(IPluginInstance* plugin) const {
+    if (!audio || livePluginsCompile != audio->compileCount()) return nullptr;
+    const auto hosts = [&](const LivePlugin& lp) { return lp.instance.get() == plugin; };
+    const auto it = std::find_if(livePlugins.begin(), livePlugins.end(), hosts);
+    return it == livePlugins.end() ? nullptr : &*it;
+  }
+  bool livePlugin(IPluginInstance* plugin) const { return listedPlugin(plugin) != nullptr; }
+  // onParamEdited / onStateDirty: the user works with the plugin, so its live state is the truth
+  // now. The next flush writes it into the instance's own line ("s=", its own "Plugin State" step
+  // ahead of the edit's), so the instances later compiles make from that line load it, while other
+  // lines that hold the same stored token (Duplicate Track, a duplicated device) keep theirs.
+  // Callbacks before the instance is listed do not count: they come from the compile itself (the
+  // engine loads the carried state after instantiation, activation pumps) or right after it, not
+  // from the user.
+  void takeOverStoredState(IPluginInstance* plugin) {
+    auto it = pluginInfo.find(plugin);
+    if (it == pluginInfo.end() || !it->second.stateLoadFailed || !livePlugin(plugin)) return;
+    it->second.stateLoadFailed = false;
+    pendingFor(plugin).takeOver = true;
+  }
+  // onRestartRequested: rebuilt from idle() (takeRestartRequests). Requests of instances that are
+  // not listed come from the compile that made them (state loads, values, activation: the
+  // activation that follows the load already applies what it asks for) or from an offline render,
+  // and are ignored: honoured, each compile would ask for the next one.
+  void noteRestartRequest(IPluginInstance* plugin) {
+    const LivePlugin* lp = listedPlugin(plugin);
+    if (!lp) return;
+    if (restartRequestCompile != livePluginsCompile) {
+      restartRequests.clear();
+      restartRequestCompile = livePluginsCompile;
+    }
+    const bool echo = restartEcho();
+    auto [it, added] = restartRequests.try_emplace(std::make_pair(lp->node, lp->slot), echo);
+    if (!added) it->second = it->second && echo;
+  }
+  // A plugin that asks for a restart after each activation asks soon after it: from its first
+  // process() blocks or a timer the activation started, delivered at the next pumps. The listed
+  // graph counts as new until it has been pumped kRestartEchoPumps times AND kRestartEchoMs have
+  // passed since it was listed (a main thread that stalled delivers such a request at its next
+  // pumps, however late). Requests made later come from a change (the user switched an option of
+  // the plugin again, automation) and rebuild even when the spec line is the same.
+  static constexpr uint64_t kRestartEchoPumps = 8;
+  static constexpr int64_t kRestartEchoMs = 500;
+  bool restartEcho() const {
+    const int64_t now = static_cast<int64_t>(sq_time_monotonic_ns() / 1000000ull);
+    return livePluginsPumps <= kRestartEchoPumps || now - livePluginsListedMs <= kRestartEchoMs;
+  }
+  // Shell::idle(), after the flush: the restart requests become a rebuild, except a slot asking again
+  // with an unchanged spec line while the instance its own restart rebuild made is new
+  // (restartRebuilds, restartEcho).
+  void takeRestartRequests() {
+    if (restartRequests.empty()) return;
+    std::map<std::pair<sq_guid, int32_t>, bool> requests;
+    requests.swap(restartRequests);
+    // A compile since the requests made new instances anyway.
+    if (!audio || restartRequestCompile != audio->compileCount()) return;
+    for (const auto& [key, echo] : requests) {
+      std::string line = slotSpec(key.first, key.second);
+      const auto last = restartRebuilds.find(key);
+      if (echo && last != restartRebuilds.end() && last->second == line && livePluginsCompile == pluginRebuildCompile) {
+        sq_log_printf(SQ_LOG_INFO, kTag, "plugin at slot %d asked for a restart again right after its restart "
+                      "rebuild; not rebuilding", static_cast<int>(key.second));
+        continue;
+      }
+      restartPending[key] = std::move(line);
+      pluginRebuildWanted = true;
+    }
+  }
+  // The spec line of (node, slot) in the active song without its bypass marker (slot -1: the
+  // instrument); "" when there is none.
+  std::string slotSpec(const sq_guid& node, int32_t slot) {
+    auto t = pluginTrack(node);
+    if (!t) return {};
+    if (slot < 0) return trackStr(t.get(), "user.instrument");
+    const std::vector<std::string> lines = splitLines(trackStr(t.get(), "user.inserts"));
+    const size_t s = static_cast<size_t>(slot);
+    return s < lines.size() ? engine::audio::specWithoutBypass(lines[s]) : std::string();
+  }
+  // A gesture parameter without an edit for this long no longer holds its gesture open (a plugin
+  // that sends GESTURE_BEGIN without END must not glue all later edits into one undo step).
+  static constexpr int64_t kGestureIdleMs = 500;
+  // onParamEdited: queue the value under the instance's gesture tag. Edits of one gesture (BEGIN ..
+  // END, possibly over many idle ticks; overlapping gestures of several parameters count as one)
+  // share "plugin:<id>:<gesture>" and merge into one undo step; edits outside a gesture get a fresh
+  // tag at each flush (flushPluginEdits). A BEGIN of a parameter already open, or one while every
+  // open parameter has been idle for kGestureIdleMs, starts a new gesture.
+  void notePluginEdit(IPluginInstance* plugin, const sq_param_change& c) {
+    takeOverStoredState(plugin);
+    PluginInfo& info = infoFor(plugin);
+    const int64_t now = static_cast<int64_t>(sq_time_monotonic_ns() / 1000000ull);
+    auto& open = info.openGestures;
+    const auto idle = [&](const std::pair<const uint32_t, int64_t>& g) { return now - g.second > kGestureIdleMs; };
+    if (c.flags & SQ_PARAM_GESTURE_BEGIN) {
+      if (open.count(c.param_id)) open.clear();  // its END never came
+      for (auto it = open.begin(); it != open.end();) it = idle(*it) ? open.erase(it) : std::next(it);
+      if (open.empty()) ++info.gesture;
+      open[c.param_id] = now;
+    } else if (auto it = open.find(c.param_id); it != open.end()) {
+      it->second = now;
+    }
+    info.synced[c.param_id] = ParamSync{c.value, c.value};  // the flush writes it into the spec
+    info.awaiting.erase(c.param_id);                        // (the plugin's newest value wins)
+    PendingEdits& pe = pendingFor(plugin);
+    pe.values[c.param_id] = c.value;
+    pe.mergeTag.clear();
+    if (!std::all_of(open.begin(), open.end(), idle))
+      pe.mergeTag = "plugin:" + std::to_string(info.id) + ":" + std::to_string(info.gesture);
+    if (c.flags & SQ_PARAM_GESTURE_END) open.erase(c.param_id);
+  }
+
+  // Adapters deliver IPluginHostCallback events only from inside a main-thread IPluginInstance call
+  // (pluginhost.h); one cheap call (getLatencyFrames) per hosted instance pumps them. The instance
+  // list is re-read only when the engine compiled a new graph; each instance is listed after its
+  // first pump there, with the latency that pump read as its baseline (the engine does not expose
+  // the latency a slot was compiled with). A later latency different from the baseline rebuilds the
+  // graph once (PDC), unless the instance comes from that very rebuild and makes the same move
+  // again (latencyRebuilds). The engine's fast-lane clones and offline-render instances are not listed
+  // (AudioEngine::pluginSlots does not report them), so nothing pumps them.
+  void refreshLivePlugins() {
+    if (!audio) return;
+    const uint64_t cc = audio->compileCount();
+    if (cc == livePluginsCompile) return;
+    livePluginsCompile = cc;
+    livePluginsListedMs = static_cast<int64_t>(sq_time_monotonic_ns() / 1000000ull);
+    livePluginsPumps = 0;
+    livePlugins.clear();
+    if (cc != pluginRebuildCompile) restartRebuilds.clear();  // a compile made by anything else
+    for (auto& ps : audio->pluginSlots()) {
+      if (!ps.instance) continue;
+      const uint32_t latency = ps.instance->getLatencyFrames();
+      livePlugins.push_back(LivePlugin{std::move(ps.instance), ps.node, ps.slot, latency});
+    }
+    // Instances no longer hosted lose their entries (their addresses may be reused).
+    for (auto it = pluginInfo.begin(); it != pluginInfo.end();) {
+      const auto hosts = [&](const LivePlugin& lp) { return lp.instance.get() == it->first; };
+      it = std::any_of(livePlugins.begin(), livePlugins.end(), hosts) ? std::next(it) : pluginInfo.erase(it);
+    }
+  }
+  void pumpPlugins() {
+    refreshLivePlugins();
+    ++livePluginsPumps;
+    for (size_t i = 0; i < livePlugins.size(); ++i) {
+      LivePlugin& lp = livePlugins[i];
+      const uint32_t latency = lp.instance->getLatencyFrames();
+      if (latency == lp.latency) continue;
+      const std::pair<uint32_t, uint32_t> move{lp.latency, latency};
+      lp.latency = latency;
+      auto [last, added] = latencyRebuilds.try_emplace(std::make_pair(lp.node, lp.slot), move);
+      if (!added && last->second == move && livePluginsCompile == pluginRebuildCompile) {
+        sq_log_printf(SQ_LOG_INFO, kTag, "plugin at slot %d changed its latency %u -> %u after activation again; "
+                      "not rebuilding", static_cast<int>(lp.slot), move.first, move.second);
+        continue;
+      }
+      last->second = move;
+      pluginRebuildWanted = true;
+    }
+    // Host-side spec changes reach the plugins through the engine on the audio thread, some blocks
+    // after the document change: once a plugin holds such a value, plugin and spec agree again, so
+    // a later move of the plugin (a preset loaded inside it) is the plugin's (refreshSpecParams).
+    if (specsChanged) {
+      specsChanged = false;
+      for (const LivePlugin& lp : livePlugins) noteSpecValues(lp);
+    }
+    for (const LivePlugin& lp : livePlugins) {
+      const auto it = pluginInfo.find(lp.instance.get());
+      if (it == pluginInfo.end() || it->second.awaiting.empty()) continue;
+      const std::map<uint32_t, double> awaiting = it->second.awaiting;  // (callbacks may edit it)
+      for (const auto& [id, value] : awaiting) {
+        double v = 0;
+        if (SQ_FAILED(lp.instance->getParamValue(id, &v)) || !std::isfinite(v) || !sameParamValue(v, value)) continue;
+        PluginInfo& info = infoFor(lp.instance.get());
+        const auto a = info.awaiting.find(id);
+        if (a == info.awaiting.end() || !sameParamValue(a->second, value)) continue;  // an edit reported meanwhile
+        info.awaiting.erase(a);
+        info.synced[id] = ParamSync{v, value};
+      }
+    }
+  }
+  // After a document change: the spec values of `lp`'s line that differ from the last agreement
+  // point (or have none) wait for the plugin (PluginInfo::awaiting).
+  void noteSpecValues(const LivePlugin& lp) {
+    engine::audio::SpecParts sp;
+    if (!engine::audio::parseSpec(slotSpec(lp.node, lp.slot), &sp)) return;
+    PluginInfo& info = infoFor(lp.instance.get());
+    info.awaiting.clear();
+    const auto pe = pendingEdits.find(lp.instance.get());
+    for (const auto& [id, stored] : sp.params) {
+      if (pe != pendingEdits.end() && pe->second.values.count(id)) continue;  // an edit the flush writes
+      const auto s = info.synced.find(id);
+      if (s == info.synced.end() || !sameParamValue(stored, s->second.spec)) info.awaiting[id] = stored;
+    }
+  }
+
+  // Equal up to rounding noise (float-backed plugins, normalized <-> plain conversions), so a
+  // round trip through the plugin does not count as a change of a stored "i=v" value.
+  static bool sameParamValue(double a, double b) {
+    return std::fabs(a - b) <= 1e-6 * std::max({1.0, std::fabs(a), std::fabs(b)});
+  }
+  // Parameter ids of the automation lanes on `t` that drive line `slot` ("insert.<slot>.<id>"; slot
+  // -1: "instrument.<id>"). Lanes without points drive nothing (doc_builder ignores them).
+  static std::set<uint32_t> automatedParams(ITrack* t, int32_t slot) {
+    std::set<uint32_t> out;
+    const std::string prefix = slot < 0 ? std::string("instrument.") : "insert." + std::to_string(slot) + ".";
+    for (const auto& l : engine::audio::parseAutomation(trackStr(t, "automation"))) {
+      if (l.points.empty() || l.target.size() <= prefix.size()) continue;
+      if (l.target.compare(0, prefix.size(), prefix) != 0) continue;
+      const std::string rest = l.target.substr(prefix.size());
+      char* end = nullptr;
+      const unsigned long id = std::strtoul(rest.c_str(), &end, 10);
+      if (end && *end == '\0' && rest[0] >= '0' && rest[0] <= '9') out.insert(static_cast<uint32_t>(id));
+    }
+    return out;
+  }
+  // `spec` with the "i=v" values it already holds re-read from the plugin (getParamValue) where the
+  // PLUGIN moved a value (a preset or state loaded inside the plugin). The plugin's value counts
+  // only when, since the plugin and the spec last agreed (PluginInfo::synced), the plugin moved and
+  // the spec did not:
+  //  - a spec value changed on the host side (Track.SetInsertParam, undo / redo, scripts) reaches
+  //    the plugin through the engine on the audio thread (the next block, or never without a running
+  //    device); until the plugin reports it, the spec wins;
+  //  - a plugin that does not take a spec value (range, steps) keeps it in the spec;
+  //  - parameters an automation lane of the line drives (`automated`) keep their static value: the
+  //    plugin's value is the automation's.
+  // Values the plugin does not report, and differences within rounding noise, change nothing.
+  // Not caught: a host-side change and its undo both made within one audio block (A -> B -> A
+  // with B delivered and A not yet) reads as a plugin move to B. `moved` (optional) receives the
+  // values re-read from the plugin (it holds them: AudioEngine::notePluginValues).
+  std::string refreshSpecParams(IPluginInstance* inst, const std::string& spec, const std::set<uint32_t>& automated,
+                                engine::audio::ParamList* moved = nullptr) {
+    engine::audio::SpecParts sp;
+    if (!engine::audio::parseSpec(spec, &sp)) return spec;
+    PluginInfo& info = infoFor(inst);
+    std::string s = spec;
+    for (const auto& [id, stored] : sp.params) {
+      double v = 0;
+      if (SQ_FAILED(inst->getParamValue(id, &v)) || !std::isfinite(v)) continue;
+      auto [it, first] = info.synced.try_emplace(id, ParamSync{v, stored});
+      ParamSync& last = it->second;
+      if (first) continue;
+      if (automated.count(id) || sameParamValue(v, stored)) {
+        last = ParamSync{v, stored};  // in agreement (or the automation's value: not the plugin's)
+        info.awaiting.erase(id);
+        continue;
+      }
+      if (!sameParamValue(stored, last.spec) || sameParamValue(v, last.seen)) continue;
+      s = engine::audio::specSetParam(s, id, v);
+      last = ParamSync{v, v};
+      info.awaiting.erase(id);
+      if (moved) moved->emplace_back(id, v);
+    }
+    return s;
+  }
+
   // Shell::idle(): the edits plugin editors reported since the last tick become "i=v" values of
-  // their spec lines (one merged "Plugin Parameter" step per flush). The engine's mix-only path
-  // turns them into live parameter commands; the plugin already holds the value, so that is a no-op
-  // for it. Instances the newest graph no longer hosts are dropped.
+  // their spec lines (one "Plugin Parameter" step per flush, merged across the ticks of one editor
+  // gesture of one instance). Instances that announced onParamsChanged also get the "i=v" values
+  // already in their spec re-read from the plugin. The engine's mix-only path turns the new values
+  // into live parameter commands, but not for the instance itself (notePluginValues: it already
+  // holds them, and an echo arriving after a newer edit of the plugin would undo that edit).
+  // Instances the newest graph no longer hosts are dropped. A stored state the user took over
+  // (takeOverStoredState) is replaced by the instance's live state first, in a "Plugin State" step
+  // of its own (undoing the edit that took it over keeps it).
   void flushPluginEdits() {
     if (pendingEdits.empty()) return;
     std::map<IPluginInstance*, PendingEdits> edits;
     edits.swap(pendingEdits);
     if (!audio || !active()) return;
+    std::map<std::string, TrackSpecEdit> takenOver;
+    for (const auto& [inst, pe] : edits) {
+      sq_guid node{};
+      int32_t slot = 0;
+      std::string b64;
+      if (!pe.takeOver || !audio->locatePlugin(inst, &node, &slot)) continue;
+      auto t = pluginTrack(node);
+      if (!t || !liveStateToken(inst, slot, &b64)) continue;
+      editSlotSpec(specEditFor(takenOver, t), slot, [&](const std::string& spec) { return engine::audio::specSetState(spec, b64); });
+    }
+    const sq_result tr = writeSpecEdits(takenOver, "Plugin State", false);
+    if (SQ_FAILED(tr)) sq_log_printf(SQ_LOG_WARN, kTag, "taken-over plugin states not written: %s", sq_result_string(tr));
+    const std::string serial = std::to_string(++pluginFlushSerial);
     std::map<std::string, TrackSpecEdit> perTrack;
     for (const auto& [inst, pe] : edits) {
+      // An instance whose stored state could not be loaded keeps the song's stored values.
+      const bool refresh = pe.refresh && !stateLoadFailed(inst);
+      if (pe.values.empty() && !refresh) continue;
       sq_guid node{};
       int32_t slot = 0;
       if (!audio->locatePlugin(inst, &node, &slot)) continue;
       auto t = pluginTrack(node);
       if (!t) continue;
       TrackSpecEdit& te = specEditFor(perTrack, t);
-      te.gesture = pe.gesture;
-      editSlotSpec(te, slot, [&](const std::string& spec) {
-        std::string s = spec;
-        for (const auto& [param, value] : pe.values) s = engine::audio::specSetParam(s, param, value);
+      engine::audio::ParamList held;  // what the plugin holds of the values written
+      const bool changed = editSlotSpec(te, slot, [&](const std::string& spec) {
+        held.clear();
+        std::string s = refresh ? refreshSpecParams(inst, spec, automatedParams(te.track.get(), slot), &held) : spec;
+        for (const auto& [param, value] : pe.values) {
+          s = engine::audio::specSetParam(s, param, value);
+          held.emplace_back(param, value);
+        }
         return s;
       });
+      if (!changed) continue;
+      audio->notePluginValues(inst, held);
+      std::string tag = pe.mergeTag;
+      if (tag.empty()) tag = "plugin:" + std::to_string(infoFor(inst).id) + ":n" + serial;
+      // Two instances of one track in one flush: one write, merged with neither gesture.
+      te.mergeTag = te.mergeTag.empty() || te.mergeTag == tag ? tag : "plugin:flush:" + serial;
     }
     const sq_result r = writeSpecEdits(perTrack, "Plugin Parameter", true);
+    audio->forgetPluginValues();  // the write's document update has used them (or there was none)
     if (SQ_FAILED(r)) sq_log_printf(SQ_LOG_WARN, kTag, "plugin parameter edits not written: %s", sq_result_string(r));
+  }
+  // The live state of `inst` (hosted at `slot`) as an "s=" token; false (logged) when the plugin
+  // cannot save it.
+  static bool liveStateToken(IPluginInstance* inst, int32_t slot, std::string* b64) {
+    auto out = sq::Ptr<sq::MemoryStream>::adopt(new sq::MemoryStream());
+    const sq_result sr = inst->saveState(out.get());
+    if (SQ_FAILED(sr)) {
+      sq_log_printf(SQ_LOG_WARN, kTag, "plugin state of slot %d not captured: %s", static_cast<int>(slot), sq_result_string(sr));
+      return false;
+    }
+    *b64 = base64Encode(out->bytes().data(), out->bytes().size());
+    return true;
   }
   // Shell::capturePluginStates: see shell.hpp. onlyNode null = every hosted plugin.
   size_t capturePluginStates(const sq_guid* onlyNode, int32_t onlySlot) {
     if (!audio || !active()) return 0;
+    // Everything the plugins reported up to now is written first (its own "Plugin Parameter" step),
+    // so the state below is the newest truth and the next idle() finds nothing left to change.
+    pumpPlugins();
+    flushPluginEdits();
     std::map<std::string, TrackSpecEdit> perTrack;
     size_t changed = 0;
     for (const auto& ps : audio->pluginSlots()) {
       if (!ps.instance) continue;
       if (onlyNode && (!(*onlyNode == ps.node) || onlySlot != ps.slot)) continue;
-      auto out = sq::Ptr<sq::MemoryStream>::adopt(new sq::MemoryStream());
-      const sq_result sr = ps.instance->saveState(out.get());
-      if (SQ_FAILED(sr)) {
-        sq_log_printf(SQ_LOG_WARN, kTag, "plugin state of slot %d not captured: %s", static_cast<int>(ps.slot), sq_result_string(sr));
+      IPluginInstance* inst = ps.instance.get();
+      if (stateLoadFailed(inst)) {
+        sq_log_printf(SQ_LOG_WARN, kTag,
+                      "plugin state of slot %d not captured: the song's stored state could not be loaded into "
+                      "the plugin, so the stored state was kept",
+                      static_cast<int>(ps.slot));
         continue;
       }
-      const std::string b64 = base64Encode(out->bytes().data(), out->bytes().size());
+      std::string b64;
+      if (!liveStateToken(inst, ps.slot, &b64)) continue;
       auto t = pluginTrack(ps.node);
       if (!t) continue;
-      if (editSlotSpec(specEditFor(perTrack, t), ps.slot, [&](const std::string& spec) { return engine::audio::specSetState(spec, b64); }))
-        ++changed;
+      // The "i=v" values are applied over the state at instantiation, so they must agree with it: a
+      // value the plugin changed without an edit (preset loaded inside the plugin) is re-read too.
+      TrackSpecEdit& te = specEditFor(perTrack, t);
+      engine::audio::ParamList held;  // values re-read from the plugin: not sent back to it
+      const auto withState = [&](const std::string& spec) {
+        held.clear();
+        const std::string withToken = engine::audio::specSetState(spec, b64);
+        return refreshSpecParams(inst, withToken, automatedParams(te.track.get(), ps.slot), &held);
+      };
+      if (!editSlotSpec(te, ps.slot, withState)) continue;
+      ++changed;
+      audio->notePluginValues(inst, held);
+    }
+    // Bypassed lines host no instance: the live state the engine keeps with each (what enabling it
+    // restores) goes into its "s=" token, the bypass marker and "i=v" values unchanged. A line whose
+    // stored token could not be loaded keeps it: the kept state is that failed instance's defaults.
+    for (const auto& ks : audio->keptPluginStates()) {
+      if (onlyNode && (!(*onlyNode == ks.node) || onlySlot != ks.slot)) continue;
+      if (ks.state.bytes.empty()) continue;
+      auto t = pluginTrack(ks.node);
+      if (!t) continue;
+      const std::string b64 = base64Encode(ks.state.bytes.data(), ks.state.bytes.size());
+      const auto withKept = [&](const std::string& spec) {
+        engine::audio::SpecParts sp;
+        if (!engine::audio::parseSpec(spec, &sp) || failedStoredStates.count(stateDigest(sp.state))) return spec;
+        return engine::audio::specSetState(spec, b64);
+      };
+      if (editSlotSpec(specEditFor(perTrack, t), ks.slot, withKept)) ++changed;
     }
     if (!changed) return 0;
     const sq_result r = writeSpecEdits(perTrack, "Plugin State", false);
+    audio->forgetPluginValues();
     if (SQ_FAILED(r)) {
       sq_log_printf(SQ_LOG_WARN, kTag, "plugin states not written: %s", sq_result_string(r));
       return 0;
@@ -3225,6 +3713,19 @@ void Shell::stop() {
   if (impl_->audio && impl_->engineObserver) impl_->audio->removeObserver(impl_->engineObserver.get());
   impl_->engineObserver = nullptr;
   impl_->pendingEdits.clear();  // instances die with the graphs below; nothing left to write
+  impl_->livePlugins.clear();   // (the references would keep them past the engine and their modules)
+  impl_->livePluginsCompile = UINT64_MAX;
+  impl_->livePluginsPumps = 0;
+  impl_->pluginInfo.clear();
+  impl_->failedStoredStates.clear();
+  impl_->latencyRebuilds.clear();
+  impl_->restartRequests.clear();
+  impl_->restartRebuilds.clear();
+  impl_->restartPending.clear();
+  impl_->pluginRebuildCompile = UINT64_MAX;
+  impl_->boundDoc = sq_guid{};
+  impl_->watchDocument({});  // (the observer holds the Impl)
+  impl_->specsChanged = false;
   impl_->pluginRebuildWanted = false;
   if (impl_->audio) {
     impl_->audio->setDocument(nullptr);
@@ -3235,6 +3736,10 @@ void Shell::stop() {
     impl_->audio->unregisterService(&host);
     impl_->audio = nullptr;
   }
+  // Callbacks of the teardown itself (deactivate() pumps) may have queued instances again: they
+  // must die before their modules unload.
+  impl_->pendingEdits.clear();
+  impl_->pluginInfo.clear();
   if (impl_->docs) {
     while (impl_->docs->getDocumentCount() > 0) {
       sq::Ptr<IDocument> d;
@@ -3253,11 +3758,18 @@ void Shell::stop() {
 
 void Shell::idle() {
 #if SQ_SHELL_ENGINE
-  impl_->flushPluginEdits();  // editor edits -> spec lines (before the engine tick picks them up)
+  impl_->pumpPlugins();          // plugin -> host callbacks (editor edits, rescans, restarts, latency)
+  impl_->flushPluginEdits();     // editor edits -> spec lines (before the engine tick picks them up)
+  impl_->takeRestartRequests();  // (after the flush: a request that came with an edit of its line is new)
   if (impl_->pluginRebuildWanted) {
     impl_->pluginRebuildWanted = false;
-    if (impl_->audio) impl_->audio->rebuild();  // latency / restart requested by a hosted plugin
+    if (impl_->audio) {
+      impl_->audio->rebuild();  // latency / restart requested by a hosted plugin
+      impl_->pluginRebuildCompile = impl_->audio->compileCount();
+      for (auto& [slot, line] : impl_->restartPending) impl_->restartRebuilds[slot] = std::move(line);
+    }
   }
+  impl_->restartPending.clear();
   if (impl_->audio) impl_->audio->idle();
   impl_->syncLiveTarget();  // live MIDI follows the selected track
   impl_->pumpMidi();

@@ -122,6 +122,10 @@ struct AutoLane {
   float staticValue = 0.0f;            // Insert / Instrument: value restored when the transport stops
                                        // (NaN = unknown, e.g. a plugin parameter: not restored)
   AutomationLane lane;                 // ppq points; volume/send in dB, pan -1..1, mute 0/1
+  bool mainHolds = false;              // Insert / Instrument, set only on the data a live swap installs
+                                       // (Graph::swapAutomation): the main-chain processor already holds
+                                       // staticValue (its plugin reported it), so the swap restores the
+                                       // parameter on the fast-lane copy only. Later restores ignore it.
 };
 struct AutomationData {
   std::vector<std::vector<AutoLane>> tracks;  // indexed like GraphDesc::tracks (may be shorter)
@@ -144,11 +148,20 @@ struct TrackDesc {
   std::vector<ParamList> insertParams; // per inserts[] entry: values written in its spec
   // "user.inserts" line -> inserts[] index, -1 for bypassed / unavailable lines (doc_builder).
   std::vector<int32_t> slotToChain;
+  // Per "user.inserts" line (parallel to slotToChain, bypassed / unavailable lines included): the
+  // line's identity as far as the document can tell (doc_builder: the spec without its bypass
+  // marker, canonical, "s=" state text as a digest). The engine lines up the lines of a recompiled
+  // graph with the installed ones by it (AudioEngine::captureStatesInto), so an insert keeps its
+  // live state when lines are moved, added, removed or bypassed around it. Empty (descs built
+  // without a document): the chain entries pair in order.
+  std::vector<std::string> lineKeys;
   // Per inserts[] entry: state carried over from the previous graph (empty = none). Set by the
-  // engine right before compiling; applied in prepare() before the plugin is activated.
+  // engine right before compiling (live graphs and offline-render graphs alike); applied in
+  // prepare() before the plugin is activated.
   std::vector<PluginState> insertStates;
   ProcessorProto instrument;           // instrument track: its one synth (null = audio track)
   ParamList instrumentParams;
+  std::string instrumentKey;           // identity of the instrument spec (as lineKeys)
   PluginState instrumentState;
   std::vector<TimedMidi> midi;         // sequenced events for the instrument (timeline frames)
   bool liveMidi = false;               // receives live MIDI (Graph::routeLiveMidi)
@@ -171,6 +184,7 @@ struct BusDesc {
   std::vector<ProcessorProto> inserts;
   std::vector<ParamList> insertParams;
   std::vector<int32_t> slotToChain;    // as TrackDesc::slotToChain
+  std::vector<std::string> lineKeys;   // as TrackDesc::lineKeys
   std::vector<PluginState> insertStates;
   std::vector<SendDesc> sends;         // to other buses (cycles are rejected)
   float volume = 1.0f;
@@ -188,6 +202,7 @@ struct GraphDesc {
   std::vector<ProcessorProto> masterInserts;
   std::vector<ParamList> masterInsertParams;
   std::vector<int32_t> masterSlotToChain;
+  std::vector<std::string> masterLineKeys;  // as TrackDesc::lineKeys
   std::vector<PluginState> masterInsertStates;
   float masterVolume = 1.0f;
   float masterPan = 0.0f;              // -1..1 (stereo balance law, like a bus)
@@ -438,6 +453,11 @@ class Graph {
   // slot = insert chain index; slot -1 on a track = its instrument. Also reaches the fast lane's
   // copy of a zero-latency insert.
   void setTrackParam(size_t track, int32_t slot, uint32_t param, float value) noexcept;
+  // Only the fast lane's copy (the main-chain insert already holds the value: its plugin reported it).
+  void setTrackFastParam(size_t track, int32_t slot, uint32_t param, float value) noexcept;
+  // The fast lane's copy of insert `slot` of `track` (as setTrackParam), null for a latent insert
+  // (tests).
+  AudioProcessor* fastInsert(size_t track, size_t slot) const noexcept;
   void setBusParam(size_t bus, int32_t slot, uint32_t param, float value) noexcept;
   void setMasterParam(int32_t slot, uint32_t param, float value) noexcept;
   void setTrackSendLevel(size_t track, size_t send, float level) noexcept;
@@ -451,6 +471,8 @@ class Graph {
   // ---- automation ----
   // RT: installs `data` as this graph's automation (owned; deleted by ~Graph on the control
   // thread) and returns the previously installed external data (caller retires it), or null.
+  // Automated parameters go back to their static values (the old lanes', then the new lanes'),
+  // those `data` marks AutoLane::mainHolds on the fast-lane copy only.
   AutomationData* swapAutomation(AutomationData* data) noexcept;
   const AutomationData* automation() const noexcept { return automation_; }
 
@@ -466,7 +488,10 @@ class Graph {
   void sumInto(int32_t dest, float* const* src, uint32_t ch, uint32_t frames) noexcept;
   void processFastLane(const ProcessContext& ctx, float* const* out, uint32_t outChannels) noexcept;
   void applyAutomation(const ProcessContext& ctx) noexcept;
-  void endAutomation() noexcept;
+  // Drops the automation overrides and restores automated parameters to their static values.
+  // swapIn: the data a swap installs; a parameter one of its lanes marks mainHolds is restored on
+  // the fast-lane copy only (a bus insert / instrument has none: not at all).
+  void endAutomation(const AutomationData* swapIn = nullptr) noexcept;
 
   // One send edge (track or bus -> bus).
   struct Send {
@@ -519,7 +544,8 @@ class Graph {
   float masterVolume_ = 1.0f;
   uint32_t latency_ = 0;
 
-  // fast lane: one zero-latency chain per track, with its own fader ramp state
+  // fast lane: one zero-latency chain per track (own instances of the inserts, started from the
+  // same TrackDesc::insertStates), with its own fader ramp state
   std::vector<ProcessorChain> fastChains_;
   std::vector<float> fastGain_;          // trackCount * kMaxChannels
   std::unique_ptr<bool[]> fastGainInit_;
