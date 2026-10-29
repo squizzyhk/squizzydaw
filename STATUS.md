@@ -1,6 +1,18 @@
 # Squizzy Studio - status matrix
 
-## Third pass: complete DAW (2026-10-28) - read this first
+## Fourth pass: plugin editors, plugin state, installer (2026-10-29) - read this first
+
+Main now contains the work of every branch (the arrange/mixer/instrument branch and the session-import branch were merged; five conflicts resolved in favour of the former, whose mixer commands and sample-rate conversion superseded the latter's). On top of that:
+
+- **Plugin editor windows (Windows):** `app/src/gui_plugin_editor.cpp` hosts VST3 and CLAP editors in owned top-level windows (DPI-correct client size, plugin-driven resize through `IPluginHostCallback::onEditorResize`, fixed-size plugins lose the thick frame). Opened from the device rack ("Open Editor" button, header double-click, card menu), the mixer (insert slot menu / double-click) and the Track menu (`Open Plugin Editor`, Ctrl+Shift+E: the selected track's plugin instrument, else its first active plugin insert). A structural edit recompiles the graph; the window re-attaches to the new instance instead of closing. Closing the window captures the plugin's state into the song. **Verified on this machine** with Surge XT (CLAP) and Graillon 3 (VST3): open, recompile re-attach, close box, save, app exit with editors open.
+- **Plugin state in the song:** an insert / instrument spec may end with `|s=<base64>` (opaque `IPluginInstance::saveState` bytes, loaded before the `i=v` values at instantiation). Captured on `File.Save`, when an editor window closes, and by `Plugin.CaptureState`. The structure key ignores it, so a capture never recompiles. Parameter edits made in a plugin's own editor are coalesced per gesture and written to the spec as one undo step ("Plugin Parameter"), so they persist and undo like rack edits.
+- **State survives recompiles:** `AudioEngine::compileAndInstall` snapshots every live plugin's state (`carryPluginStates`, keyed by node + `user.inserts` line, checked against the plugin id) and the new graph restores it before activation (`TrackDesc::insertStates`, `SubMixProcessor::setInitialStates`). This closes most of known gap 4 for plugins (built-in device state still restarts). `AudioEngine::pluginInstance / locatePlugin / pluginSlots` expose the hosted instances to the shell and GUI.
+- **Commands:** `Plugin.CaptureState`; `Track.SetVolume/SetPan/ToggleMute/ToggleSolo` (from the session-import branch). `SquizzyStudio.exe <song.song>` opens a song before `--run` commands and before the window (used by the installer's `.song` association).
+- **Installer:** `installer/build-installer.ps1` stages the app (app-local VC++ runtime, no test binaries) and builds `dist/SquizzyStudio-<version>-x64.msi` with WiX v5 (per-machine, Start Menu + Desktop shortcuts, `.song` association, major upgrade). See `installer/README.md`.
+- **Tests:** 132 CTest entries green on Windows (`engine_audio_plugin_state`, `engine_audio_spec_state` and new `engine_audio_plugin_fx` cases pin the state carry and the grammar). The whole tree builds with `/W4 /WX`.
+- **Known / open:** the plugin editor host is Windows-only (X11/Cocoa stubs return false with a status message). `pluginhost-vst3` logs "force-unloading with live objects" at exit when Graillon 3 was loaded (pre-existing: the same happens with the previous build; the plugin keeps objects alive). Plugin GUI edits of parameters that are not exposed as parameters only persist through the state capture (save / editor close). The plugin scan is asynchronous: `Plugins.Rescan` from `--run` needs a `Transport.Wait` long enough for the scan to finish, or the manifest stays empty.
+
+## Third pass: complete DAW (2026-10-28)
 
 This pass turned the service platform into a usable DAW. The tables further down are from the second pass; where they disagree with this section, this section wins.
 

@@ -49,7 +49,6 @@ wix build installer\SquizzyStudio.wxs -arch x64 -d StageDir=<stage> -d Version=<
 
 ## Known limits
 
-- `.song` is registered with an `open` verb that runs `SquizzyStudio.exe "%1"`, but the shell currently
-  accepts only `--option` arguments (`app/src/main.cpp`, `parseArgs`): a positional path prints the usage
-  and exits. The association starts working as soon as the app accepts a document path.
+- `.song` is registered with an `open` verb that runs `SquizzyStudio.exe "%1"`; the app opens that song
+  before showing the window (`SquizzyStudio [options] [song.song]`).
 - x64 only; no per-user install option (the package is `Scope="perMachine"` and asks for elevation).

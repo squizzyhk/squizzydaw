@@ -54,6 +54,10 @@ The Linux build has no window backend and no hardware audio driver yet: the app 
 
 The MSI installs to `%ProgramFiles%\Squizzy Studio`, adds Start Menu and Desktop shortcuts, registers `.song` (ProgId `SquizzyStudio.Song`) and upgrades an earlier version in place (fixed `UpgradeCode`; downgrades are refused). Details and known limits are in [`installer/README.md`](installer/README.md).
 
+## Plugins
+
+Scanned VST3 and CLAP plugins (`Plugins.Rescan`, or the browser's Plugins tab) can be used as instruments and inserts. Their own editor windows open from the device rack, the mixer or `Track > Open Plugin Editor` (Ctrl+Shift+E); their state is saved inside the song (`|s=<base64>` on the insert line) and survives graph recompiles, and edits made in the plugin's editor are undoable like rack edits.
+
 ## Run
 
 ```text

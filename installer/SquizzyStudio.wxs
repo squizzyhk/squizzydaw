@@ -71,8 +71,7 @@
         </File>
 
         <!-- ".song" file association: HKCR\.song -> SquizzyStudio.Song, open verb runs the EXE with the
-             document path. Note: the shell currently accepts only "- -option" arguments, so a positional
-             path makes it print usage and exit until the app grows an open-document argument. -->
+             document path (SquizzyStudio.exe accepts one positional song argument). -->
         <ProgId Id="SquizzyStudio.Song" Description="Squizzy Studio song" Icon="SquizzyStudioExe" IconIndex="0">
           <Extension Id="song" ContentType="application/x-squizzy-song">
             <Verb Id="open" Command="Open" TargetFile="SquizzyStudioExe" Argument="&quot;%1&quot;" />
