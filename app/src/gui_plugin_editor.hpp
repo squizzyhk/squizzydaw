@@ -31,9 +31,15 @@ class PluginEditorHost {
   // track's instrument. nodeTitle is the node's display name ("Master", the track name); the
   // window title becomes "<nodeTitle> - <plugin name>". ownerHwnd = the main window's native
   // handle. Returns false (with the reason on the status line) when that insert is not a running
-  // plugin, the plugin has no editor, or the window could not be created.
+  // plugin, the plugin has no editor, the window could not be created, or a plugin call of this
+  // host is still in progress (a plugin running a dialog's message loop inside it).
   bool open(const sq_guid& node, int32_t slot, const std::string& nodeTitle, void* ownerHwnd);
-  // Closes every editor window without touching the song (document switch, shutdown).
+  // Closes every editor window without touching the song (document switch, shutdown). runGui calls
+  // it before the main window closes: the frames are owned by that window and would otherwise be
+  // destroyed with it (the frame still closes the plugin's view from WM_DESTROY, as a safety net).
+  // Safe from a message loop a plugin runs inside one of this host's calls: the frames go at once,
+  // and so do the views except one inside that call (a resize), which closes once it has returned;
+  // the editors' bookkeeping is freed then too.
   void closeAll();
   // Main-loop pump: follows graph recompiles / removed inserts (cheap unless the engine's compile
   // count or the document serial changed) and forgets windows the user closed.

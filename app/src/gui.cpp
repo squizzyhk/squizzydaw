@@ -932,11 +932,15 @@ int runGui(Shell& shell, int quitAfterMs) {
       gui.overlays.clear();  // Save / Don't Save / Cancel, as for New, Open and Close Song
       gui::guardUnsavedChanges(gui, [&] {
         gui.quitConfirmed = true;
+        gui.editors_->closeAll();  // before the owner goes: closes the plugins' views while they exist
         window->close();
       });
       window->invalidate();
       return false;
     }
+    // The editor frames are owned by the main window and would be destroyed with it (children,
+    // i.e. the plugins' views, first): close them properly while the views still exist.
+    gui.editors_->closeAll();
     return true;
   };
   window->setCallbacks(std::move(cb));
@@ -946,6 +950,7 @@ int runGui(Shell& shell, int quitAfterMs) {
   for (;;) {
     bool alive = window->pumpEvents(false);
     if (alive && quitAfterMs >= 0 && (sq_time_monotonic_ns() - start) / 1000000ull >= static_cast<uint64_t>(quitAfterMs)) {
+      gui.editors_->closeAll();  // IWindow::close() skips WM_CLOSE / onCloseRequest
       window->close();
       alive = window->pumpEvents(false);
     }

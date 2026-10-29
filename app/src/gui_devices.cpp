@@ -81,8 +81,10 @@ struct Card {
   Rect box, header, power, remove, left, right, menu;
   Rect editorBtn;  // "Open Editor" of a plugin card (empty for built-in devices)
   std::vector<Rect> controls;
-  // A plugin (non built-in) card: parameters live in the plugin's own editor window.
-  bool plugin() const { return info == nullptr && spec.format != "builtin"; }
+  // A plugin (non built-in) card: parameters live in the plugin's own editor window. Not an
+  // unparseable line (format "?"): nothing runs behind it, so there is no editor to open (same
+  // rule as the mixer's isPluginInsert, which requires parseSpec to succeed).
+  bool plugin() const { return info == nullptr && spec.format != "builtin" && spec.format != "?"; }
 };
 
 class DeviceRack final : public Widget {

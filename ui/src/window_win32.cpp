@@ -134,18 +134,22 @@ class Win32Window final : public IWindow {
   explicit Win32Window(const WindowDesc& d) {
     static bool registered = false;
     HINSTANCE inst = GetModuleHandleW(nullptr);
+    enableDpiAwareness();  // before the class: its icons are loaded at the sizes for this DPI
     if (!registered) {
       WNDCLASSEXW wc{};
       wc.cbSize = sizeof wc;
       wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
       wc.lpfnWndProc = &Win32Window::wndProc;
       wc.hInstance = inst;
+      // The app icon (IDI_APP in the exe's resources) for the caption and Alt+Tab; null in an
+      // executable without it (tests), which leaves Windows' default icon.
+      wc.hIcon = static_cast<HICON>(LoadImageW(inst, L"IDI_APP", IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0));
+      wc.hIconSm = static_cast<HICON>(LoadImageW(inst, L"IDI_APP", IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
       wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
       wc.lpszClassName = kClassName;
       RegisterClassExW(&wc);
       registered = true;
     }
-    enableDpiAwareness();
     // WindowDesc sizes are DIPs: scale by the system DPI, and fit the work area.
     UINT sysDpi = 96;
     if (HDC sdc = GetDC(nullptr)) {
