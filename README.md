@@ -52,7 +52,7 @@ The Linux build has no window backend and no hardware audio driver yet: the app 
 .\installer\build-installer.ps1 -BuildDir build\windows-release -OutDir out\dist -Version 0.2.0
 ```
 
-The MSI installs to `%ProgramFiles%\Squizzy Studio`, adds Start Menu and Desktop shortcuts, registers `.song` (ProgId `SquizzyStudio.Song`) and upgrades an earlier version in place (fixed `UpgradeCode`; downgrades are refused). Details and known limits are in [`installer/README.md`](installer/README.md).
+The MSI installs to `%ProgramFiles%\Squizzy Studio`, adds Start Menu and Desktop shortcuts, registers `.song` (ProgId `SquizzyStudio.Song`) and upgrades an earlier or same-version install in place (fixed `UpgradeCode` with `AllowSameVersionUpgrades`, so a rebuilt `0.1.0` replaces the installed `0.1.0`; downgrades are refused). The application icon is `app/resources/SquizzyStudio.ico`, compiled into `SquizzyStudio.exe` (`app/resources/app.rc`) and reused for the Add/Remove Programs entry. Details and known limits are in [`installer/README.md`](installer/README.md).
 
 ## Plugins
 

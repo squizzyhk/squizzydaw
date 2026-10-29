@@ -53,6 +53,15 @@ target_include_directories(SquizzyStudio PRIVATE "${_gen}" "${CMAKE_CURRENT_SOUR
 target_link_libraries(SquizzyStudio PRIVATE sq::shell sq::ui)
 sq_set_output_dir(SquizzyStudio "${SQ_BIN_DIR}")
 sq_stamp_version(SquizzyStudio SquizzyStudio ${SQ_VERSION} "Squizzy Studio" "VFT_APP")
+if(WIN32)
+  # Application icon (IDI_APP, the EXE's first icon resource): Explorer, the taskbar, the MSI shortcuts
+  # and the .song ProgId all read it from SquizzyStudio.exe. The master .ico lives next to the .rc;
+  # installer/build-installer.ps1 passes the same file to wix for the Add/Remove Programs icon.
+  target_sources(SquizzyStudio PRIVATE resources/app.rc)
+  set_source_files_properties(resources/app.rc PROPERTIES
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/resources"
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/SquizzyStudio.ico")
+endif()
 
 # Stock themes (ui/themes, packed by tools/skin-compiler's sq-skinc): embedded as RCDATA "SQTHEMES" on
 # Windows (Shell loads ThemePack::fromResource) and copied to <bin>/themes/sqthemes.sqtheme for

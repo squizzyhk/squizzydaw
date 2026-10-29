@@ -8,9 +8,15 @@
                  shortcuts and the .song association can reference it by File Id.
     Version    - product version a.b.c (SQ_VERSION from the repo VERSION file).
     LicenseRtf - full path of installer/License.rtf shown on the licence page.
+    IconIco    - full path of app/resources/SquizzyStudio.ico (16/32/48/256), the Add/Remove Programs icon.
+                 The same file is compiled into SquizzyStudio.exe (app/resources/app.rc), which is what the
+                 shortcuts and the .song ProgId point at.
 
   Contract: UpgradeCode never changes (MajorUpgrade keys off it); bump Version for every release so an
   upgrade replaces the previous install in place and a downgrade is refused with DowngradeErrorMessage.
+  AllowSameVersionUpgrades="yes": a rebuild with an unchanged Version (every dev build is 0.1.0) also
+  replaces the installed copy instead of installing beside it. `wix msi validate` reports ICE61 for this
+  (the Upgrade row includes the package's own version); it is expected. `wix build` runs no ICEs.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
@@ -24,12 +30,15 @@
            InstallerVersion="500"
            Compressed="yes">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first to install this version." />
+    <!-- Default schedule (afterInstallValidate): the old product is removed before the new files go in. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first to install this version." />
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Add/Remove Programs icon: the first icon resource of the application EXE. -->
-    <Icon Id="SquizzyStudioIcon.exe" SourceFile="$(var.StageDir)\SquizzyStudio.exe" />
-    <Property Id="ARPPRODUCTICON" Value="SquizzyStudioIcon.exe" />
+    <!-- Add/Remove Programs icon: the small .ico itself (not the EXE, which would be copied into the Icon
+         table verbatim). Shortcuts and the ProgId use the EXE's own icon resource instead. -->
+    <Icon Id="SquizzyStudio.ico" SourceFile="$(var.IconIco)" />
+    <Property Id="ARPPRODUCTICON" Value="SquizzyStudio.ico" />
     <!-- ARPNOMODIFY is already set by WixUI_InstallDir; declaring it here again is a duplicate-symbol error. -->
 
     <!-- Install root: %ProgramFiles%\Squizzy Studio (x64 only). -->

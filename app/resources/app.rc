@@ -1,0 +1,6 @@
+// Application icon resource for SquizzyStudio.exe (Windows only; compiled by app/CMakeLists.txt).
+// Contract: IDI_APP is the first (and only) ICON resource, so Explorer, the taskbar, the MSI shortcuts
+// and the .song ProgId (IconIndex 0) all show it. The master icon is resources/SquizzyStudio.ico; the
+// installer reuses that file for the Add/Remove Programs icon (installer/build-installer.ps1 -d IconIco).
+// Keep this file free of VERSIONINFO: sq_stamp_version generates that block in a separate .rc.
+IDI_APP ICON "SquizzyStudio.ico"

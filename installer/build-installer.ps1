@@ -54,9 +54,12 @@ $outDirFull = Resolve-RepoPath $OutDir
 $bin = Join-Path $buildDirFull 'bin'
 $wxs = Join-Path $PSScriptRoot 'SquizzyStudio.wxs'
 $licenseRtf = Join-Path $PSScriptRoot 'License.rtf'
+# Master application icon: compiled into SquizzyStudio.exe by app/resources/app.rc and reused here for the
+# Add/Remove Programs entry (small Icon table row instead of the whole EXE).
+$iconIco = Join-Path $repoRoot 'app\resources\SquizzyStudio.ico'
 
 if (!(Test-Path $bin)) { Fail "build output folder not found: $bin (build the windows-release preset first)" }
-foreach ($f in $wxs, $licenseRtf) { if (!(Test-Path $f)) { Fail "installer source missing: $f" } }
+foreach ($f in $wxs, $licenseRtf, $iconIco) { if (!(Test-Path $f)) { Fail "installer source missing: $f" } }
 
 # --- version ---------------------------------------------------------------------------------------------
 if (-not $Version) {
@@ -133,6 +136,7 @@ $wixArgs = @(
   '-d', "StageDir=$stage",
   '-d', "Version=$msiVersion",
   '-d', "LicenseRtf=$licenseRtf",
+  '-d', "IconIco=$iconIco",
   '-ext', 'WixToolset.UI.wixext',
   '-pdbtype', 'none',
   '-o', $msi
