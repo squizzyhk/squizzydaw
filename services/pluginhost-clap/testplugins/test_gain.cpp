@@ -6,11 +6,19 @@
 //   - a stereo sidechain input bus (mixed into the output by the "Sidechain Mix" parameter),
 //   - a note input port (counts note-ons into the read-only "Notes Received" parameter and
 //     reports the change as an output parameter event) and a note output port (echoes notes),
-//   - state save/load of the parameter values.
-// Used by the pluginhost-clap and pluginscanner tests; lives in bin/testplugins/.
+//   - state save/load of the parameter values,
+//   - a hidden "Edit Probe" parameter (test-only): every value the host sends it makes the plugin
+//     act as if its editor had dragged "Sidechain Mix" to that value (GESTURE_BEGIN, PARAM_VALUE,
+//     GESTURE_END on the output events), so hosts can test editor edits of an active plugin,
+//   - two exported test-only functions (not CLAP; host tests reach them through their own handle
+//     on this library): sq_test_gain_set_process_hook (a callback at the start of every process
+//     call, before the plugin reads its input events) and sq_test_gain_set_edit_steps (how many
+//     PARAM_VALUE steps an Edit Probe drag reports, default 1).
+// Used by the pluginhost-clap, pluginscanner and app e2e tests; lives in bin/testplugins/.
 #include <cstdlib>
 #include <clap/clap.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -22,9 +30,14 @@ namespace {
 constexpr uint32_t kLatency = 64;
 constexpr uint32_t kChannels = 2;
 
-enum ParamId : clap_id { kGain = 1, kScMix = 2, kBypass = 3, kNotes = 4 };
-constexpr clap_id kParamIds[] = {kGain, kScMix, kBypass, kNotes};
-constexpr uint32_t kParamCount = 4;
+enum ParamId : clap_id { kGain = 1, kScMix = 2, kBypass = 3, kNotes = 4, kEditProbe = 5 };
+constexpr clap_id kParamIds[] = {kGain, kScMix, kBypass, kNotes, kEditProbe};
+constexpr uint32_t kParamCount = 5;
+
+// Test-only hooks (see the exported functions at the end).
+std::atomic<void (*)(void*)> gProcessHook{nullptr};
+std::atomic<void*> gProcessHookCtx{nullptr};
+std::atomic<uint32_t> gEditSteps{1};
 
 const char* const kFeatures[] = {CLAP_PLUGIN_FEATURE_AUDIO_EFFECT, CLAP_PLUGIN_FEATURE_UTILITY, CLAP_PLUGIN_FEATURE_STEREO, nullptr};
 
@@ -48,6 +61,7 @@ struct Gain {
   double scMix = 0.0;
   double bypass = 0.0;
   double notes = 0.0;
+  double editProbe = 0.0;
   float* delay[kChannels] = {nullptr, nullptr};
   uint32_t delayPos = 0;
   bool active = false;
@@ -61,6 +75,7 @@ double* paramSlot(Gain* g, clap_id id) {
     case kScMix: return &g->scMix;
     case kBypass: return &g->bypass;
     case kNotes: return &g->notes;
+    case kEditProbe: return &g->editProbe;
     default: return nullptr;
   }
 }
@@ -116,6 +131,38 @@ void pushNotesParam(Gain* g, const clap_output_events_t* out, uint32_t time) {
   out->try_push(out, &ev.header);
 }
 
+// Test-only "Edit Probe": what an editor drag of "Sidechain Mix" to `value` reports to the host
+// (gEditSteps PARAM_VALUE events, evenly spaced from the current value, the last one exact).
+void simulateEditorEdit(Gain* g, const clap_output_events_t* out, uint32_t time, double value) {
+  const double from = g->scMix;
+  g->scMix = clampParam(kScMix, value);
+  if (!out) return;
+  clap_event_param_gesture_t gesture{};
+  gesture.header.size = sizeof gesture;
+  gesture.header.time = time;
+  gesture.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+  gesture.header.type = CLAP_EVENT_PARAM_GESTURE_BEGIN;
+  gesture.param_id = kScMix;
+  out->try_push(out, &gesture.header);
+  clap_event_param_value_t ev{};
+  ev.header.size = sizeof ev;
+  ev.header.time = time;
+  ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+  ev.header.type = CLAP_EVENT_PARAM_VALUE;
+  ev.param_id = kScMix;
+  ev.note_id = -1;
+  ev.port_index = -1;
+  ev.channel = -1;
+  ev.key = -1;
+  const uint32_t steps = gEditSteps.load(std::memory_order_relaxed);
+  for (uint32_t i = 1; i <= steps; ++i) {
+    ev.value = i == steps ? g->scMix : from + (g->scMix - from) * i / steps;
+    out->try_push(out, &ev.header);
+  }
+  gesture.header.type = CLAP_EVENT_PARAM_GESTURE_END;
+  out->try_push(out, &gesture.header);
+}
+
 void handleEvent(Gain* g, const clap_event_header_t* h, const clap_output_events_t* out) {
   if (h->space_id != CLAP_CORE_EVENT_SPACE_ID) return;
   switch (h->type) {
@@ -123,6 +170,7 @@ void handleEvent(Gain* g, const clap_event_header_t* h, const clap_output_events
       auto* ev = reinterpret_cast<const clap_event_param_value_t*>(h);
       if (ev->param_id == kNotes) break;  // read-only
       if (double* slot = paramSlot(g, ev->param_id)) *slot = clampParam(ev->param_id, ev->value);
+      if (ev->param_id == kEditProbe) simulateEditorEdit(g, out, h->time, g->editProbe);
       break;
     }
     case CLAP_EVENT_NOTE_ON:
@@ -151,6 +199,7 @@ void handleEvent(Gain* g, const clap_event_header_t* h, const clap_output_events
 clap_process_status gProcess(const clap_plugin_t* p, const clap_process_t* proc) {
   Gain* g = self(p);
   if (!g->active || proc->audio_outputs_count < 1 || proc->audio_inputs_count < 1) return CLAP_PROCESS_ERROR;
+  if (auto hook = gProcessHook.load(std::memory_order_acquire)) hook(gProcessHookCtx.load(std::memory_order_acquire));
   const clap_audio_buffer_t& in = proc->audio_inputs[0];
   const clap_audio_buffer_t* sc = proc->audio_inputs_count > 1 ? &proc->audio_inputs[1] : nullptr;
   const clap_audio_buffer_t& outb = proc->audio_outputs[0];
@@ -247,6 +296,11 @@ bool prInfo(const clap_plugin_t*, uint32_t index, clap_param_info_t* info) {
       std::snprintf(info->name, sizeof info->name, "Notes Received");
       info->max_value = 1e6;
       break;
+    case kEditProbe:
+      info->flags = CLAP_PARAM_IS_HIDDEN;
+      std::snprintf(info->name, sizeof info->name, "Edit Probe (test)");
+      info->max_value = 1;
+      break;
   }
   return true;
 }
@@ -261,6 +315,7 @@ bool prToText(const clap_plugin_t*, clap_id id, double v, char* buf, uint32_t si
   if (id == kBypass) return std::snprintf(buf, size, "%s", v >= 0.5 ? "On" : "Off") > 0;
   if (id == kScMix) return std::snprintf(buf, size, "%.0f %%", v * 100.0) > 0;
   if (id == kNotes) return std::snprintf(buf, size, "%.0f", v) > 0;
+  if (id == kEditProbe) return std::snprintf(buf, size, "%.2f", v) > 0;
   return false;
 }
 bool prFromText(const clap_plugin_t*, clap_id, const char* text, double* out) {
@@ -354,3 +409,16 @@ const void* eGetFactory(const char* id) { return std::strcmp(id, CLAP_PLUGIN_FAC
 }  // namespace
 
 extern "C" CLAP_EXPORT const clap_plugin_entry_t clap_entry = {CLAP_VERSION_INIT, eInit, eDeinit, eGetFactory};
+
+// ---- test-only exports (not CLAP) ----------------------------------------------------------------
+// `fn(ctx)` runs at the start of every process call, before the plugin reads its input events
+// (null: none). Set it while no process call runs.
+extern "C" CLAP_EXPORT void sq_test_gain_set_process_hook(void (*fn)(void*), void* ctx) {
+  gProcessHook.store(nullptr, std::memory_order_release);
+  gProcessHookCtx.store(ctx, std::memory_order_release);
+  gProcessHook.store(fn, std::memory_order_release);
+}
+// Every later Edit Probe drag reports `steps` PARAM_VALUE events (at least 1) between its gesture events.
+extern "C" CLAP_EXPORT void sq_test_gain_set_edit_steps(uint32_t steps) {
+  gEditSteps.store(steps ? steps : 1u, std::memory_order_relaxed);
+}

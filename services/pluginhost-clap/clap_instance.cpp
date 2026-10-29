@@ -7,10 +7,20 @@
 //    storage and the sysex arena are sized in activate(); main-thread parameter sets travel in a
 //    fixed SPSC ring.
 //  - Plugin -> host requests that may arrive on any thread (request_restart, request_callback,
-//    latency/params/state notifications) only set atomic flags. They are delivered to the
-//    IPluginHostCallback (and on_main_thread() is called) from the next main-thread call into
-//    this instance (pump()). The interface has no idle hook, so the engine should call any cheap
-//    main-thread method (e.g. getLatencyFrames) periodically; see the handoff notes.
+//    latency/params/state notifications) only set atomic flags. Parameter edits the plugin reports
+//    from process() (CLAP_EVENT_PARAM_VALUE / PARAM_GESTURE_* on out_events: its editor while it is
+//    active) go to the caller's params_out; when that is absent or full (the engine passes none)
+//    they go into a fixed SPSC ring instead (fromAudio_; read-only parameters are outputs, not
+//    edits, and are not queued). What the ring has no room for is merged per parameter into
+//    preallocated records (newest value, gesture END / BEGIN) that the audio thread pushes into
+//    the ring once it has room again (deactivate() delivers the rest): a parameter's final value
+//    and its GESTURE_END are never lost. Both are delivered to the IPluginHostCallback (and
+//    on_main_thread() is called) from the next main-thread call into this instance (pump()). The
+//    interface has no idle hook: the host calls a cheap main-thread method (getLatencyFrames) on
+//    every hosted instance from its idle tick (the app shell does it in Shell::idle).
+//  - While active, setParamValue() queues the value for the audio thread; getParamValue() reports
+//    a queued value until the plugin's process call that received it has returned, so a set is
+//    visible right away and never reads back as the old value afterwards.
 #include "clap_instance.hpp"
 
 #include <algorithm>
@@ -223,6 +233,9 @@ ClapInstance::ClapInstance() {
 }
 
 ClapInstance::~ClapInstance() {
+  // The refcount is already 0: no host callback may see this object any more (a callback that
+  // add-refs and releases its argument would delete it a second time). deactivate() pumps.
+  cb_ = nullptr;
   if (plugin_) {
     if (editorOpen_ && gui_) gui_->destroy(plugin_);
     if (active_) deactivate();
@@ -288,6 +301,13 @@ bool ClapInstance::isMainThread() const { return !tAudioThread && sq_thread_curr
 
 void ClapInstance::pump() {
   if (!plugin_ || !isMainThread()) return;
+  // Editor edits reported from process() (pushOutputEvent), oldest first.
+  ParamEdit pe{};
+  while (fromAudio_.pop(pe)) {
+    if (!cb_) continue;
+    const sq_param_change c{pe.id, 0, pe.value, pe.flags};
+    cb_->onParamEdited(this, &c);
+  }
   uint32_t p = pending_.exchange(0, std::memory_order_acq_rel);
   if (!p) return;
   if (p & kPendCallback) plugin_->on_main_thread(plugin_);
@@ -372,22 +392,43 @@ sq_result ClapInstance::activate(const sq_plugin_setup* setup) {
     evStore_.assign(4096, EventSlot{});
     evList_.assign(4096, nullptr);
     sysexArena_.assign(64 * 1024, 0);
-    // Parameter value table (for gesture values on output).
+    // Parameter value table (for gesture values on output), read-only flags, in-flight sets.
     paramIds_.clear();
+    std::vector<std::pair<uint32_t, uint8_t>> infos;  // (id, read-only)
     if (params_) {
       uint32_t n = params_->count(plugin_);
       for (uint32_t i = 0; i < n; ++i) {
         clap_param_info_t pi{};
-        if (params_->get_info(plugin_, i, &pi)) paramIds_.push_back(pi.id);
+        if (!params_->get_info(plugin_, i, &pi)) continue;
+        infos.emplace_back(pi.id, (pi.flags & CLAP_PARAM_IS_READONLY) ? uint8_t{1} : uint8_t{0});
       }
-      std::sort(paramIds_.begin(), paramIds_.end());
+      std::sort(infos.begin(), infos.end());
     }
-    paramValues_.reset(new std::atomic<double>[paramIds_.size() ? paramIds_.size() : 1]);
+    paramIds_.reserve(infos.size());
+    paramReadOnly_.clear();
+    paramReadOnly_.reserve(infos.size());
+    for (const auto& [id, ro] : infos) {
+      paramIds_.push_back(id);
+      paramReadOnly_.push_back(ro);
+    }
+    const size_t np = paramIds_.size() ? paramIds_.size() : 1;
+    paramValues_.reset(new std::atomic<double>[np]);
     for (size_t i = 0; i < paramIds_.size(); ++i) {
       double v = 0;
       if (params_) params_->get_value(plugin_, paramIds_[i], &v);
       paramValues_[i].store(v, std::memory_order_relaxed);
     }
+    paramQueuedSeq_.assign(np, 0);
+    paramQueuedValue_.assign(np, 0.0);
+    paramAppliedSeq_.reset(new std::atomic<uint32_t>[np]);
+    for (size_t i = 0; i < np; ++i) paramAppliedSeq_[i].store(0, std::memory_order_relaxed);
+    paramTakenSeq_.assign(np, 0);
+    paramTakenSlots_.assign(np, 0);
+    paramTakenCount_ = 0;
+    paramHeld_.assign(np, 0);
+    paramHeldValue_.assign(np, 0.0);
+    heldSlots_.assign(np, 0);
+    heldHead_ = heldCount_ = 0;
   } catch (...) {
     return SQ_E_OUTOFMEMORY;
   }
@@ -425,8 +466,37 @@ sq_result ClapInstance::deactivate() {
   }
   plugin_->deactivate(plugin_);
   active_ = false;
-  ParamSet drop{};
-  while (toAudio_.pop(drop)) {
+  // The edits process() reported come first, oldest first: the ring's, then those held back from a
+  // full ring that no process() call pushes any more. Anything the flush in pump() (a pending
+  // request_flush) reports is newer. Like pump(), only on the main thread: an
+  // instance released elsewhere (a stuck offline render's, on its worker) drops the held ones and
+  // leaves the ring.
+  const bool deliver = isMainThread();
+  if (deliver)
+    for (ParamEdit pe{}; fromAudio_.pop(pe);) {
+      if (!cb_) continue;
+      const sq_param_change c{pe.id, 0, pe.value, pe.flags};
+      cb_->onParamEdited(this, &c);
+    }
+  for (ParamEdit pe{}; nextHeldEdit(pe); popHeldEdit()) {
+    if (!cb_ || !deliver) continue;
+    const sq_param_change c{pe.id, 0, pe.value, pe.flags};
+    cb_->onParamEdited(this, &c);
+  }
+  // Sets no process() call picked up any more still reach the (now inactive) plugin.
+  std::vector<ParamSet> late;
+  ParamSet ps{};
+  while (toAudio_.pop(ps)) {
+    try {
+      late.push_back(ps);
+    } catch (...) {
+    }
+  }
+  if (!late.empty()) {
+    try {
+      flushParamsMainThread(late.data(), static_cast<uint32_t>(late.size()), false);
+    } catch (...) {  // out of memory: the sets are lost (the destructor calls this too)
+    }
   }
   pump();
   return SQ_OK;
@@ -441,7 +511,7 @@ uint32_t ClapInstance::paramSlot(uint32_t id) const {
 bool ClapInstance::pushOutputEvent(const clap_event_header_t* h) {
   if (!h || h->space_id != CLAP_CORE_EVENT_SPACE_ID) return false;
   sq_plugin_process* d = curProcess_;
-  auto addParam = [&](uint32_t id, uint32_t time, double value, uint32_t flags) -> bool {
+  auto addParam = [&](uint32_t id, uint32_t time, double value, uint32_t flags, uint32_t slot) -> bool {
     if (flushEdits_) {  // main-thread flush (editor edits)
       try {
         flushEdits_->push_back(sq_param_change{id, 0, value, flags});
@@ -450,8 +520,23 @@ bool ClapInstance::pushOutputEvent(const clap_event_header_t* h) {
       }
       return true;
     }
-    if (!d || !d->params_out || d->params_out_count >= d->params_out_capacity) return false;
-    d->params_out[d->params_out_count++] = sq_param_change{id, time, value, flags};
+    if (!d) return false;  // not inside process()
+    // A held parameter's newer edits queue up behind the held ones (holdEdit).
+    const bool held = slot != UINT32_MAX && paramHeld_[slot] != 0;
+    if (!held && d->params_out && d->params_out_count < d->params_out_capacity) {
+      d->params_out[d->params_out_count++] = sq_param_change{id, time, value, flags};
+      return true;
+    }
+    // No (more) room in params_out: the main thread reports the edit from pump(). A read-only
+    // parameter (meter, counter) is an output of the plugin, not an edit, and a gesture of a
+    // parameter the table does not know has no value to report: both accepted and dropped.
+    if (slot == UINT32_MAX ? flags != 0 : paramReadOnly_[slot] != 0) return true;
+    if (!held) {
+      if (heldCount_) pushHeldEdits();  // the edits held before this one go first
+      if ((!heldCount_ || slot == UINT32_MAX) && fromAudio_.push(ParamEdit{id, flags, value})) return true;
+      if (slot == UINT32_MAX) return false;  // no record to hold it in
+    }
+    holdEdit(slot, flags, value);
     return true;
   };
   auto addMidi = [&](uint32_t time, uint8_t b0, uint8_t b1, uint8_t b2, uint32_t size, const uint8_t* data) -> bool {
@@ -471,14 +556,15 @@ bool ClapInstance::pushOutputEvent(const clap_event_header_t* h) {
       auto* e = reinterpret_cast<const clap_event_param_value_t*>(h);
       uint32_t slot = paramSlot(e->param_id);
       if (slot != UINT32_MAX) paramValues_[slot].store(e->value, std::memory_order_relaxed);
-      return addParam(e->param_id, h->time, e->value, 0);
+      return addParam(e->param_id, h->time, e->value, 0, slot);
     }
     case CLAP_EVENT_PARAM_GESTURE_BEGIN:
     case CLAP_EVENT_PARAM_GESTURE_END: {
       auto* e = reinterpret_cast<const clap_event_param_gesture_t*>(h);
       uint32_t slot = paramSlot(e->param_id);
       double v = slot != UINT32_MAX ? paramValues_[slot].load(std::memory_order_relaxed) : 0.0;
-      return addParam(e->param_id, h->time, v, h->type == CLAP_EVENT_PARAM_GESTURE_BEGIN ? SQ_PARAM_GESTURE_BEGIN : SQ_PARAM_GESTURE_END);
+      return addParam(e->param_id, h->time, v, h->type == CLAP_EVENT_PARAM_GESTURE_BEGIN ? SQ_PARAM_GESTURE_BEGIN : SQ_PARAM_GESTURE_END,
+                      slot);
     }
     case CLAP_EVENT_NOTE_ON:
     case CLAP_EVENT_NOTE_OFF: {
@@ -506,6 +592,44 @@ bool ClapInstance::pushOutputEvent(const clap_event_header_t* h) {
     default:
       return false;
   }
+}
+
+void ClapInstance::holdEdit(uint32_t slot, uint32_t flags, double value) {
+  uint8_t& h = paramHeld_[slot];
+  if (!h) {  // newly held: joins the FIFO (each slot at most once, so heldSlots_ never overflows)
+    heldSlots_[(heldHead_ + heldCount_) % static_cast<uint32_t>(heldSlots_.size())] = slot;
+    ++heldCount_;
+  }
+  h = static_cast<uint8_t>(h | kHeldEdit);
+  if (flags & SQ_PARAM_GESTURE_BEGIN) h = static_cast<uint8_t>(h | kHeldOpen);
+  if (flags & SQ_PARAM_GESTURE_END) h = static_cast<uint8_t>((h & ~kHeldOpen) | kHeldEnd);
+  paramHeldValue_[slot] = value;
+}
+
+bool ClapInstance::nextHeldEdit(ParamEdit& out) const {
+  if (!heldCount_) return false;
+  // A held parameter reports at most two edits, both with its newest value: GESTURE_END when a
+  // gesture ended, then GESTURE_BEGIN when one is still open (a plain value when neither).
+  const uint32_t slot = heldSlots_[heldHead_];
+  const uint8_t h = paramHeld_[slot];
+  const uint32_t flags = (h & kHeldEnd) ? SQ_PARAM_GESTURE_END : (h & kHeldOpen) ? SQ_PARAM_GESTURE_BEGIN : 0u;
+  out = ParamEdit{paramIds_[slot], flags, paramHeldValue_[slot]};
+  return true;
+}
+
+void ClapInstance::popHeldEdit() {
+  if (!heldCount_) return;
+  const uint32_t slot = heldSlots_[heldHead_];
+  uint8_t& h = paramHeld_[slot];
+  h = ((h & kHeldEnd) && (h & kHeldOpen)) ? static_cast<uint8_t>(kHeldEdit | kHeldOpen) : uint8_t{0};
+  if (h) return;  // its BEGIN is next
+  heldHead_ = (heldHead_ + 1) % static_cast<uint32_t>(heldSlots_.size());
+  --heldCount_;
+}
+
+void ClapInstance::pushHeldEdits() {
+  ParamEdit pe{};
+  while (nextHeldEdit(pe) && fromAudio_.push(pe)) popHeldEdit();
 }
 
 sq_result ClapInstance::process(sq_plugin_process* d) {
@@ -610,7 +734,14 @@ sq_result ClapInstance::process(sq_plugin_process* d) {
     ++evCount_;
   };
   ParamSet ps{};
-  while (toAudio_.pop(ps)) addParamEvent(ps.id, 0, ps.value);
+  while (toAudio_.pop(ps)) {
+    addParamEvent(ps.id, 0, ps.value);
+    if (ps.seq == 0) continue;
+    const uint32_t slot = paramSlot(ps.id);
+    if (slot == UINT32_MAX) continue;
+    if (!paramTakenSeq_[slot]) paramTakenSlots_[paramTakenCount_++] = slot;
+    paramTakenSeq_[slot] = ps.seq;  // published once the plugin has processed it (below)
+  }
   uint32_t mi = 0, pi = 0;
   const uint32_t mn = d->midi_in ? d->midi_in_count : 0;
   const uint32_t pn = d->params_in ? d->params_in_count : 0;
@@ -662,6 +793,14 @@ sq_result ClapInstance::process(sq_plugin_process* d) {
   clap_process_status st = plugin_->process(plugin_, &proc);
   curProcess_ = nullptr;
   steadyTime_ += frames;
+  // The plugin has processed the queued sets: getParamValue() may ask it for them now.
+  for (uint32_t i = 0; i < paramTakenCount_; ++i) {
+    const uint32_t slot = paramTakenSlots_[i];
+    paramAppliedSeq_[slot].store(paramTakenSeq_[slot], std::memory_order_release);
+    paramTakenSeq_[slot] = 0;
+  }
+  paramTakenCount_ = 0;
+  if (heldCount_) pushHeldEdits();  // as soon as the main thread has made room
   if (st == CLAP_PROCESS_ERROR) return SQ_E_FAIL;
   return st == CLAP_PROCESS_SLEEP ? SQ_S_FALSE : SQ_OK;
 }
@@ -719,6 +858,14 @@ sq_result ClapInstance::getParamValue(uint32_t paramId, double* value) {
   pump();
   if (!value) return SQ_E_INVALIDARG;
   if (!params_) return SQ_E_NOTFOUND;
+  if (active_) {
+    // A set the plugin has not processed yet is the value it is about to have.
+    const uint32_t slot = paramSlot(paramId);
+    if (slot != UINT32_MAX && paramAppliedSeq_[slot].load(std::memory_order_acquire) != paramQueuedSeq_[slot]) {
+      *value = paramQueuedValue_[slot];
+      return SQ_OK;
+    }
+  }
   return params_->get_value(plugin_, paramId, value) ? SQ_OK : SQ_E_NOTFOUND;
 }
 
@@ -757,7 +904,17 @@ sq_result ClapInstance::setParamValue(uint32_t paramId, double value) {
   pump();
   if (!params_) return SQ_E_NOTFOUND;
   if (std::isnan(value)) return SQ_E_INVALIDARG;
-  if (active_) return toAudio_.push(ParamSet{paramId, value}) ? SQ_OK : SQ_E_BUSY;
+  if (active_) {
+    const uint32_t slot = paramSlot(paramId);
+    uint32_t seq = 0;  // 0 = untracked (an id the parameter table does not know)
+    if (slot != UINT32_MAX) seq = paramQueuedSeq_[slot] == UINT32_MAX ? 1u : paramQueuedSeq_[slot] + 1;
+    if (!toAudio_.push(ParamSet{paramId, value, seq})) return SQ_E_BUSY;
+    if (slot != UINT32_MAX) {
+      paramQueuedValue_[slot] = value;
+      paramQueuedSeq_[slot] = seq;
+    }
+    return SQ_OK;
+  }
   ParamSet ps{paramId, value};
   flushParamsMainThread(&ps, 1, false);
   return SQ_OK;

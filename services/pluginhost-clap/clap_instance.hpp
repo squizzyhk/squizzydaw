@@ -59,6 +59,13 @@ class ClapInstance final : public sq::Object<ClapInstance, sq::IPluginInstance> 
   struct ParamSet {
     uint32_t id;
     double value;
+    uint32_t seq = 0;  // setParamValue while active: the parameter's paramQueuedSeq_ for this set (0 = untracked)
+  };
+  // A parameter edit the plugin reported from process() (out_events) for the main thread.
+  struct ParamEdit {
+    uint32_t id;
+    uint32_t flags;  // SQ_PARAM_GESTURE_*
+    double value;    // plain
   };
   union EventSlot {
     clap_event_header_t header;
@@ -76,13 +83,23 @@ class ClapInstance final : public sq::Object<ClapInstance, sq::IPluginInstance> 
     kPendFlush = 1u << 5,
     kPendTail = 1u << 6,
   };
+  // paramHeld_ bits: what a parameter's edits fromAudio_ had no room for add up to.
+  enum Held : uint8_t {
+    kHeldEdit = 1u << 0,  // at least one edit (the newest value is paramHeldValue_)
+    kHeldEnd = 1u << 1,   // a GESTURE_END among them
+    kHeldOpen = 1u << 2,  // a GESTURE_BEGIN after the last END: the gesture is still open
+  };
 
-  void pump();  // main thread: deliver deferred plugin requests to the host callback
+  void pump();  // main thread: deliver deferred plugin requests and process() edits to the host callback
   void queryExtensions();
   bool isMainThread() const;
   void flushParamsMainThread(const ParamSet* sets, uint32_t count, bool reportEdits);
   uint32_t paramSlot(uint32_t id) const;  // index into paramIds_, or UINT32_MAX (RT-safe)
   bool pushOutputEvent(const clap_event_header_t* h);  // audio thread (or flush on main)
+  void holdEdit(uint32_t slot, uint32_t flags, double value);  // audio thread: fromAudio_ is full
+  bool nextHeldEdit(ParamEdit& out) const;                     // the oldest held parameter's next edit
+  void popHeldEdit();                                          // drops the edit nextHeldEdit() returned
+  void pushHeldEdits();  // audio thread: held edits into fromAudio_, oldest first, while it has room
 
   // CLAP callbacks (static thunks in the .cpp forward here).
   clap_host_t host_{};
@@ -123,7 +140,27 @@ class ClapInstance final : public sq::Object<ClapInstance, sq::IPluginInstance> 
   uint32_t sysexUsed_ = 0;
   std::vector<uint32_t> paramIds_;                      // sorted
   std::unique_ptr<std::atomic<double>[]> paramValues_;  // parallel to paramIds_
+  std::vector<uint8_t> paramReadOnly_;                  // parallel to paramIds_: CLAP_PARAM_IS_READONLY
+  // Main-thread sets still in flight (parallel to paramIds_): getParamValue() reports the queued
+  // value until the plugin has processed it (paramAppliedSeq_ catches up with paramQueuedSeq_ once
+  // the plugin's process call that received the set has returned).
+  std::vector<uint32_t> paramQueuedSeq_;                     // main thread only
+  std::vector<double> paramQueuedValue_;                     // main thread only
+  std::unique_ptr<std::atomic<uint32_t>[]> paramAppliedSeq_;  // written by the audio thread
+  std::vector<uint32_t> paramTakenSeq_;    // audio thread: newest seq handed to the plugin this call (0 = none)
+  std::vector<uint32_t> paramTakenSlots_;  // audio thread: the slots with a paramTakenSeq_, paramTakenCount_ used
+  uint32_t paramTakenCount_ = 0;
   SpscRing<ParamSet> toAudio_{1024};
+  // Editor edits reported from process() when the caller has no params_out room for them (audio
+  // thread -> main thread, drained by pump() into IPluginHostCallback::onParamEdited).
+  SpscRing<ParamEdit> fromAudio_{1024};
+  // Edits fromAudio_ had no room for, merged per parameter (audio thread; deactivate() delivers
+  // what is left). Until a held parameter is back in the ring, its newer edits are held too, so the
+  // main thread still sees each parameter's edits in order and the newest value last.
+  std::vector<uint8_t> paramHeld_;        // parallel to paramIds_: Held bits
+  std::vector<double> paramHeldValue_;    // parallel to paramIds_: the newest held edit's value
+  std::vector<uint32_t> heldSlots_;       // FIFO of held slots (each at most once), oldest first
+  uint32_t heldHead_ = 0, heldCount_ = 0;
   int64_t steadyTime_ = 0;
 
   // Output routing for the call in progress.
