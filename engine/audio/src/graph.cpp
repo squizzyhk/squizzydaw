@@ -179,10 +179,16 @@ bool TrackProcessor::prepare(double sr, uint32_t maxFrames, uint32_t outChannels
     sources_.push_back(std::move(n));
   }
   chain_ = ProcessorChain{};
-  for (auto& p : desc_.inserts)
-    if (p) chain_.add(p->clone());
+  for (size_t i = 0; i < desc_.inserts.size(); ++i) {
+    const auto& p = desc_.inserts[i];
+    if (!p) continue;
+    ProcessorPtr c = p->clone();
+    if (i < desc_.insertStates.size() && !desc_.insertStates[i].bytes.empty()) c->loadInitialState(desc_.insertStates[i]);
+    chain_.add(std::move(c));
+  }
   if (!chain_.prepare(sr, maxFrames, desc_.channels)) return false;
   instrument_ = desc_.instrument ? desc_.instrument->clone() : nullptr;
+  if (instrument_ && !desc_.instrumentState.bytes.empty()) instrument_->loadInitialState(desc_.instrumentState);
   if (instrument_ && !instrument_->prepare(sr, maxFrames, desc_.channels)) return false;
   // sequenced events of one block (bounded) + live events + note-offs of a stop/jump + live
   // note releases + controller resets
@@ -380,14 +386,20 @@ ProcessorPtr SubMixProcessor::clone() const {
   auto p = std::make_unique<SubMixProcessor>(channels_, protos_, volume_, pan_, mute_);
   p->setMix64(mix64_);
   p->setSolo(solo_);
+  p->setInitialStates(states_);
   return p;
 }
 bool SubMixProcessor::prepare(double sr, uint32_t maxFrames, uint32_t outChannels) {
   maxFrames_ = maxFrames;
   outChannels_ = outChannels;
   chain_ = ProcessorChain{};
-  for (auto& p : protos_)
-    if (p) chain_.add(p->clone());
+  for (size_t i = 0; i < protos_.size(); ++i) {
+    const auto& p = protos_[i];
+    if (!p) continue;
+    ProcessorPtr c = p->clone();
+    if (i < states_.size() && !states_[i].bytes.empty()) c->loadInitialState(states_[i]);
+    chain_.add(std::move(c));
+  }
   if (!chain_.prepare(sr, maxFrames, channels_)) return false;
   sumF_.assign(static_cast<size_t>(channels_) * maxFrames, 0.0f);
   sumD_.assign(static_cast<size_t>(channels_) * maxFrames, 0.0);
@@ -552,6 +564,7 @@ std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& 
     auto bp = std::make_unique<SubMixProcessor>(bd.channels, bd.inserts, bd.volume, bd.pan, bd.mute);
     bp->setMix64(cfg.mix64);
     bp->setSolo(bd.solo);
+    bp->setInitialStates(bd.insertStates);
     if (!bp->prepare(g->sr_, cfg.maxBlock, destChannels(bd.output))) return fail("bus prepare failed");
     g->buses_.push_back(std::move(bp));
     g->busDest_.push_back(bd.output);
@@ -563,6 +576,7 @@ std::unique_ptr<Graph> Graph::compile(const GraphDesc& desc, const GraphConfig& 
   g->master_ = std::make_unique<SubMixProcessor>(cfg.outputChannels, desc.masterInserts, desc.masterVolume,
                                                  std::clamp(desc.masterPan, -1.0f, 1.0f), desc.masterMute);
   g->master_->setMix64(cfg.mix64);
+  g->master_->setInitialStates(desc.masterInsertStates);
   if (!g->master_->prepare(g->sr_, cfg.maxBlock, cfg.outputChannels)) return fail("master prepare failed");
   g->masterVolume_ = desc.masterVolume;
   allocPlanar(g->masterBuf_, g->masterPtrs_, cfg.outputChannels, cfg.maxBlock);

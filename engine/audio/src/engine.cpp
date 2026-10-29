@@ -42,6 +42,7 @@ void EngineCore::setGraph(std::unique_ptr<Graph> g) {
     generation_.store(g->generation());
     latency_.store(g->latency());
   }
+  newest_ = g.get();
   if (!running_.load()) {
     collectGarbage();
     delete pending_.exchange(nullptr);
@@ -690,6 +691,7 @@ sq_result AudioEngine::compileAndInstall() {
   cfg.meters = &core_->meters();
   std::string err;
   ++compileCount_;
+  carryPluginStates(d);
   std::unique_ptr<Graph> g = Graph::compile(d, cfg, &err);
   if (!g) {
     // invalid bus routing (e.g. a cycle from the document): fall back to routing buses to master
@@ -726,6 +728,142 @@ sq_result AudioEngine::compileAndInstall() {
 }
 
 sq_result AudioEngine::rebuild() { return rebuildFromDocument(false); }
+
+namespace {
+// Chain index of a "user.inserts" line, -1 when bypassed / unavailable / out of range.
+int32_t chainOf(const std::vector<int32_t>& map, int32_t slot) {
+  return slot >= 0 && static_cast<size_t>(slot) < map.size() ? map[static_cast<size_t>(slot)] : -1;
+}
+// Line index whose chain index is `chain` (the inverse of chainOf), -1 when none.
+int32_t slotOf(const std::vector<int32_t>& map, size_t chain) {
+  for (size_t i = 0; i < map.size(); ++i)
+    if (map[i] == static_cast<int32_t>(chain)) return static_cast<int32_t>(i);
+  return -1;
+}
+bool captureInto(const AudioProcessor* p, PluginState* out) {
+  if (!p || !p->pluginInstance()) return false;
+  if (auto* fx = dynamic_cast<const PluginFx*>(p)) return fx->saveState(out);
+  if (auto* sy = dynamic_cast<const PluginSynth*>(p)) return sy->saveState(out);
+  return false;
+}
+}  // namespace
+
+sq::Ptr<IPluginInstance> AudioEngine::pluginInstance(const sq_guid& node, int32_t slot) {
+  Graph* g = core_->newestGraph();
+  if (!g) return {};
+  const AudioProcessor* p = nullptr;
+  if (sq_guid_is_null(&node)) {
+    const int32_t c = chainOf(desc_.masterSlotToChain, slot);
+    if (c >= 0) p = g->master().insert(static_cast<size_t>(c));
+  } else if (const int32_t ti = g->findTrack(node); ti >= 0) {
+    TrackProcessor& t = g->track(static_cast<size_t>(ti));
+    if (slot < 0) p = t.instrument();
+    else if (const int32_t c = chainOf(t.desc().slotToChain, slot); c >= 0) p = t.insert(static_cast<size_t>(c));
+  } else if (const int32_t bi = g->findBus(node); bi >= 0 && static_cast<size_t>(bi) < desc_.buses.size()) {
+    const int32_t c = chainOf(desc_.buses[static_cast<size_t>(bi)].slotToChain, slot);
+    if (c >= 0) p = g->bus(static_cast<size_t>(bi)).insert(static_cast<size_t>(c));
+  }
+  IPluginInstance* inst = p ? p->pluginInstance() : nullptr;
+  return inst ? sq::Ptr<IPluginInstance>(inst) : sq::Ptr<IPluginInstance>{};
+}
+
+std::vector<AudioEngine::PluginSlot> AudioEngine::pluginSlots() {
+  std::vector<PluginSlot> out;
+  Graph* g = core_->newestGraph();
+  if (!g) return out;
+  auto push = [&](const sq_guid& node, int32_t slot, const AudioProcessor* p) {
+    IPluginInstance* inst = p ? p->pluginInstance() : nullptr;
+    if (inst) out.push_back(PluginSlot{node, slot, sq::Ptr<IPluginInstance>(inst)});
+  };
+  for (size_t i = 0; i < g->trackCount(); ++i) {
+    TrackProcessor& t = g->track(i);
+    push(t.desc().id, -1, t.instrument());
+    for (size_t c = 0; c < t.insertCount(); ++c) {
+      const int32_t s = slotOf(t.desc().slotToChain, c);
+      if (s >= 0) push(t.desc().id, s, t.insert(c));
+    }
+  }
+  for (size_t b = 0; b < g->busCount() && b < desc_.buses.size(); ++b)
+    for (size_t c = 0; c < g->bus(b).insertCount(); ++c) {
+      const int32_t s = slotOf(desc_.buses[b].slotToChain, c);
+      if (s >= 0) push(g->busId(b), s, g->bus(b).insert(c));
+    }
+  for (size_t c = 0; c < g->master().insertCount(); ++c) {
+    const int32_t s = slotOf(desc_.masterSlotToChain, c);
+    if (s >= 0) push(sq_guid{}, s, g->master().insert(c));
+  }
+  return out;
+}
+
+bool AudioEngine::locatePlugin(IPluginInstance* inst, sq_guid* node, int32_t* slot) {
+  if (!inst) return false;
+  for (const PluginSlot& s : pluginSlots())
+    if (s.instance.get() == inst) {
+      if (node) *node = s.node;
+      if (slot) *slot = s.slot;
+      return true;
+    }
+  return false;
+}
+
+void AudioEngine::carryPluginStates(GraphDesc& d) {
+  Graph* g = core_->newestGraph();
+  if (!g) return;
+  // (node, slot) -> state of the instance that runs now; desc_ is already the NEXT description,
+  // so the old slot maps come from the graph's own descs (tracks) and the previous bus/master maps.
+  struct Key {
+    sq_guid node;
+    int32_t slot;
+    bool operator<(const Key& o) const noexcept {
+      const int c = std::memcmp(&node, &o.node, sizeof node);
+      return c != 0 ? c < 0 : slot < o.slot;
+    }
+  };
+  std::map<Key, PluginState> states;
+  auto grab = [&](const sq_guid& node, int32_t slot, const AudioProcessor* p) {
+    PluginState st;
+    if (slot != INT32_MIN && captureInto(p, &st)) states[Key{node, slot}] = std::move(st);
+  };
+  for (size_t i = 0; i < g->trackCount(); ++i) {
+    TrackProcessor& t = g->track(i);
+    grab(t.desc().id, -1, t.instrument());
+    for (size_t c = 0; c < t.insertCount(); ++c) grab(t.desc().id, slotOf(t.desc().slotToChain, c) < 0 ? INT32_MIN : slotOf(t.desc().slotToChain, c), t.insert(c));
+  }
+  for (size_t b = 0; b < g->busCount() && b < prevBusSlotMaps_.size(); ++b)
+    for (size_t c = 0; c < g->bus(b).insertCount(); ++c) {
+      const int32_t s = slotOf(prevBusSlotMaps_[b], c);
+      grab(g->busId(b), s < 0 ? INT32_MIN : s, g->bus(b).insert(c));
+    }
+  for (size_t c = 0; c < g->master().insertCount(); ++c) {
+    const int32_t s = slotOf(prevMasterSlotMap_, c);
+    grab(sq_guid{}, s < 0 ? INT32_MIN : s, g->master().insert(c));
+  }
+  prevBusSlotMaps_.clear();
+  for (const auto& b : d.buses) prevBusSlotMaps_.push_back(b.slotToChain);
+  prevMasterSlotMap_ = d.masterSlotToChain;
+  if (states.empty()) return;
+  auto take = [&](const sq_guid& node, int32_t slot) -> PluginState {
+    auto it = states.find(Key{node, slot});
+    return it == states.end() ? PluginState{} : it->second;
+  };
+  for (auto& t : d.tracks) {
+    if (t.instrument) t.instrumentState = take(t.id, -1);
+    t.insertStates.assign(t.inserts.size(), PluginState{});
+    for (size_t s = 0; s < t.slotToChain.size(); ++s)
+      if (t.slotToChain[s] >= 0 && static_cast<size_t>(t.slotToChain[s]) < t.insertStates.size())
+        t.insertStates[static_cast<size_t>(t.slotToChain[s])] = take(t.id, static_cast<int32_t>(s));
+  }
+  for (auto& b : d.buses) {
+    b.insertStates.assign(b.inserts.size(), PluginState{});
+    for (size_t s = 0; s < b.slotToChain.size(); ++s)
+      if (b.slotToChain[s] >= 0 && static_cast<size_t>(b.slotToChain[s]) < b.insertStates.size())
+        b.insertStates[static_cast<size_t>(b.slotToChain[s])] = take(b.id, static_cast<int32_t>(s));
+  }
+  d.masterInsertStates.assign(d.masterInserts.size(), PluginState{});
+  for (size_t s = 0; s < d.masterSlotToChain.size(); ++s)
+    if (d.masterSlotToChain[s] >= 0 && static_cast<size_t>(d.masterSlotToChain[s]) < d.masterInsertStates.size())
+      d.masterInsertStates[static_cast<size_t>(d.masterSlotToChain[s])] = take(sq_guid{}, static_cast<int32_t>(s));
+}
 
 sq_result AudioEngine::rebuildFromDocument(bool allowMixOnly) {
   if (doc_) {

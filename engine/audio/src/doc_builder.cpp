@@ -278,6 +278,7 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
         buildChain(sq::getAttrString(props.get(), "user.inserts"), inserts, cb, key, info);
         b.inserts = std::move(cb.protos);
         b.insertParams = std::move(cb.params);
+        b.slotToChain = cb.slotToChain;
         extra.slotToChain = std::move(cb.slotToChain);
         busIndex[id] = static_cast<int32_t>(d.buses.size());
         d.buses.push_back(std::move(b));
@@ -294,6 +295,7 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
         buildChain(sq::getAttrString(props.get(), "user.inserts"), inserts, cb, key, info);
         d.masterInserts = std::move(cb.protos);
         d.masterInsertParams = std::move(cb.params);
+        d.masterSlotToChain = std::move(cb.slotToChain);
         break;
       }
       case SQ_TRACK_AUDIO:
@@ -313,6 +315,7 @@ sq_result buildGraphDesc(IDocument* doc, IClassRegistry* reg, MediaCache& cache,
         buildChain(sq::getAttrString(props.get(), "user.inserts"), inserts, cb, key, info);
         td.inserts = std::move(cb.protos);
         td.insertParams = std::move(cb.params);
+        td.slotToChain = cb.slotToChain;
         extra.slotToChain = std::move(cb.slotToChain);
         if (ti.kind == SQ_TRACK_INSTRUMENT) {
           // ONE instrument per track: "user.instrument" -> resolver; empty or unresolvable -> the

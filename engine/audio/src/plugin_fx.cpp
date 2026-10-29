@@ -1,6 +1,8 @@
 // Squizzy Studio engine/audio - PluginFx / PluginSynth (see plugin_fx.hpp).
 #include "sq/engine/audio/plugin_fx.hpp"
 
+#include "sq/cpp/bytestream.hpp"
+
 #include <algorithm>
 #include <cstring>
 
@@ -8,8 +10,35 @@ namespace sq::engine::audio {
 
 // ---- PluginHostCore ----
 PluginHostCore::~PluginHostCore() {
+  if (inst_) inst_->closeEditor();  // an editor window may still be attached (the GUI re-attaches to the new instance)
   if (inst_ && active_) inst_->deactivate();
   inst_ = nullptr;
+}
+
+namespace {
+std::string pluginIdOf(IPluginInstance* inst) {
+  sq_plugin_desc d{};
+  d.struct_size = sizeof d;
+  if (!inst || inst->getDesc(&d) != SQ_OK) return {};
+  d.id[sizeof d.id - 1] = 0;
+  return d.id;
+}
+}  // namespace
+
+void PluginHostCore::loadState(const PluginState& state) {
+  if (!inst_ || state.bytes.empty()) return;
+  if (!state.pluginId.empty() && pluginIdOf(inst_.get()) != state.pluginId) return;
+  auto in = sq::makeMemoryStream(state.bytes.data(), state.bytes.size(), false);
+  inst_->loadState(in.get());
+}
+
+bool PluginHostCore::saveState(PluginState* out) const {
+  if (!inst_ || !out) return false;
+  auto mem = sq::Ptr<sq::MemoryStream>::adopt(new sq::MemoryStream());
+  if (SQ_FAILED(inst_->saveState(mem.get())) || mem->bytes().empty()) return false;
+  out->pluginId = pluginIdOf(inst_.get());
+  out->bytes = mem->bytes();
+  return true;
 }
 
 void PluginHostCore::instantiate() {

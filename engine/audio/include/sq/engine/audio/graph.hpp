@@ -142,8 +142,14 @@ struct TrackDesc {
   std::vector<SourceProto> sources;    // summed
   std::vector<ProcessorProto> inserts; // insert chain (serial)
   std::vector<ParamList> insertParams; // per inserts[] entry: values written in its spec
+  // "user.inserts" line -> inserts[] index, -1 for bypassed / unavailable lines (doc_builder).
+  std::vector<int32_t> slotToChain;
+  // Per inserts[] entry: state carried over from the previous graph (empty = none). Set by the
+  // engine right before compiling; applied in prepare() before the plugin is activated.
+  std::vector<PluginState> insertStates;
   ProcessorProto instrument;           // instrument track: its one synth (null = audio track)
   ParamList instrumentParams;
+  PluginState instrumentState;
   std::vector<TimedMidi> midi;         // sequenced events for the instrument (timeline frames)
   bool liveMidi = false;               // receives live MIDI (Graph::routeLiveMidi)
   std::vector<SendDesc> sends;
@@ -164,6 +170,8 @@ struct BusDesc {
   uint32_t channels = 2;
   std::vector<ProcessorProto> inserts;
   std::vector<ParamList> insertParams;
+  std::vector<int32_t> slotToChain;    // as TrackDesc::slotToChain
+  std::vector<PluginState> insertStates;
   std::vector<SendDesc> sends;         // to other buses (cycles are rejected)
   float volume = 1.0f;
   float pan = 0.0f;
@@ -179,6 +187,8 @@ struct GraphDesc {
   std::vector<BusDesc> buses;
   std::vector<ProcessorProto> masterInserts;
   std::vector<ParamList> masterInsertParams;
+  std::vector<int32_t> masterSlotToChain;
+  std::vector<PluginState> masterInsertStates;
   float masterVolume = 1.0f;
   float masterPan = 0.0f;              // -1..1 (stereo balance law, like a bus)
   bool masterMute = false;             // silences the mix (not the metronome click)
@@ -307,6 +317,8 @@ class SubMixProcessor final : public AudioProcessor {
   uint32_t tail() const noexcept override { return chain_.tail(); }
   // Latency of the inserts in front of chain index `slot`.
   uint32_t latencyBefore(int32_t slot) const noexcept;
+  // Control thread, before prepare(): carried plugin states per protos_[] entry (see TrackDesc).
+  void setInitialStates(std::vector<PluginState> states) { states_ = std::move(states); }
   void setVolume(float v) noexcept { volume_ = v; }
   void setPan(float p) noexcept { pan_ = p; }
   void setMute(bool m) noexcept { mute_ = m; }
@@ -336,6 +348,7 @@ class SubMixProcessor final : public AudioProcessor {
  private:
   uint32_t channels_;
   std::vector<ProcessorProto> protos_;
+  std::vector<PluginState> states_;
   ProcessorChain chain_;
   float volume_, pan_;
   bool mute_;
@@ -395,6 +408,7 @@ class Graph {
   TrackProcessor& track(size_t i) noexcept { return *tracks_[i]; }
   size_t busCount() const noexcept { return buses_.size(); }
   SubMixProcessor& bus(size_t i) noexcept { return *buses_[i]; }
+  const sq_guid& busId(size_t i) const noexcept { return busIds_[i]; }
   SubMixProcessor& master() noexcept { return *master_; }
   int32_t findTrack(const sq_guid& id) const noexcept;
   int32_t findBus(const sq_guid& id) const noexcept;

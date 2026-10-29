@@ -1004,10 +1004,6 @@ struct Shell::Impl {
                              missingNote(missing, " rendered as silence"));
   }
 
-  static std::string fileNameOf(const std::string& path) {
-    const size_t slash = path.find_last_of("/\\");
-    return slash == std::string::npos ? path : path.substr(slash + 1);
-  }
   static std::string stemOf(const std::string& name) {
     const size_t dot = name.find_last_of('.');
     return dot == std::string::npos || dot == 0 ? name : name.substr(0, dot);
@@ -2122,6 +2118,36 @@ struct Shell::Impl {
       p->setGuid("node", &g);
       const sq_result r = step("Remove Track", [&] { return exec(sq::doc::kRemoveNode, p.get()); });
       return setMessage(r, SQ_SUCCEEDED(r) ? "removed track " + label : std::string("remove failed: ") + sq_result_string(r));
+    }, haveDoc);
+    add("Track", "SetVolume", "Set Track Volume", [this](IAttributes* a, IAttributes*) {
+      auto t = track(a);
+      if (SQ_FAILED(needTrack(t))) return SQ_E_NOTFOUND;
+      double db = 0.0;
+      if (!argNum(a, "value", &db) || db < -96.0 || db > 24.0) return setMessage(SQ_E_INVALIDARG, "value=<dB, -96..24> required");
+      const sq_result r = step("Track Volume", [&] { return setTrackProp(t.get(), "volumeDb", [&](IAttributes* p) { p->setDouble("value", db); }); });
+      return setMessage(r, SQ_SUCCEEDED(r) ? trackLabel(t.get()) + " volume " + std::to_string(db) + " dB" : std::string("set volume failed: ") + sq_result_string(r));
+    }, haveDoc);
+    add("Track", "SetPan", "Set Track Pan", [this](IAttributes* a, IAttributes*) {
+      auto t = track(a);
+      if (SQ_FAILED(needTrack(t))) return SQ_E_NOTFOUND;
+      double pan = 0.0;
+      if (!argNum(a, "value", &pan) || pan < -1.0 || pan > 1.0) return setMessage(SQ_E_INVALIDARG, "value=<-1..1> required");
+      const sq_result r = step("Track Pan", [&] { return setTrackProp(t.get(), "pan", [&](IAttributes* p) { p->setDouble("value", pan); }); });
+      return setMessage(r, SQ_SUCCEEDED(r) ? trackLabel(t.get()) + " pan " + std::to_string(pan) : std::string("set pan failed: ") + sq_result_string(r));
+    }, haveDoc);
+    add("Track", "ToggleMute", "Mute Track", [this](IAttributes* a, IAttributes*) {
+      auto t = track(a);
+      if (SQ_FAILED(needTrack(t))) return SQ_E_NOTFOUND;
+      const bool on = (trackInfo(t.get()).flags & SQ_TRACK_MUTE) == 0;
+      const sq_result r = step("Mute Track", [&] { return setTrackProp(t.get(), "mute", [&](IAttributes* p) { p->setBool("value", on ? SQ_TRUE : SQ_FALSE); }); });
+      return setMessage(r, SQ_SUCCEEDED(r) ? trackLabel(t.get()) + (on ? " muted" : " unmuted") : std::string("mute failed: ") + sq_result_string(r));
+    }, haveDoc);
+    add("Track", "ToggleSolo", "Solo Track", [this](IAttributes* a, IAttributes*) {
+      auto t = track(a);
+      if (SQ_FAILED(needTrack(t))) return SQ_E_NOTFOUND;
+      const bool on = (trackInfo(t.get()).flags & SQ_TRACK_SOLO) == 0;
+      const sq_result r = step("Solo Track", [&] { return setTrackProp(t.get(), "solo", [&](IAttributes* p) { p->setBool("value", on ? SQ_TRUE : SQ_FALSE); }); });
+      return setMessage(r, SQ_SUCCEEDED(r) ? trackLabel(t.get()) + (on ? " soloed" : " solo off") : std::string("solo failed: ") + sq_result_string(r));
     }, haveDoc);
     add("Track", "Rename", "Rename Track", [this](IAttributes* a, IAttributes*) {
       auto t = track(a);

@@ -12,12 +12,24 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "sq/media.h"
 #include "sq/engine/audio/rt.hpp"
 
+namespace sq {
+struct IPluginInstance;
+}
+
 namespace sq::engine::audio {
+
+// Opaque plugin state captured from one instance (IPluginInstance::saveState) to be handed to the
+// next instance of the SAME plugin (pluginId = sq_plugin_desc.id) when a graph is recompiled.
+struct PluginState {
+  std::string pluginId;
+  std::vector<uint8_t> bytes;
+};
 
 // Per-block information handed to processors and source nodes.
 struct ProcessContext {
@@ -61,6 +73,12 @@ class AudioProcessor {
   virtual uint32_t parameterCount() const noexcept { return 0; }
   virtual void setParameter(uint32_t index, float plainValue) noexcept { (void)index, (void)plainValue; }
   virtual float parameter(uint32_t index) const noexcept { (void)index; return 0.0f; }
+  // Plugin hosts (plugin_fx.hpp): the hosted plugin instance, null for built-in processors. Main
+  // thread only (editor windows, state capture); the pointer lives as long as this processor.
+  virtual sq::IPluginInstance* pluginInstance() const noexcept { return nullptr; }
+  // Control thread, after clone() and before prepare(): restores state captured from an earlier
+  // instance of the same plugin (ignored by built-ins and when the plugin id differs).
+  virtual void loadInitialState(const PluginState& state) { (void)state; }
 };
 using ProcessorPtr = std::unique_ptr<AudioProcessor>;
 using ProcessorProto = std::shared_ptr<const AudioProcessor>;

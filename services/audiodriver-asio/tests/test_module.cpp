@@ -86,6 +86,7 @@ SQ_TEST("audiodriver-asio [module]: loads, class registered, devices match the b
   auto st = f.drv.as<sq::IAsioDriverStatus>();
   REQUIRE(st);
   const std::string text = f.status();
+  CHECK_EQ(st->isHostCompiled() != 0, SQ_TEST_EXPECT_ASIO_HOST != 0);
   CHECK(!text.empty());
   std::printf("asio status: %s\n", text.c_str());
 

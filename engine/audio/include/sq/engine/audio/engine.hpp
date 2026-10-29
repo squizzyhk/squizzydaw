@@ -145,6 +145,10 @@ class EngineCore final : public sq::Object<EngineCore, IAudioCallback> {
 
   // Testing / offline: the graph currently owned by the RT side (only valid when not running).
   Graph* graphForControlThread() noexcept { return running_.load() ? nullptr : cur_; }
+  // Control thread: the graph most recently handed to setGraph() (null before the first). It is
+  // the newest graph that exists; it is freed only by a later setGraph()/collectGarbage() on this
+  // same thread, so main-thread-only state (plugin instances) may be read from it between calls.
+  Graph* newestGraph() const noexcept { return newest_; }
 
  private:
   void apply(const Command& c) noexcept;
@@ -156,6 +160,8 @@ class EngineCore final : public sq::Object<EngineCore, IAudioCallback> {
   void drainCommands() noexcept;
   bool deferForPending(const Command& c) noexcept;
   void captureLive(const LiveMidiEvent& e) noexcept;
+
+  Graph* newest_ = nullptr;  // control thread bookkeeping (newestGraph())
 
   // RT-owned state
   Graph* cur_ = nullptr;
@@ -254,6 +260,22 @@ class AudioEngine final : public sq::Object<AudioEngine, IAudioEngine, ITranspor
   sq_result rebuild();  // recompile the graph from the document / desc
   // Graph compilations so far (tests: proves parameter-only edits do not recompile).
   uint64_t compileCount() const noexcept { return compileCount_; }
+  // ---- hosted plugins (main thread) ----
+  // The plugin instance behind an insert of the newest compiled graph: node = track / bus id (null
+  // = master), slot = "user.inserts" line index, or -1 for an instrument track's instrument. Null
+  // for built-in devices, bypassed / unavailable lines and unknown nodes. The returned reference
+  // keeps the instance alive after its graph is replaced; compare with a later call to notice that.
+  sq::Ptr<IPluginInstance> pluginInstance(const sq_guid& node, int32_t slot);
+  // Inverse lookup in the newest graph: which node / slot hosts `inst`. false when not found.
+  bool locatePlugin(IPluginInstance* inst, sq_guid* node, int32_t* slot);
+  // Every (node, slot) of the newest graph that hosts a plugin instance.
+  struct PluginSlot {
+    sq_guid node{};
+    int32_t slot = 0;
+    sq::Ptr<IPluginInstance> instance;
+  };
+  std::vector<PluginSlot> pluginSlots();
+
   // Turns track insert specs (track property "user.inserts") into processors; see plugin_fx.hpp.
   // Takes effect at the next rebuild.
   void setInsertResolver(InsertResolver resolver) { inserts_ = std::move(resolver); }
@@ -316,6 +338,9 @@ class AudioEngine final : public sq::Object<AudioEngine, IAudioEngine, ITranspor
     uint32_t compensation = 0;
   };
   sq_result compileAndInstall();
+  // Captures the plugin states of the newest graph into `d` (keyed by node + slot) so the graph
+  // compiled from `d` starts where the old one left off.
+  void carryPluginStates(GraphDesc& d);
   void notify(const char* topic);
   int32_t trackIndex(const sq_guid& id) const;
   int32_t meterSlotFor(const sq_guid& id);
@@ -369,6 +394,9 @@ class AudioEngine final : public sq::Object<AudioEngine, IAudioEngine, ITranspor
   uint32_t graphLatency_ = 0;
   std::string structureKey_;   // DocBuildResult::structureKey of the installed document graph
   uint64_t compileCount_ = 0;
+  // Slot maps the newest graph's buses / master were compiled with (carryPluginStates).
+  std::vector<std::vector<int32_t>> prevBusSlotMaps_;
+  std::vector<int32_t> prevMasterSlotMap_;
 
   // Meter slot directory. Append-only table published with a release store of the count, so
   // getMeter (any non-RT thread, wait-free per audioengine.h) scans it without a lock. Entries

@@ -63,6 +63,10 @@ class PluginHostCore {
   void setParameter(uint32_t id, float value) noexcept;
   float parameter(uint32_t id) const noexcept;
   IPluginInstance* instance() const noexcept { return inst_.get(); }
+  // Main thread, before activate(): IPluginInstance::loadState when the plugin id matches.
+  void loadState(const PluginState& state);
+  // Main thread: captures the instance state (false when there is no instance / no state).
+  bool saveState(PluginState* out) const;
   const PluginFactory& factory() const noexcept { return factory_; }
   const std::string& name() const noexcept { return name_; }
   const std::string& error() const noexcept { return error_; }
@@ -107,6 +111,8 @@ class PluginFx final : public FxProcessor {
   float parameter(uint32_t id) const noexcept override { return core_.parameter(id); }
 
   IPluginInstance* instance() const noexcept { return core_.instance(); }
+  IPluginInstance* pluginInstance() const noexcept override { return core_.instance(); }
+  void loadInitialState(const PluginState& state) override { core_.loadState(state); }
   const std::string& name() const noexcept { return core_.name(); }
   const std::string& error() const noexcept { return core_.error(); }
 
@@ -129,6 +135,8 @@ class PluginSynth final : public SynthProcessor {
   float parameter(uint32_t id) const noexcept override { return core_.parameter(id); }
 
   IPluginInstance* instance() const noexcept { return core_.instance(); }
+  IPluginInstance* pluginInstance() const noexcept override { return core_.instance(); }
+  void loadInitialState(const PluginState& state) override { core_.loadState(state); }
   const std::string& name() const noexcept { return core_.name(); }
   const std::string& error() const noexcept { return core_.error(); }
 
