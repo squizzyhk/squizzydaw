@@ -10,7 +10,14 @@
 // Lifetime: every OS request has a context object owned by the backend. A context is freed only
 // after the OS reported completion/cancellation for it (or, at shutdown, after a bounded wait;
 // a context whose completion never arrived is leaked on purpose rather than freed under a
-// callback that might still run).
+// callback that might still run). An advertisement gets two completions, the registration's and
+// the deregistration's, in that order even when it is cancelled before its registration
+// completed. The callbacks are code of this module, and one that has just signalled its event is
+// still returning through it; no API reports when it has left. So the first OS request pins the
+// module (it stays mapped until the process exits; a later unload / load reuses the image, which
+// module.h allows: INIT after SHUTDOWN). A leaked context outlives the backend, so the callbacks
+// reach nothing of the backend: each context shares ownership of the DnsApi (a leaked one keeps
+// it, and with it dnsapi.dll, alive for the rest of the process) and a browse has its own lock.
 #include "services.hpp"
 
 #if defined(_WIN32)
@@ -128,13 +135,14 @@ dnssd::Message toMessage(const DNS_RECORD* list) {
 
 class SystemDiscovery final : public DiscoveryBackend {
  public:
-  explicit SystemDiscovery(std::unique_ptr<DnsApi> api) : api_(std::move(api)) {}
+  explicit SystemDiscovery(std::shared_ptr<DnsApi> api) : api_(std::move(api)) {}
   ~SystemDiscovery() override { shutdown(); }
   const char* name() const override { return "system-dnssd"; }
 
   sq_result browse(uint32_t cookie, const char* serviceType, Ptr<IDiscoveryListener> listener) override {
+    pinModule();
     auto b = std::make_unique<Browse>();
-    b->owner = this;
+    b->api = api_;
     b->cookie = cookie;
     b->type = dnssd::joinName(dnssd::splitName(serviceType));
     b->query = widen(dnssd::serviceDomain(serviceType));
@@ -159,9 +167,10 @@ class SystemDiscovery final : public DiscoveryBackend {
   }
 
   sq_result advertise(uint32_t cookie, const sq_discovery_record& record) override {
+    pinModule();
     auto a = std::make_unique<Advert>();
     a->rec = record;
-    a->api = api_.get();
+    a->api = api_;
     std::string host = record.host;
     bool literal = !host.empty() && host.find_first_not_of("0123456789.") == std::string::npos;
     if (host.empty() || literal) host = localHostName();
@@ -248,7 +257,7 @@ class SystemDiscovery final : public DiscoveryBackend {
     std::atomic<bool> finished{false};
   };
   struct Browse {
-    SystemDiscovery* owner = nullptr;
+    std::shared_ptr<DnsApi> api;    // shared, not the backend's: a leaked browse outlives it
     uint32_t cookie = 0;
     std::string type;
     std::wstring query;
@@ -257,6 +266,7 @@ class SystemDiscovery final : public DiscoveryBackend {
     HANDLE done = nullptr;          // set when the OS reports the browse cancelled
     std::atomic<bool> stopping{false};
     std::atomic<int> inFlight{0};   // callbacks currently running for this browse
+    std::recursive_mutex m;         // guards known and resolves
     std::set<std::string> known;    // lower-case instance labels reported as found
     std::map<std::string, std::unique_ptr<Resolve>> resolves;  // by lower-case label
   };
@@ -268,13 +278,26 @@ class SystemDiscovery final : public DiscoveryBackend {
     DNS_SERVICE_REGISTER_REQUEST req{};
     HANDLE done = nullptr;
     std::atomic<int> completions{0};
-    DnsApi* api = nullptr;
+    std::shared_ptr<DnsApi> api;    // shared, not the backend's: a leaked advert outlives it
   };
   struct Event {
     Ptr<IDiscoveryListener> l;
     sq_discovery_record rec;
     bool found;
   };
+
+  // Keeps this module mapped for the rest of the process (see the Lifetime note at the top): called
+  // before the first OS request, whose callbacks run this module's code on OS threads.
+  static void pinModule() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+      HMODULE self = nullptr;
+      if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                              reinterpret_cast<LPCWSTR>(&once), &self))
+        sq::logf(SQ_LOG_WARN, "could not pin the module (%lu): unloading it may crash a late DNS-SD callback",
+                 static_cast<unsigned long>(GetLastError()));
+    });
+  }
 
   static std::string lower(std::string s) {
     for (auto& c : s)
@@ -298,23 +321,25 @@ class SystemDiscovery final : public DiscoveryBackend {
     }
   }
 
+  // The browse / resolve callbacks and what they run use only the Browse (and its Resolves),
+  // never the backend: the context may have been leaked by stopBrowse and the backend be gone.
   static VOID WINAPI onBrowse(DWORD status, PVOID ctx, PDNS_RECORD records) {
     auto* b = static_cast<Browse*>(ctx);
     if (status == ERROR_CANCELLED || !b) {
-      if (records && b) b->owner->api_->dnsFree(records, DnsFreeRecordList);
+      if (records && b) b->api->dnsFree(records, DnsFreeRecordList);
       if (b) SetEvent(b->done);
       return;
     }
     b->inFlight.fetch_add(1);
     try {
-      if (status == ERROR_SUCCESS && records && !b->stopping.load()) b->owner->handleBrowse(*b, records);
+      if (status == ERROR_SUCCESS && records && !b->stopping.load()) handleBrowse(*b, records);
     } catch (...) {
     }
-    if (records) b->owner->api_->dnsFree(records, DnsFreeRecordList);
+    if (records) b->api->dnsFree(records, DnsFreeRecordList);
     b->inFlight.fetch_sub(1);
   }
 
-  void handleBrowse(Browse& b, const DNS_RECORD* records) {
+  static void handleBrowse(Browse& b, const DNS_RECORD* records) {
     dnssd::Message msg = toMessage(records);
     std::vector<sq_discovery_record> found, lost;
     dnssd::extractInstances(msg, b.type.c_str(), found, lost);
@@ -323,25 +348,28 @@ class SystemDiscovery final : public DiscoveryBackend {
     for (auto& r : lost) complete.insert(lower(r.name));
     std::vector<Event> events;
     {
-      std::lock_guard<std::recursive_mutex> lk(m_);
+      std::lock_guard<std::recursive_mutex> lk(b.m);
       for (auto& r : found) {
         if (r.type[0] == 0) std::snprintf(r.type, sizeof r.type, "%s", b.type.c_str());
         if (b.known.insert(lower(r.name)).second) events.push_back({b.listener, r, true});
       }
       for (auto& r : lost)
         if (b.known.erase(lower(r.name))) events.push_back({b.listener, r, false});
-      // PTRs without SRV in this answer: resolve them.
-      for (const auto& [label, ttl] : dnssd::extractPointers(msg, b.type.c_str())) {
-        std::string key = lower(label);
-        if (ttl == 0 || complete.count(key) || b.known.count(key) || b.resolves.count(key)) continue;
-        startResolve(b, label);
+      // PTRs without SRV in this answer: resolve them. Not once stopping is set: stopBrowse may
+      // already have taken the resolves (under b.m) to cancel them and would miss a new one.
+      if (!b.stopping.load()) {
+        for (const auto& [label, ttl] : dnssd::extractPointers(msg, b.type.c_str())) {
+          std::string key = lower(label);
+          if (ttl == 0 || complete.count(key) || b.known.count(key) || b.resolves.count(key)) continue;
+          startResolve(b, label);
+        }
       }
     }
     fire(events);
   }
 
-  // m_ held.
-  void startResolve(Browse& b, const std::string& label) {
+  // b.m held.
+  static void startResolve(Browse& b, const std::string& label) {
     sq_discovery_record tmp{};
     std::snprintf(tmp.name, sizeof tmp.name, "%s", label.c_str());
     std::snprintf(tmp.type, sizeof tmp.type, "%s", b.type.c_str());
@@ -356,7 +384,7 @@ class SystemDiscovery final : public DiscoveryBackend {
     req.QueryName = r->name.data();
     req.pResolveCompletionCallback = &SystemDiscovery::onResolve;
     req.pQueryContext = r.get();
-    if (api_->resolve(&req, &r->cancel) != DNS_REQUEST_PENDING) {
+    if (b.api->resolve(&req, &r->cancel) != DNS_REQUEST_PENDING) {
       CloseHandle(r->done);
       return;
     }
@@ -368,10 +396,10 @@ class SystemDiscovery final : public DiscoveryBackend {
     Browse* b = r ? r->parent : nullptr;
     if (b) b->inFlight.fetch_add(1);
     try {
-      if (b && status == ERROR_SUCCESS && inst && !b->stopping.load()) b->owner->handleResolve(*b, inst);
+      if (b && status == ERROR_SUCCESS && inst && !b->stopping.load()) handleResolve(*b, inst);
     } catch (...) {
     }
-    if (inst && b) b->owner->api_->freeInstance(inst);
+    if (inst && b) b->api->freeInstance(inst);
     if (r) {
       r->finished.store(true);
       SetEvent(r->done);
@@ -379,7 +407,7 @@ class SystemDiscovery final : public DiscoveryBackend {
     if (b) b->inFlight.fetch_sub(1);
   }
 
-  void handleResolve(Browse& b, const DNS_SERVICE_INSTANCE* inst) {
+  static void handleResolve(Browse& b, const DNS_SERVICE_INSTANCE* inst) {
     std::vector<dnssd::TxtPair> txt;
     for (DWORD i = 0; i < inst->dwPropertyCount; ++i)
       txt.emplace_back(narrow(inst->keys ? inst->keys[i] : nullptr), narrow(inst->values ? inst->values[i] : nullptr));
@@ -394,7 +422,7 @@ class SystemDiscovery final : public DiscoveryBackend {
     if (!dnssd::makeRecord(osName(inst->pszInstanceName), host, inst->wPort, txt, rec)) return;
     std::vector<Event> events;
     {
-      std::lock_guard<std::recursive_mutex> lk(m_);
+      std::lock_guard<std::recursive_mutex> lk(b.m);
       if (b.known.insert(lower(rec.name)).second) events.push_back({b.listener, rec, true});
     }
     fire(events);
@@ -403,14 +431,15 @@ class SystemDiscovery final : public DiscoveryBackend {
   static VOID WINAPI onRegister(DWORD status, PVOID ctx, PDNS_SERVICE_INSTANCE inst) {
     auto* a = static_cast<Advert*>(ctx);
     // The OS hands back its own copy of the instance (ours stays owned by the advert): free it
-    // before signalling, the advert may be destroyed right after the event is set.
+    // before counting, the advert may be destroyed as soon as the count reaches what stopAdvert
+    // waits for. The count is the last access (the event only wakes the waiter early).
     if (inst && a) a->api->freeInstance(inst);
     if (a) {
       if (status != ERROR_SUCCESS && a->completions.load() == 0)
         sq_log_printf(SQ_LOG_WARN, "hardware-remote", "DNS-SD registration of '%s' failed: %lu", a->rec.name,
                       static_cast<unsigned long>(status));
-      a->completions.fetch_add(1);
       SetEvent(a->done);
+      a->completions.fetch_add(1);
     }
   }
 
@@ -420,7 +449,7 @@ class SystemDiscovery final : public DiscoveryBackend {
     bool cancelled = WaitForSingleObject(b->done, 2000) == WAIT_OBJECT_0;
     std::map<std::string, std::unique_ptr<Resolve>> resolves;
     {
-      std::lock_guard<std::recursive_mutex> lk(m_);
+      std::lock_guard<std::recursive_mutex> lk(b->m);
       resolves.swap(b->resolves);
     }
     bool resolvesDone = true;
@@ -441,13 +470,15 @@ class SystemDiscovery final : public DiscoveryBackend {
   }
 
   void stopAdvert(std::unique_ptr<Advert> a) {
-    int before = a->completions.load();
+    // Every completion still to come must have arrived: the registration's (pending when the
+    // advertisement is cancelled right after advertise(); it arrives even then) and, if the OS
+    // took the request, the deregistration's. Waiting for "one more than now" took a late
+    // registration completion for the deregistration's and freed the context under the
+    // deregistration callback.
     DWORD st = api_->dereg(&a->req, nullptr);
-    bool confirmed = false;
-    if (st == DNS_REQUEST_PENDING) {
-      for (int i = 0; i < 40 && a->completions.load() <= before; ++i) WaitForSingleObject(a->done, 50);
-      confirmed = a->completions.load() > before;
-    }
+    const int expected = st == DNS_REQUEST_PENDING ? 2 : 1;
+    for (int i = 0; i < 40 && a->completions.load() < expected; ++i) WaitForSingleObject(a->done, 50);
+    const bool confirmed = a->completions.load() >= expected;
     if (!confirmed) {
       sq::logf(SQ_LOG_WARN, "DNS-SD deregistration of '%s' not confirmed; leaking its context", a->rec.name);
       (void)a.release();
@@ -457,8 +488,8 @@ class SystemDiscovery final : public DiscoveryBackend {
     api_->freeInstance(a->instance);
   }
 
-  std::unique_ptr<DnsApi> api_;
-  std::recursive_mutex m_;
+  std::shared_ptr<DnsApi> api_;  // shared with every context (see the Lifetime note at the top)
+  std::recursive_mutex m_;        // guards browses_ and adverts_
   std::map<uint32_t, std::unique_ptr<Browse>> browses_;
   std::map<uint32_t, std::unique_ptr<Advert>> adverts_;
 };
@@ -466,7 +497,7 @@ class SystemDiscovery final : public DiscoveryBackend {
 }  // namespace
 
 std::unique_ptr<DiscoveryBackend> makeSystemDiscovery() {
-  auto api = std::make_unique<DnsApi>();
+  auto api = std::make_shared<DnsApi>();
   if (!api->load()) return nullptr;
   return std::make_unique<SystemDiscovery>(std::move(api));
 }

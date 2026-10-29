@@ -20,6 +20,11 @@ sq_add_service(NAME hardware-remote VERSION 0.1.0
 
 sq_add_test(NAME hardware_remote_osc SOURCES tests/test_osc.cpp LIBS sqhwremote_core)
 sq_add_test(NAME hardware_remote_dnssd SOURCES tests/test_dnssd.cpp LIBS sqhwremote_core)
+# The system DNS-SD backend over a fake dnsapi (compiles src/discovery_win.cpp into the test).
+if(WIN32)
+  sq_add_test(NAME hardware_remote_system_dnssd SOURCES tests/test_system_dnssd.cpp src/udp.cpp
+              LIBS sqhwremote_core ws2_32 iphlpapi)
+endif()
 # Loader-level cases. "[loopback]" only uses 127.0.0.1 and must always pass; "[mdns]" needs a
 # working multicast-capable network stack / OS DNS-SD service and is reported Skipped (exit 77)
 # when the advertisement is not seen.
