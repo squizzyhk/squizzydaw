@@ -25,6 +25,9 @@ bool arrangeDropFile(Widget* arrange, float x, float y, const std::string& path)
 std::vector<MenuItem> buildInsertMenu(GuiContext& ctx, const sq_guid& track);
 // "Choose instrument" menu for an instrument track (gui_browser_devices.cpp).
 std::vector<MenuItem> buildInstrumentMenu(GuiContext& ctx, const sq_guid& track);
+// Display name of a scanned plugin ("Graillon 3") for a spec's format + id; the id's last
+// reverse-DNS component when the registry does not know it (gui_browser_devices.cpp).
+std::string pluginDisplayName(GuiContext& ctx, const std::string& format, const std::string& id);
 
 // Menu entries shared by the menu bar and context menus (gui_menubar.cpp).
 std::vector<MenuItem> buildMainMenu(GuiContext& ctx, const std::string& title);

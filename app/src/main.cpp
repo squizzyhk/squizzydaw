@@ -39,6 +39,7 @@ struct Options {
   std::string logLevel;
   std::string audioDriver;
   std::vector<std::string> run;  // --run "Category.Name key=value ..."
+  std::string openFile;          // positional: a .song to open (File.Open) after the services start
   std::string screenshot;        // --screenshot FILE.png (headless GUI render)
   std::string uiScript;          // --ui-script FILE|"op;op"
   int shotW = 1600, shotH = 1000;
@@ -48,7 +49,8 @@ struct Options {
 void printUsage() {
   std::printf(
       "Squizzy Studio %s (platform ABI %d.%d)\n"
-      "usage: SquizzyStudio [options]\n"
+      "usage: SquizzyStudio [options] [song.song]\n"
+      "  song.song             open this song (also how the .song file association starts the app)\n"
       "  --headless            boot, load services, print a summary, exit\n"
       "  --list-classes        print every registered class and exit\n"
       "  --list-commands       print every command of the command system and exit\n"
@@ -125,6 +127,7 @@ bool parseArgs(int argc, char** argv, Options& o) {
     } else if (a == "--help" || a == "-h" || a == "/?") o.help = true;
     else if (a == "--version") o.version = true;
     else if (a == "--licenses") o.licenses = true;
+    else if (!a.empty() && a[0] != '-' && o.openFile.empty()) o.openFile = a;  // the song to open
     else {
       std::fprintf(stderr, "unknown option: %s\n", a.c_str());
       return false;
@@ -392,6 +395,17 @@ int main(int argc, char** argv) {
   app.shell.start(so);
 
   int rc = 0;
+  if (!opt.openFile.empty()) {
+    // Opened before --run commands and before the window, so both act on that song.
+    auto a = sq::makeAttributes();
+    a->setString("path", opt.openFile.c_str());
+    const sq_result r = app.shell.execute("File.Open", a.get());
+    if (SQ_FAILED(r)) {
+      std::fprintf(stderr, "cannot open %s: %s%s%s\n", opt.openFile.c_str(), sq_result_string(r),
+                   app.shell.lastMessage().empty() ? "" : " - ", app.shell.lastMessage().c_str());
+      if (!gui) rc |= 1;
+    }
+  }
   if (opt.listClasses) app.listClasses();
   if (opt.listCommands) app.listCommands();
   if (opt.headless) app.printSummary();

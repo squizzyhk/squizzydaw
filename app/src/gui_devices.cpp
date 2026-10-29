@@ -305,7 +305,10 @@ class DeviceRack final : public Widget {
     cd.power = Rect{x + 8, top + 6, 14, 14};
     c.fillEllipse(cd.power, cd.bypass ? p.faint : accent);
     c.fillEllipse(cd.power.inset(4), p.panel2);
-    const std::string title = cd.info ? cd.info->name : (cd.spec.id.empty() ? std::string("Device") : cd.spec.id);
+    const std::string title = cd.info ? cd.info->name
+                              : cd.spec.id.empty() ? std::string("Device")
+                              : cd.spec.format == "?" ? cd.spec.id
+                                                      : pluginDisplayName(ctx_, cd.spec.format, cd.spec.id);
     c.drawTextBold(title, Rect{x + 28, top, w - 110, kHeader - 4}, cd.bypass ? p.faint : p.text, 12);
     cd.menu = Rect{x + w - 24, top + 4, 18, 18};
     c.drawText("\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2", cd.menu, p.dim, 10, TextAlign::Center);
@@ -323,7 +326,8 @@ class DeviceRack final : public Widget {
     cd.controls.clear();
     cd.editorBtn = Rect{};
     if (!cd.info) {
-      c.drawText(cd.spec.format == "?" ? "Unknown device" : "Plugin: " + cd.spec.id, Rect{x + 12, top + kHeader + 6, w - 24, 18}, p.dim, 11.5f);
+      c.drawText(cd.spec.format == "?" ? std::string("Unknown device") : cd.spec.format + " plugin: " + pluginDisplayName(ctx_, cd.spec.format, cd.spec.id),
+                 Rect{x + 12, top + kHeader + 6, w - 24, 18}, p.dim, 11.5f);
       if (cd.plugin()) {
         // Parameters live in the plugin's own window: one button opens it (double-click on the
         // header and the card menu do the same).

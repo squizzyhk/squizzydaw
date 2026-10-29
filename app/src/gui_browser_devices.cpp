@@ -2,6 +2,7 @@
 // ("+ FX") and the device rack: catalog rows, insert / instrument menus, and adding devices to a
 // track (commands from the shell, with a document-property fallback).
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 
 #include "gui_panels.hpp"
@@ -142,6 +143,23 @@ std::vector<MenuItem> buildInsertMenu(GuiContext& ctx, const sq_guid& track) {
     }
   }
   return m;
+}
+
+std::string pluginDisplayName(GuiContext& ctx, const std::string& format, const std::string& id) {
+  if (auto reg = ctx.shell().plugins()) {
+    for (uint32_t i = 0; i < reg->getPluginCount(); ++i) {
+      sq_plugin_desc d{};
+      d.struct_size = sizeof d;
+      if (reg->getPlugin(i, &d) != SQ_OK || format != d.format || id != d.id || !d.name[0]) continue;
+      d.name[sizeof d.name - 1] = 0;
+      return d.name;
+    }
+  }
+  std::string s = id;
+  const size_t dot = s.find_last_of(".:/");
+  if (dot != std::string::npos && dot + 1 < s.size()) s = s.substr(dot + 1);
+  if (!s.empty()) s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+  return s;
 }
 
 std::vector<MenuItem> buildInstrumentMenu(GuiContext& ctx, const sq_guid& track) {

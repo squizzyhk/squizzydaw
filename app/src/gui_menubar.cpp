@@ -4,10 +4,13 @@
 #include <cstring>
 
 #include "gui_panels.hpp"
+#include "sq/engine/audio/builtin.hpp"
 #include "sq/interfaces/audiodevice.h"
 #include "sq/platform.h"
 
 namespace sq::app::gui {
+
+void openSelectedPluginEditor(GuiContext& ctx);
 namespace {
 
 MenuItem cmd(GuiContext& ctx, const std::string& label, const std::string& command, const std::string& shortcut = {}) {
@@ -282,6 +285,8 @@ std::vector<MenuItem> buildMainMenu(GuiContext& ctx, const std::string& title) {
     }, "F2"));
     m.push_back(cmd(ctx, "Arm for Recording", "Track.ToggleArm"));
     m.push_back(cmd(ctx, "Delete Track", "Track.Remove"));
+    m.push_back(MenuItem::sep());
+    m.push_back(fn("Open Plugin Editor", [&ctx] { openSelectedPluginEditor(ctx); }, "Ctrl+Shift+E"));
   } else if (title == "Transport") {
     const auto ts = ctx.transport();
     m.push_back(cmd(ctx, (ts.flags & SQ_TRANSPORT_PLAYING) ? "Stop" : "Play", (ts.flags & SQ_TRANSPORT_PLAYING) ? "Transport.Stop" : "Transport.Play", "Space"));
@@ -523,6 +528,45 @@ class MenuBar final : public Widget {
 
 std::unique_ptr<Widget> makeMenuBar(GuiContext& ctx) { return std::make_unique<MenuBar>(ctx); }
 
+// The selected track's plugin editor: its plugin instrument, else its first active plugin insert
+// (the master track: its first plugin insert). Keyboard-only path to what the device rack and the
+// mixer offer with the mouse.
+void openSelectedPluginEditor(GuiContext& ctx) {
+  TrackView t;
+  const sq_guid id = ctx.selectedTrack();
+  if (!ctx.findTrack(id, &t)) {
+    ctx.setStatus("select a track first");
+    return;
+  }
+  const sq_guid node = t.info.kind == SQ_TRACK_MASTER ? sq_guid{} : id;
+  auto isPlugin = [](const std::string& line) {
+    sq::engine::audio::SpecParts sp;
+    return !sq::engine::audio::specBypassed(line) && sq::engine::audio::parseSpec(line, &sp) && sp.format != "builtin";
+  };
+  if (t.info.kind == SQ_TRACK_INSTRUMENT && isPlugin(ctx.trackString(id, "user.instrument"))) {
+    ctx.openPluginEditor(node, -1);
+    return;
+  }
+  const std::string inserts = ctx.trackString(id, "user.inserts");
+  int32_t slot = 0;
+  size_t pos = 0;
+  while (pos < inserts.size()) {
+    const size_t nl = inserts.find('\n', pos);
+    std::string line = inserts.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+    pos = nl == std::string::npos ? inserts.size() : nl + 1;
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    const size_t b = line.find_first_not_of(" \t");
+    if (b == std::string::npos) continue;  // blank lines do not count as slots (same as the Track.* commands)
+    line = line.substr(b);
+    if (isPlugin(line)) {
+      ctx.openPluginEditor(node, slot);
+      return;
+    }
+    ++slot;
+  }
+  ctx.setStatus("'" + t.name + "' has no plugin instrument or insert to edit (built-in devices live in the device rack)");
+}
+
 bool handleShortcutKey(GuiContext& ctx, Key k, unsigned mods) {
   const bool ctrl = (mods & kModCtrl) != 0;
   switch (k) {
@@ -571,7 +615,10 @@ bool handleShortcutChar(GuiContext& ctx, uint32_t ch, unsigned mods) {
       case 'V' - '@': runEditCommand(ctx, "Paste", nullptr); return true;
       case 'T' - '@': ctx.run(shift ? "Track.AddInstrument" : "Track.AddAudio"); return true;
       case 'I' - '@': importAudio(ctx); return true;
-      case 'E' - '@': exportAudio(ctx); return true;
+      case 'E' - '@':
+        if (shift) openSelectedPluginEditor(ctx);
+        else exportAudio(ctx);
+        return true;
       default: return false;
     }
   }

@@ -1590,6 +1590,17 @@ struct Shell::Impl {
     cp(desc.id, sizeof desc.id, sp.id);
     cp(desc.path, sizeof desc.path, sp.path);
     cp(desc.name, sizeof desc.name, sp.id);
+    // The registry knows the plugin's display name (the spec only carries the id); adapters that
+    // cannot read a name from the plugin itself (VST3) report this one through getDesc().
+    if (auto reg = sh.plugins()) {
+      for (uint32_t i = 0; i < reg->getPluginCount(); ++i) {
+        sq_plugin_desc d{};
+        d.struct_size = sizeof d;
+        if (reg->getPlugin(i, &d) != SQ_OK || sp.format != d.format || sp.id != d.id || !d.name[0]) continue;
+        cp(desc.name, sizeof desc.name, d.name);
+        break;
+      }
+    }
     desc.status = SQ_PLUGIN_STATUS_OK;
     IHostContext* hostCtx = &sh.host;
     IClassRegistry* creg = &sh.registry;

@@ -227,19 +227,15 @@ class Mixer final : public Widget {
     return nullptr;
   }
 
-  static std::string deviceName(const std::string& spec) {
+  std::string deviceName(const std::string& spec) const {
     std::string s = spec;
     if (!s.empty() && s[0] == '!') s = s.substr(1);
     const size_t a = s.find('|');
     if (a == std::string::npos) return s;
     const size_t b = s.find('|', a + 1);
     std::string id = s.substr(a + 1, b == std::string::npos ? std::string::npos : b - a - 1);
+    if (s.compare(0, 8, "builtin|") != 0) return pluginDisplayName(ctx_, s.substr(0, a), id);  // scanned plugin name
     if (!id.empty()) id[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(id[0])));
-    if (s.compare(0, 8, "builtin|") != 0) {
-      // plugin: the id is often reverse-dns; keep the last component
-      const size_t dot = id.find_last_of(".:/");
-      if (dot != std::string::npos && dot + 1 < id.size()) id = id.substr(dot + 1);
-    }
     return id;
   }
 
