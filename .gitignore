@@ -6,3 +6,6 @@
 CMakeUserPresets.json
 /re/
 .claude/worktrees/
+
+# installer output
+/dist/

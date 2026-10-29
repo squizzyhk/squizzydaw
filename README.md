@@ -42,6 +42,18 @@ ctest --preset linux -LE gui --output-on-failure
 The Linux build has no window backend and no hardware audio driver yet: the app runs headless and offline rendering works, while the GUI and live device I/O remain Windows-only. macOS has the same `#ifdef` seams but its build is **unverified**.
 >>>>>>> origin/feature/core-session-import
 
+## Installer
+
+`installer/` builds a per-machine x64 MSI with WiX v5 (`dotnet tool install --global wix --version 5.0.2`, then `wix extension add -g WixToolset.UI.wixext/5.0.2`). `installer/build-installer.ps1` stages `build/release/bin` the way the CI package step does (app, tools, `sqplatform.dll`, `services/`, `fonts/`, `themes/`, `scripts/`, notices, app-local VC++ runtime; no `*.pdb`/`*.ilk`, test executables or test plugins) and runs `wix build`:
+
+```powershell
+.\build.ps1 -Preset windows-release -BuildDir build\release
+.\installer\build-installer.ps1                 # -> dist\SquizzyStudio-<SQ_VERSION>-x64.msi
+.\installer\build-installer.ps1 -BuildDir build\windows-release -OutDir out\dist -Version 0.2.0
+```
+
+The MSI installs to `%ProgramFiles%\Squizzy Studio`, adds Start Menu and Desktop shortcuts, registers `.song` (ProgId `SquizzyStudio.Song`) and upgrades an earlier version in place (fixed `UpgradeCode`; downgrades are refused). Details and known limits are in [`installer/README.md`](installer/README.md).
+
 ## Run
 
 ```text

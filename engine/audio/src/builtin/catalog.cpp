@@ -124,6 +124,10 @@ bool parseSpec(const std::string& spec, SpecParts* out) {
     const std::string& kv = parts[i];
     const size_t eq = kv.find('=');
     if (eq == std::string::npos || eq == 0) continue;
+    if (eq == 1 && kv[0] == 's') {  // "s=<base64>": the plugin's saved state (last wins)
+      r.state = kv.substr(2);
+      continue;
+    }
     char* end = nullptr;
     const unsigned long idx = std::strtoul(kv.c_str(), &end, 10);
     if (end != kv.c_str() + eq) continue;
@@ -149,6 +153,7 @@ std::string formatSpec(const SpecParts& parts) {
     s += '=';
     appendNumber(&s, value);
   }
+  if (!parts.state.empty()) s += "|s=" + parts.state;  // always the last token
   return s;
 }
 

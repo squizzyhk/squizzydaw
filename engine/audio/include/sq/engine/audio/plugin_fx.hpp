@@ -113,6 +113,8 @@ class PluginFx final : public FxProcessor {
   IPluginInstance* instance() const noexcept { return core_.instance(); }
   IPluginInstance* pluginInstance() const noexcept override { return core_.instance(); }
   void loadInitialState(const PluginState& state) override { core_.loadState(state); }
+  // Main thread: captures the running instance's state (see PluginHostCore::saveState).
+  bool saveState(PluginState* out) const { return core_.saveState(out); }
   const std::string& name() const noexcept { return core_.name(); }
   const std::string& error() const noexcept { return core_.error(); }
 
@@ -137,6 +139,8 @@ class PluginSynth final : public SynthProcessor {
   IPluginInstance* instance() const noexcept { return core_.instance(); }
   IPluginInstance* pluginInstance() const noexcept override { return core_.instance(); }
   void loadInitialState(const PluginState& state) override { core_.loadState(state); }
+  // Main thread: captures the running instance's state (see PluginHostCore::saveState).
+  bool saveState(PluginState* out) const { return core_.saveState(out); }
   const std::string& name() const noexcept { return core_.name(); }
   const std::string& error() const noexcept { return core_.error(); }
 

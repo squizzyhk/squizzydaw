@@ -11,6 +11,14 @@ std::string specStructure(const std::string& spec) {
   SpecParts p;
   if (!parseSpec(spec, &p)) return spec;
   p.params.clear();
+  p.state.clear();
+  return formatSpec(p);
+}
+
+std::string specSetState(const std::string& spec, const std::string& base64) {
+  SpecParts p;
+  if (!parseSpec(spec, &p)) return spec;
+  p.state = base64;
   return formatSpec(p);
 }
 

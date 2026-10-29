@@ -8,11 +8,19 @@
 #include <map>
 
 #include "gui_panels.hpp"
+#include "sq/engine/audio/builtin.hpp"
 
 namespace sq::app::gui {
 namespace {
 
 constexpr float kStripW = 96;
+
+// An insert line that hosts a plugin (not a built-in device): its parameters live in the plugin's
+// own editor window. The bypass marker does not matter here.
+bool isPluginInsert(const std::string& line) {
+  sq::engine::audio::SpecParts sp;
+  return sq::engine::audio::parseSpec(sq::engine::audio::specWithoutBypass(line), &sp) && sp.format != "builtin";
+}
 constexpr double kMinDb = -72;  // fader bottom = -inf
 
 double faderToDb(double t) {
@@ -166,6 +174,11 @@ class Mixer final : public Widget {
         else if (part == Part::Pan) ctx_.setProperty(s->t.id, "pan", 0.0);
         else if (part == Part::Send) setSend(*s, idx, 0.0, false);
         else if (part == Part::Name && !s->master) rename(*s);
+        else if (part == Part::Slot && idx >= 0) {
+          // a plugin insert opens its editor window; a built-in device shows the device panel
+          if (idx < static_cast<int>(s->inserts.size()) && isPluginInsert(s->inserts[static_cast<size_t>(idx)])) openEditor(*s, idx);
+          else click(*s, Part::Slot, idx, Point{e.x, e.y});
+        }
         return true;
       default: return false;
     }
@@ -565,6 +578,10 @@ class Mixer final : public Widget {
     ctx_.setPropertyString(s.t.id, "user.sends", all, merge);
   }
 
+  // The engine node of a strip: the master strip is addressed by the null guid.
+  static sq_guid nodeFor(const Strip& s) { return s.master ? sq_guid{} : s.t.id; }
+  void openEditor(const Strip& s, int idx) { ctx_.openPluginEditor(nodeFor(s), idx); }
+
   void rename(Strip& s) {
     const sq_guid id = s.t.id;
     ctx_.prompt("Rename Track", s.t.name, [this, id](const std::string& nm) {
@@ -674,6 +691,13 @@ class Mixer final : public Widget {
     std::vector<MenuItem> m;
     const sq_guid id = s.t.id;
     if (part == Part::Slot && idx >= 0) {
+      if (idx < static_cast<int>(s.inserts.size()) && isPluginInsert(s.inserts[static_cast<size_t>(idx)])) {
+        MenuItem open;
+        open.label = "Open Editor";
+        const sq_guid node = nodeFor(s);
+        open.action = [this, node, idx] { ctx_.openPluginEditor(node, idx); };
+        m.push_back(open);
+      }
       MenuItem bypass;
       const bool by = idx < static_cast<int>(s.inserts.size()) && !s.inserts[static_cast<size_t>(idx)].empty() &&
                       s.inserts[static_cast<size_t>(idx)][0] == '!';

@@ -163,6 +163,12 @@ class GuiContext {
   virtual bool editFocused(std::string_view cmd) = 0;
   // A named widget of the main window ("arrange", "mixer", ...), nullptr if absent.
   virtual Widget* findWidget(std::string_view name) = 0;
+  // Opens the native editor window of the plugin behind an insert: node = track / bus guid, or the
+  // NULL guid for the master track's inserts (callers translate an SQ_TRACK_MASTER track to a null
+  // guid); slot = "user.inserts" line index, -1 = an instrument track's instrument. Returns false
+  // and sets the status line when no editor is available (built-in / bypassed insert, plugin without
+  // editor, headless GUI, other platforms).
+  virtual bool openPluginEditor(const sq_guid& node, int32_t slot) = 0;
 
   // ---- document helpers (gui_context.cpp) ----
   sq::Ptr<IDocument> doc();

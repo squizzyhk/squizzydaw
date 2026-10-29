@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Squizzy Studio Windows installer (WiX v5, x64, per-machine MSI).
+
+  Preprocessor variables (all passed by build-installer.ps1 with -d):
+    StageDir   - folder that holds the staged, ready-to-ship app tree (no trailing backslash).
+                 Everything under it is harvested; SquizzyStudio.exe is declared explicitly below so the
+                 shortcuts and the .song association can reference it by File Id.
+    Version    - product version a.b.c (SQ_VERSION from the repo VERSION file).
+    LicenseRtf - full path of installer/License.rtf shown on the licence page.
+
+  Contract: UpgradeCode never changes (MajorUpgrade keys off it); bump Version for every release so an
+  upgrade replaces the previous install in place and a downgrade is refused with DowngradeErrorMessage.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="Squizzy Studio"
+           Manufacturer="Squizzy Studio"
+           Version="$(var.Version)"
+           UpgradeCode="B5AE20D6-062F-4B9B-80E6-1E63F6C8BF9B"
+           Language="1033"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first to install this version." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Add/Remove Programs icon: the first icon resource of the application EXE. -->
+    <Icon Id="SquizzyStudioIcon.exe" SourceFile="$(var.StageDir)\SquizzyStudio.exe" />
+    <Property Id="ARPPRODUCTICON" Value="SquizzyStudioIcon.exe" />
+    <!-- ARPNOMODIFY is already set by WixUI_InstallDir; declaring it here again is a duplicate-symbol error. -->
+
+    <!-- Install root: %ProgramFiles%\Squizzy Studio (x64 only). -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Squizzy Studio" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="DesktopFolder" />
+
+    <!-- WixUI_InstallDir: welcome, licence (License.rtf), install folder, progress. -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+
+    <Feature Id="Main" Title="Squizzy Studio" Level="1" AllowAbsent="no">
+      <ComponentRef Id="SquizzyStudioExe" />
+      <!-- Everything else staged by build-installer.ps1: tools, sqplatform.dll, VC++ runtime, services/,
+           fonts/, themes/, scripts/, notices. Sub-folders are recreated under INSTALLFOLDER. -->
+      <Files Directory="INSTALLFOLDER" Include="$(var.StageDir)\**">
+        <Exclude Files="$(var.StageDir)\SquizzyStudio.exe" />
+      </Files>
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="SquizzyStudioExe" Guid="7D3C2B2E-5B0A-4D5E-9F0B-2C6A1E8D4F31" Bitness="always64">
+        <File Id="SquizzyStudioExe" Source="$(var.StageDir)\SquizzyStudio.exe" KeyPath="yes">
+          <!-- Non-advertised shortcuts (nested in the File they launch), both per-machine. -->
+          <Shortcut Id="StartMenuShortcut"
+                    Directory="ProgramMenuFolder"
+                    Name="Squizzy Studio"
+                    Description="Squizzy Studio digital audio workstation"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <Shortcut Id="DesktopShortcut"
+                    Directory="DesktopFolder"
+                    Name="Squizzy Studio"
+                    Description="Squizzy Studio digital audio workstation"
+                    WorkingDirectory="INSTALLFOLDER" />
+        </File>
+
+        <!-- ".song" file association: HKCR\.song -> SquizzyStudio.Song, open verb runs the EXE with the
+             document path. Note: the shell currently accepts only "- -option" arguments, so a positional
+             path makes it print usage and exit until the app grows an open-document argument. -->
+        <ProgId Id="SquizzyStudio.Song" Description="Squizzy Studio song" Icon="SquizzyStudioExe" IconIndex="0">
+          <Extension Id="song" ContentType="application/x-squizzy-song">
+            <Verb Id="open" Command="Open" TargetFile="SquizzyStudioExe" Argument="&quot;%1&quot;" />
+          </Extension>
+        </ProgId>
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

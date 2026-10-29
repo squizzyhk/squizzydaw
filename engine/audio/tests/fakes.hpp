@@ -3,6 +3,8 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -16,6 +18,7 @@
 #include "sq/cpp/attributes.hpp"
 #include "sq/interfaces/codec.h"
 #include "sq/interfaces/document.h"
+#include "sq/interfaces/pluginhost.h"
 
 namespace fakes {
 
@@ -445,5 +448,108 @@ inline sq_result MEditor::commitTransaction() {
   if (depth == 0 && doc) doc->fireChanged();
   return SQ_OK;
 }
+
+// ---------------------------------------------------------------- stateful plugin instance
+// IPluginInstance (pluginhost.h) whose whole state is one int32 `value`: saveState writes the tag
+// "SQST" followed by the little-endian value, loadState accepts exactly that form (anything else
+// is rejected and leaves the value alone). One stereo bus in and one out (as a synth it gets
+// silence in and writes silence out), no latency, no tail, no parameters, no editor. getDesc
+// reports `pluginId` as the class id, so PluginState (processor.hpp) round trips can match or
+// mismatch on it. Main-thread bookkeeping for tests: loads() / saves() count the state calls,
+// active() mirrors activate() / deactivate().
+class StatePlugin final : public sq::Object<StatePlugin, sq::IPluginInstance> {
+ public:
+  explicit StatePlugin(std::string pluginId, int32_t value = 0) : pluginId_(std::move(pluginId)), value_(value) {}
+  int32_t value() const noexcept { return value_; }
+  void setValue(int32_t v) noexcept { value_ = v; }
+  int loads() const noexcept { return loads_; }
+  int saves() const noexcept { return saves_; }
+  bool active() const noexcept { return active_; }
+  const std::string& pluginId() const noexcept { return pluginId_; }
+
+  // The serialised form of one value (exactly what saveState writes / loadState reads).
+  static std::vector<uint8_t> encode(int32_t v) {
+    std::vector<uint8_t> b = {'S', 'Q', 'S', 'T'};
+    const uint32_t u = static_cast<uint32_t>(v);
+    for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>((u >> (8 * i)) & 0xFFu));
+    return b;
+  }
+  static bool decode(const std::vector<uint8_t>& b, int32_t* v) {
+    if (b.size() != 8 || b[0] != 'S' || b[1] != 'Q' || b[2] != 'S' || b[3] != 'T') return false;
+    uint32_t u = 0;
+    for (int i = 0; i < 4; ++i) u |= static_cast<uint32_t>(b[4 + static_cast<size_t>(i)]) << (8 * i);
+    if (v) *v = static_cast<int32_t>(u);
+    return true;
+  }
+
+  sq_result SQ_CALL getDesc(sq_plugin_desc* out) override {
+    if (!out) return SQ_E_INVALIDARG;
+    std::snprintf(out->format, sizeof out->format, "fake");
+    std::snprintf(out->id, sizeof out->id, "%s", pluginId_.c_str());
+    std::snprintf(out->name, sizeof out->name, "State Plugin");
+    out->audio_inputs = 2;
+    out->audio_outputs = 2;
+    return SQ_OK;
+  }
+  uint32_t SQ_CALL getBusCount(sq_bool) override { return 1; }
+  sq_result SQ_CALL getBusInfo(sq_bool, uint32_t, sq_plugin_bus_info* out) override {
+    out->channels = 2;
+    return SQ_OK;
+  }
+  sq_result SQ_CALL setBusActive(sq_bool, uint32_t, sq_bool) override { return SQ_OK; }
+  sq_result SQ_CALL activate(const sq_plugin_setup* s) override {
+    if (!s || s->max_block_frames == 0) return SQ_E_INVALIDARG;
+    active_ = true;
+    return SQ_OK;
+  }
+  sq_result SQ_CALL deactivate() override {
+    active_ = false;
+    return SQ_OK;
+  }
+  sq_result SQ_CALL process(sq_plugin_process* d) override {
+    for (uint32_t b = 0; b < d->output_bus_count; ++b)
+      for (uint32_t c = 0; c < d->outputs[b].channel_count; ++c)
+        for (uint32_t i = 0; i < d->frames; ++i) d->outputs[b].channels[c][i] = 0.0f;
+    return SQ_S_FALSE;  // silent
+  }
+  void SQ_CALL reset() override {}
+  uint32_t SQ_CALL getLatencyFrames() override { return 0; }
+  uint32_t SQ_CALL getTailFrames() override { return 0; }
+  uint32_t SQ_CALL getParamCount() override { return 0; }
+  sq_result SQ_CALL getParamInfo(uint32_t, sq_param_info*) override { return SQ_E_NOTFOUND; }
+  sq_result SQ_CALL getParamValue(uint32_t, double*) override { return SQ_E_NOTFOUND; }
+  sq_result SQ_CALL setParamValue(uint32_t, double) override { return SQ_E_NOTFOUND; }
+  sq_result SQ_CALL paramValueToText(uint32_t, double, char*, uint32_t, uint32_t*) override { return SQ_E_NOTFOUND; }
+  sq_result SQ_CALL saveState(sq::IByteStream* out) override {
+    if (!out) return SQ_E_INVALIDARG;
+    const std::vector<uint8_t> b = encode(value_);
+    uint32_t written = 0;
+    const sq_result r = out->write(b.data(), static_cast<uint32_t>(b.size()), &written);
+    if (SQ_SUCCEEDED(r)) ++saves_;
+    return r;
+  }
+  sq_result SQ_CALL loadState(sq::IByteStream* in) override {
+    if (!in) return SQ_E_INVALIDARG;
+    std::vector<uint8_t> b(16);  // more than a valid state: a longer stream is rejected by decode
+    uint32_t got = 0;
+    if (SQ_FAILED(in->read(b.data(), static_cast<uint32_t>(b.size()), &got))) return SQ_E_FAIL;
+    b.resize(got);
+    int32_t v = 0;
+    if (!decode(b, &v)) return SQ_E_INVALIDARG;
+    value_ = v;
+    ++loads_;
+    return SQ_OK;
+  }
+  sq_bool SQ_CALL hasEditor() override { return SQ_FALSE; }
+  sq_result SQ_CALL openEditor(void*, const char*, uint32_t*, uint32_t*) override { return SQ_E_NOTIMPL; }
+  sq_result SQ_CALL closeEditor() override { return SQ_E_NOTIMPL; }
+  sq_result SQ_CALL setEditorSize(uint32_t, uint32_t) override { return SQ_E_NOTIMPL; }
+
+ private:
+  std::string pluginId_;
+  int32_t value_ = 0;
+  int loads_ = 0, saves_ = 0;
+  bool active_ = false;
+};
 
 }  // namespace fakes

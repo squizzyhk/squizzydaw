@@ -9,7 +9,8 @@
 // Commands ("Category.Name"; args/result are IAttributes, both nullable):
 //   File.New                                     new song, becomes active, engine plays it
 //   File.Open        path                        open a .song archive
-//   File.Save        path?                       save (path required for a new document)
+//   File.Save        path?                       save (path required for a new document); captures the
+//                                                live state of every hosted plugin first (capturePluginStates)
 //   File.Close
 //   File.ExportAudio path tail?:double start?:double end?:double   mixdown via engine render +
 //                                                codec chosen by the file extension (wav, flac, ...)
@@ -43,6 +44,7 @@
 //   Midi.ListInputs (-> "count", "inputs") / Midi.OpenInputs / Midi.Inject bytes:"90,60,100" (status
 //                    byte hex, data decimal, "0x" forces hex; several messages allowed)
 //   Plugins.Rescan full?:bool                    (async; IPluginRegistry::isScanning)
+//   Plugin.CaptureState                          capturePluginStates() -> result "count" (changed spec lines)
 //   Browser.IndexFolder folder / Browser.Search text? tags? kind? limit?  -> result "count", "first"
 //   Script.Evaluate source / Script.LoadPackage path
 //   Audio.ListDevices driver?:"wasapi|asio|alsa|pulse|null"  -> result "count", "devices" (id<TAB>name lines);
@@ -68,8 +70,15 @@
 // Live MIDI: every input of the MIDI drivers is opened at startup in the window
 // (Devices.Midi.Enabled; batch modes only with Devices.Midi.LiveInputHeadless or Midi.OpenInputs)
 // and forwarded to AudioEngine::pushLiveMidi; port hot-plug re-scans on driver notification.
+// Hosted plugins: the shell is every plugin instance's IPluginHostCallback (pluginhost.h). Editor
+// edits (onParamEdited) are written into the owning track's spec line from idle() as merged
+// "Plugin Parameter" undo steps; latency / restart requests rebuild the graph from idle(); editor
+// resize requests go to the GUI through PluginHostHooks. The opaque plugin state travels in the
+// spec's "s=<base64>" token (builtin.hpp), written by capturePluginStates (File.Save does it).
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -101,6 +110,14 @@ struct ShellOptions {
 struct CommandInfo {
   std::string category, name, title;
   std::string source;  // "app" | "edit" | "script" | "class"
+};
+
+// GUI hooks for plugin-host callbacks the shell cannot answer itself (main thread). Every member
+// may be empty: an unset hook answers "not handled" (onEditorResize -> SQ_FALSE).
+struct PluginHostHooks {
+  // A plugin editor asks for a new client size (IPluginHostCallback::onEditorResize); return true
+  // when the parent window was resized.
+  std::function<bool(IPluginInstance*, uint32_t, uint32_t)> onEditorResize;
 };
 
 class Shell {
@@ -141,6 +158,17 @@ class Shell {
   // Opens the device selected by Devices.Audio.Driver / Devices.Audio.Device (or `driver`).
   sq_result openAudioDevice(const std::string& driver = {});
   std::string deviceDescription() const;
+
+  // ---- hosted plugins ----
+  // Installs the GUI's answers to plugin-host callbacks ({} clears them). Main thread.
+  void setPluginHostHooks(PluginHostHooks hooks);
+  // Writes the live state (IPluginInstance::saveState, base64) of every hosted plugin of the active
+  // song - or only the plugin at (node, slot) when `node` is given; a null guid is the master
+  // track, slot -1 an instrument track's instrument - into its spec line as "|s=<base64>" in ONE
+  // undo step titled "Plugin State". Lines whose stored state already matches are left alone and
+  // no undo step is created when nothing changed. Returns the number of spec lines that changed
+  // (0: nothing changed, no engine, no document).
+  size_t capturePluginStates(const sq_guid* node = nullptr, int32_t slot = INT32_MIN);
 
   // ---- commands ----
   std::vector<CommandInfo> commands();

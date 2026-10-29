@@ -1,6 +1,8 @@
 // engine/audio - PluginFx: IPluginInstance as an insert processor (fake plugin, no module).
 #include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -224,4 +226,119 @@ SQ_TEST("plugin_fx: an engine destroyed while an offline render runs cancels it 
   g_checkThreads = false;
   CHECK_EQ(g_lifecycleOffMain.load(), 0);
   CHECK_EQ(g_alive.load(), 0);
+}
+
+// ---- plugin state (PluginHostCore::saveState / loadState, AudioProcessor::loadInitialState) ----
+namespace {
+PluginFactory stateFactory(std::string pluginId, int32_t value) {
+  return [pluginId, value](std::string*) {
+    return sq::Ptr<sq::IPluginInstance>::adopt(new fakes::StatePlugin(pluginId, value));
+  };
+}
+fakes::StatePlugin* statePlugin(sq::IPluginInstance* inst) { return static_cast<fakes::StatePlugin*>(inst); }
+}  // namespace
+
+SQ_TEST("plugin_fx: PluginHostCore captures the instance state and restores it into another instance") {
+  const PluginFactory factory = stateFactory("fake.state", 7);
+  PluginHostCore src(factory, "fake");
+  PluginState st;
+  CHECK(!src.saveState(&st));  // a prototype (no instance yet) has nothing to capture
+  CHECK(st.bytes.empty());
+  src.instantiate();
+  fakes::StatePlugin* a = statePlugin(src.instance());
+  REQUIRE(a);
+  a->setValue(42);
+  REQUIRE(src.saveState(&st));
+  CHECK_EQ(st.pluginId, std::string("fake.state"));  // sq_plugin_desc.id of the instance
+  int32_t decoded = 0;
+  REQUIRE(fakes::StatePlugin::decode(st.bytes, &decoded));
+  CHECK_EQ(decoded, 42);
+  CHECK_EQ(a->saves(), 1);
+  CHECK(!src.saveState(nullptr));
+
+  // A fresh instance of the same plugin picks the state up (before activation, like a graph does).
+  PluginHostCore dst(factory, "fake");
+  dst.instantiate();
+  fakes::StatePlugin* b = statePlugin(dst.instance());
+  REQUIRE(b);
+  CHECK_EQ(b->value(), 7);
+  dst.loadState(st);
+  CHECK_EQ(b->value(), 42);
+  CHECK_EQ(b->loads(), 1);
+  REQUIRE(dst.activate(48000.0, 64));
+  CHECK_EQ(b->value(), 42);  // activation does not disturb the restored state
+  CHECK(b->active());
+
+  // A state captured from a DIFFERENT plugin id is ignored, and so are empty bytes.
+  PluginState other;
+  other.pluginId = "someone.else";
+  other.bytes = fakes::StatePlugin::encode(99);
+  dst.loadState(other);
+  CHECK_EQ(b->value(), 42);
+  CHECK_EQ(b->loads(), 1);
+  PluginState empty;
+  empty.pluginId = "fake.state";
+  dst.loadState(empty);
+  CHECK_EQ(b->value(), 42);
+  CHECK_EQ(b->loads(), 1);
+
+  // A plugin that implements no state (saveState fails) captures nothing: the caller must not
+  // carry an empty state around.
+  PluginHostCore none([](std::string*) { return sq::Ptr<sq::IPluginInstance>::adopt(new FakeGain()); }, "gain");
+  none.instantiate();
+  REQUIRE(none.instance());
+  PluginState ns;
+  CHECK(!none.saveState(&ns));
+  CHECK(ns.bytes.empty());
+}
+
+SQ_TEST("plugin_fx: clone + loadInitialState restores a captured state into the clone's instance") {
+  const PluginFactory factory = stateFactory("fake.state", 7);
+  auto proto = std::make_shared<PluginFx>(factory, "fake");
+  CHECK(proto->pluginInstance() == nullptr);  // prototypes host no instance
+  ProcessorPtr c = proto->clone();
+  auto* fx = static_cast<PluginFx*>(c.get());
+  fakes::StatePlugin* inst = statePlugin(fx->instance());
+  REQUIRE(inst);
+  CHECK(c->pluginInstance() == fx->instance());  // the AudioProcessor view the engine uses
+  CHECK_EQ(inst->value(), 7);
+
+  PluginState st;
+  st.pluginId = "fake.state";
+  st.bytes = fakes::StatePlugin::encode(1234);
+  c->loadInitialState(st);
+  CHECK_EQ(inst->value(), 1234);
+  CHECK_EQ(inst->loads(), 1);
+  // mismatching plugin id / empty bytes: ignored
+  PluginState wrong;
+  wrong.pluginId = "fake.other";
+  wrong.bytes = fakes::StatePlugin::encode(5);
+  c->loadInitialState(wrong);
+  PluginState empty;
+  empty.pluginId = "fake.state";
+  c->loadInitialState(empty);
+  CHECK_EQ(inst->value(), 1234);
+  CHECK_EQ(inst->loads(), 1);
+  REQUIRE(c->prepare(48000.0, 64, 2));  // the state survives activation
+  CHECK_EQ(inst->value(), 1234);
+  CHECK(inst->active());
+
+  // PluginSynth shares the plumbing (instrument slot).
+  auto sproto = std::make_shared<PluginSynth>(factory, "fsynth");
+  ProcessorPtr s = sproto->clone();
+  auto* sy = static_cast<PluginSynth*>(s.get());
+  REQUIRE(sy->instance());
+  CHECK(s->pluginInstance() == sy->instance());
+  s->loadInitialState(st);
+  CHECK_EQ(statePlugin(sy->instance())->value(), 1234);
+  s->loadInitialState(wrong);
+  CHECK_EQ(statePlugin(sy->instance())->value(), 1234);
+  REQUIRE(s->prepare(48000.0, 64, 2));
+  CHECK_EQ(statePlugin(sy->instance())->value(), 1234);
+
+  // Built-in processors (no plugin) ignore states and host no instance.
+  auto noneProto = std::make_shared<PluginFx>([](std::string*) { return sq::Ptr<sq::IPluginInstance>(); }, "none");
+  ProcessorPtr plain = noneProto->clone();
+  CHECK(plain->pluginInstance() == nullptr);
+  plain->loadInitialState(st);  // no instance: a no-op, must not crash
 }

@@ -79,7 +79,10 @@ struct Card {
   std::vector<double> values;
   // layout (DIPs)
   Rect box, header, power, remove, left, right, menu;
+  Rect editorBtn;  // "Open Editor" of a plugin card (empty for built-in devices)
   std::vector<Rect> controls;
+  // A plugin (non built-in) card: parameters live in the plugin's own editor window.
+  bool plugin() const { return info == nullptr && spec.format != "builtin"; }
 };
 
 class DeviceRack final : public Widget {
@@ -220,6 +223,8 @@ class DeviceRack final : public Widget {
           Card& cd = cards_[static_cast<size_t>(ci)];
           const auto& info = cd.info->params[static_cast<size_t>(pi)];
           if (info.kind == ea::ParamKind::Continuous || info.kind == ea::ParamKind::Integer) setParam(cd, pi, info.def, false);
+        } else if (ci >= 0 && part == kHeaderPart && cards_[static_cast<size_t>(ci)].plugin()) {
+          openEditor(cards_[static_cast<size_t>(ci)]);  // double-click on a plugin card's header
         }
         return true;
       default: return false;
@@ -227,7 +232,11 @@ class DeviceRack final : public Widget {
   }
 
  private:
-  enum { kNone = 0, kBody, kHeaderPart, kPower, kRemove, kLeft, kRight, kMenu };
+  enum { kNone = 0, kBody, kHeaderPart, kPower, kRemove, kLeft, kRight, kMenu, kEditorBtn };
+
+  // The engine node of the rack's track: the master track is addressed by the null guid.
+  sq_guid nodeForTrack() const { return trackKind_ == SQ_TRACK_MASTER ? sq_guid{} : track_; }
+  void openEditor(const Card& cd) { ctx_.openPluginEditor(nodeForTrack(), cd.slot); }  // slot -1 = instrument
 
   void refresh() {
     const sq_guid sel = ctx_.selectedTrack();
@@ -242,6 +251,7 @@ class DeviceRack final : public Widget {
     haveTrack_ = ctx_.findTrack(sel, &t) && t.info.kind != SQ_TRACK_FOLDER;
     if (!haveTrack_) return;
     trackName_ = t.info.kind == SQ_TRACK_MASTER ? std::string("Master") : t.name;
+    trackKind_ = t.info.kind;
     trackColor_ = ctx_.trackColor(t);
     auto props = sq::makeAttributes();
     t.track->getProperties(props.get());
@@ -311,9 +321,18 @@ class DeviceRack final : public Widget {
       cd.remove = cd.left = cd.right = Rect{};
     }
     cd.controls.clear();
+    cd.editorBtn = Rect{};
     if (!cd.info) {
       c.drawText(cd.spec.format == "?" ? "Unknown device" : "Plugin: " + cd.spec.id, Rect{x + 12, top + kHeader + 6, w - 24, 18}, p.dim, 11.5f);
-      c.drawText("Parameters are edited in the plugin.", Rect{x + 12, top + kHeader + 26, w - 24, 18}, p.faint, 11);
+      if (cd.plugin()) {
+        // Parameters live in the plugin's own window: one button opens it (double-click on the
+        // header and the card menu do the same).
+        cd.editorBtn = Rect{x + 12, top + kHeader + 30, std::min(w - 24, 120.0f), 24};
+        const bool hot = hotCard_ == static_cast<int>(&cd - cards_.data()) && hotPart_ == kEditorBtn;
+        draw::button(c, p, cd.editorBtn, "Open Editor", hot, false, accent);
+      } else {
+        c.drawText("Parameters are edited in the plugin.", Rect{x + 12, top + kHeader + 26, w - 24, 18}, p.faint, 11);
+      }
       return x + w;
     }
     for (size_t i = 0; i < n; ++i) {
@@ -362,6 +381,7 @@ class DeviceRack final : public Widget {
       if (cd.right.contains(x, y)) return kRight;
       if (cd.menu.contains(x, y)) return kMenu;
       if (cd.header.contains(x, y)) return kHeaderPart;
+      if (cd.editorBtn.contains(x, y)) return kEditorBtn;
       for (size_t k = 0; k < cd.controls.size(); ++k)
         if (cd.controls[k].contains(x, y)) {
           *pi = static_cast<int>(k);
@@ -458,12 +478,20 @@ class DeviceRack final : public Widget {
       });
     } else if (part == kMenu) {
       cardMenu(ci, at);
+    } else if (part == kEditorBtn && cd.plugin()) {
+      openEditor(cd);
     }
   }
 
   void cardMenu(int ci, Point at) {
     const Card cd = cards_[static_cast<size_t>(ci)];
     std::vector<MenuItem> m;
+    if (cd.plugin()) {
+      MenuItem ed;
+      ed.label = "Open Editor";
+      ed.action = [this, cd] { openEditor(cd); };
+      m.push_back(ed);
+    }
     if (cd.instrument) {
       MenuItem ch;
       ch.label = "Change Instrument";
@@ -535,6 +563,7 @@ class DeviceRack final : public Widget {
   sq_guid track_{};
   bool haveTrack_ = false;
   std::string trackName_;
+  int32_t trackKind_ = 0;  // SQ_TRACK_* of track_
   Color trackColor_;
   std::vector<Card> cards_;
   uint64_t serial_ = 0;

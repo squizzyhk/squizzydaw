@@ -47,6 +47,8 @@ sq_add_test(NAME engine_audio_rtsafety SOURCES tests/test_rtsafety.cpp LIBS ${_e
 sq_add_test(NAME engine_audio_service SOURCES tests/test_service.cpp LIBS ${_ea_libs})
 sq_add_test(NAME engine_audio_verify SOURCES tests/test_verify.cpp LIBS ${_ea_libs})
 sq_add_test(NAME engine_audio_plugin_fx SOURCES tests/test_plugin_fx.cpp LIBS ${_ea_libs})
+sq_add_test(NAME engine_audio_plugin_state SOURCES tests/test_plugin_state.cpp LIBS ${_ea_libs})
+sq_add_test(NAME engine_audio_spec_state SOURCES tests/test_spec_state.cpp LIBS ${_ea_libs})
 sq_add_test(NAME engine_audio_instruments SOURCES tests/test_instruments.cpp LIBS ${_ea_libs})
 sq_add_test(NAME engine_audio_builtin SOURCES tests/test_builtin.cpp LIBS ${_ea_libs})
 sq_add_test(NAME engine_audio_builtin_dsp SOURCES tests/test_builtin_dsp.cpp LIBS ${_ea_libs})

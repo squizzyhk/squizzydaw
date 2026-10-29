@@ -344,6 +344,7 @@ class SubMixProcessor final : public AudioProcessor {
   // Post-insert, pre-fader buffer of the last process() call (bus sends).
   float* const* preFader() const noexcept { return workPtrs_.data(); }
   AudioProcessor* insert(size_t i) const noexcept { return i < chain_.size() ? chain_.at(i) : nullptr; }
+  size_t insertCount() const noexcept { return chain_.size(); }
 
  private:
   uint32_t channels_;

@@ -19,6 +19,7 @@
 #include "gui_context.hpp"
 #include "gui_overlay.hpp"
 #include "gui_panels.hpp"
+#include "gui_plugin_editor.hpp"
 #include "sq/cpp/attributes.hpp"
 #include "sq/cpp/object.hpp"
 #include "sq/platform.hpp"
@@ -193,10 +194,21 @@ Color parseColorDefine(const std::string& s, Color fallback) {
 
 class Gui final : public GuiContext {
  public:
-  explicit Gui(Shell& s) : sh_(s) {}
-  ~Gui() override { detachObservers(); }
+  explicit Gui(Shell& s) : sh_(s) {
+    editors_ = std::make_unique<gui::PluginEditorHost>(*this, s);
+    // Plugin-driven editor resizes come back from the engine's host callback through the shell.
+    PluginHostHooks hooks;
+    hooks.onEditorResize = [this](IPluginInstance* inst, uint32_t w, uint32_t h) { return editors_->onEditorResize(inst, w, h); };
+    sh_.setPluginHostHooks(std::move(hooks));
+  }
+  ~Gui() override {
+    sh_.setPluginHostHooks({});
+    editors_->closeAll();  // while the plugin instances (engine) and the main window still exist
+    detachObservers();
+  }
 
   Shell& sh_;
+  std::unique_ptr<gui::PluginEditorHost> editors_;  // native plugin editor windows
   std::unique_ptr<Skin> skin;
   SkinDefines defines;
   std::string themeName;
@@ -301,6 +313,20 @@ class Gui final : public GuiContext {
   std::string draggedFile() const override { return dragged_; }
   void setDraggedFile(const std::string& path) override { dragged_ = path; }
   Widget* findWidget(std::string_view name) override { return tree.findByName(name); }
+  bool openPluginEditor(const sq_guid& node, int32_t slot) override {
+    if (!window) {  // headless --screenshot / --ui-script: no platform windows at all
+      setStatus("plugin editors need the window");
+      return false;
+    }
+    std::string title = "Master";
+    if (!sq_guid_is_null(&node)) {
+      gui::TrackView t;
+      title = findTrack(node, &t) ? (t.info.kind == SQ_TRACK_MASTER ? std::string("Master") : t.name) : std::string("Track");
+    }
+    const bool ok = editors_->open(node, slot, title, window->nativeHandle());
+    invalidate();
+    return ok;
+  }
   bool editFocused(std::string_view cmd) override {
     for (Widget* w = tree.focus(); w; w = w->parent())
       if (auto* t = dynamic_cast<gui::EditTarget*>(w); t && t->editCommand(cmd)) {
@@ -491,6 +517,7 @@ class Gui final : public GuiContext {
     if (id == lastDoc_) return;
     lastDoc_ = id;
     ++serial_;
+    if (editors_) editors_->closeAll();  // the editors belonged to the previous song
     if (observedDoc_) observedDoc_->removeObserver(docObserver_.get());
     observedDoc_ = nullptr;
     if (d) {
@@ -604,6 +631,7 @@ class Gui final : public GuiContext {
     ensureDocument();
     watchDocuments();
     followTheme();
+    editors_->idle();  // after the engine pump: follows recompiled graphs / removed inserts
   }
 };
 

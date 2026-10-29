@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 #include "sq/cpp/attributes.hpp"
 #include "sq/platform.h"
@@ -808,6 +809,12 @@ bool AudioEngine::locatePlugin(IPluginInstance* inst, sq_guid* node, int32_t* sl
 
 void AudioEngine::carryPluginStates(GraphDesc& d) {
   Graph* g = core_->newestGraph();
+  // The slot maps `d` is compiled with are what the NEXT carry reads back, so they are recorded on
+  // every compile, including the first one (no graph to capture from yet).
+  std::vector<std::vector<int32_t>> busMaps;
+  for (const auto& b : d.buses) busMaps.push_back(b.slotToChain);
+  const std::vector<int32_t> oldMasterMap = std::exchange(prevMasterSlotMap_, d.masterSlotToChain);
+  const std::vector<std::vector<int32_t>> oldBusMaps = std::exchange(prevBusSlotMaps_, std::move(busMaps));
   if (!g) return;
   // (node, slot) -> state of the instance that runs now; desc_ is already the NEXT description,
   // so the old slot maps come from the graph's own descs (tracks) and the previous bus/master maps.
@@ -829,18 +836,15 @@ void AudioEngine::carryPluginStates(GraphDesc& d) {
     grab(t.desc().id, -1, t.instrument());
     for (size_t c = 0; c < t.insertCount(); ++c) grab(t.desc().id, slotOf(t.desc().slotToChain, c) < 0 ? INT32_MIN : slotOf(t.desc().slotToChain, c), t.insert(c));
   }
-  for (size_t b = 0; b < g->busCount() && b < prevBusSlotMaps_.size(); ++b)
+  for (size_t b = 0; b < g->busCount() && b < oldBusMaps.size(); ++b)
     for (size_t c = 0; c < g->bus(b).insertCount(); ++c) {
-      const int32_t s = slotOf(prevBusSlotMaps_[b], c);
+      const int32_t s = slotOf(oldBusMaps[b], c);
       grab(g->busId(b), s < 0 ? INT32_MIN : s, g->bus(b).insert(c));
     }
   for (size_t c = 0; c < g->master().insertCount(); ++c) {
-    const int32_t s = slotOf(prevMasterSlotMap_, c);
+    const int32_t s = slotOf(oldMasterMap, c);
     grab(sq_guid{}, s < 0 ? INT32_MIN : s, g->master().insert(c));
   }
-  prevBusSlotMaps_.clear();
-  for (const auto& b : d.buses) prevBusSlotMaps_.push_back(b.slotToChain);
-  prevMasterSlotMap_ = d.masterSlotToChain;
   if (states.empty()) return;
   auto take = [&](const sq_guid& node, int32_t slot) -> PluginState {
     auto it = states.find(Key{node, slot});
